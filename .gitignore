@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend packages and build output (npm install; app.py rebuilds dist when src is newer)
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Exported meshes: hundreds of MB each (GitHub refuses files over 100 MB)
+samples/*.stl
+
+# Personal Claude Code settings
+.claude/settings.local.json
+
+*.tmp

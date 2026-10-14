@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "design-engine",
+      "runtimeExecutable": "C:\\Users\\willi\\miniconda3\\envs\\synkad\\python.exe",
+      "runtimeArgs": ["app.py", "--no-browser"],
+      "port": 8765
+    },
+    {
+      "name": "design-engine-test",
+      "runtimeExecutable": "C:\\Users\\willi\\miniconda3\\envs\\synkad\\python.exe",
+      "runtimeArgs": ["app.py", "--no-browser", "--port", "8766"],
+      "port": 8766
+    }
+  ]
+}

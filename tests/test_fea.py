@@ -1,0 +1,282 @@
+"""Finite element analysis: element, matrix-free products, multigrid, and results checked against
+textbook answers (uniform tension, a cantilever beam)."""
+import numpy as np
+import pytest
+
+from engine import fields as F
+from engine.fea import element as EL
+from engine.fea.analysis import Model, build_model, element_stresses, solve, static_analysis
+from engine.fea.materials import PRESETS, Material
+from engine.fea.model import (Condition, ConditionError, Conditions, FEGrid, apply_conditions, plan_coarsenings,
+                              sample_triangles)
+from engine.fea.solver import Hierarchy, prolong, restrict
+
+
+def test_element_stiffness_is_symmetric_with_six_rigid_modes():
+    K = EL.stiffness(0.3)
+    assert np.allclose(K, K.T)
+    eig = np.linalg.eigvalsh(K)
+    assert (np.abs(eig[:6]) < 1e-10).all() and (eig[6:] > 1e-3).all()
+    assert np.allclose(K.sum(axis=1).reshape(8, 3).sum(axis=0), 0)   # a translation costs nothing
+
+
+def _assembled(scale, KE):
+    """Dense stiffness matrix of a grid, the plain way."""
+    nx, ny, nz = scale.shape
+    X, Y, Z = nx + 1, ny + 1, nz + 1
+    K = np.zeros((X * Y * Z * 3,) * 2)
+    for i, j, k in np.ndindex(scale.shape):
+        nodes = [((i + cx) * Y + (j + cy)) * Z + (k + cz) for cx, cy, cz in EL.CORNERS]
+        dofs = np.array([3 * n + d for n in nodes for d in range(3)])
+        K[np.ix_(dofs, dofs)] += scale[i, j, k] * KE
+    return K
+
+
+@pytest.fixture(params=["slabs", "elements"])
+def layout(request, monkeypatch):
+    """Run a test with the whole-grid layout and with the element-by-element one."""
+    from engine.fea import solver
+    monkeypatch.setattr(solver, "DENSE_FILL", 0.0 if request.param == "slabs" else 1.01)
+    return request.param
+
+
+def test_matrix_free_product_equals_the_assembled_matrix(layout):
+    rng = np.random.default_rng(1)
+    scale = rng.uniform(0.1, 2.0, (3, 4, 2))
+    scale[1, 2, 0] = 0.0   # an empty element
+    KE = EL.stiffness(0.35)
+    fixed = np.zeros((4, 5, 3, 3), dtype=bool)
+    fixed[0, :, :, :] = True
+    fixed[2, 1, 1, 2] = True
+    H = Hierarchy(scale, KE, fixed, (0, 0, 0))
+    u = rng.standard_normal((4, 5, 3, 3)) * H.free
+    expect = (_assembled(scale, KE) @ u.ravel()).reshape(u.shape) * H.free
+    assert np.allclose(H.apply(u), expect, rtol=1e-12, atol=1e-12)
+
+
+def test_coarse_levels_are_galerkin_operators_of_the_fixed_fine_one(layout):
+    rng = np.random.default_rng(2)
+    scale = rng.uniform(0.01, 1.0, (4, 4, 8))
+    scale[:2, :2, :3] = 0.0
+    fixed = np.zeros((5, 5, 9, 3), dtype=bool)
+    fixed[:, 0, :, 1] = True
+    fixed[3, 3, 5, :] = True   # an odd node: only dilated coarse nodes can hold it
+    H = Hierarchy(scale, EL.stiffness(0.3), fixed, (1, 2, 2))
+    assert [lv.kind for lv in H.levels] == ["fine", "children", "stored"]
+    for fine, coarse in zip(H.levels, H.levels[1:]):
+        vc = rng.standard_normal(coarse.nodes + (3,)) * coarse.free
+        galerkin = restrict(fine.apply(prolong(vc, fine.factors)), fine.factors) * coarse.free
+        assert np.allclose(coarse.apply(vc), galerkin, rtol=1e-10, atol=1e-10 * np.abs(galerkin).max())
+
+
+def test_coarsening_plan_pads_little():
+    ks, padded = plan_coarsenings((100, 10, 10))
+    assert padded == (100, 10, 10) and ks == (1, 1, 1)
+    ks, padded = plan_coarsenings((203, 61, 33))
+    assert all(p <= 1.15 * n for p, n in zip(padded, (203, 61, 33)))
+    assert np.prod([p // 2 ** k for p, k in zip(padded, ks)]) <= 4000
+
+
+def test_uniform_tension_is_exact():
+    # a block pulled at x = L, held by sliding supports on three faces: uniform stress sigma, stretch
+    # sigma L / E and contraction -nu sigma W / E, exactly, for hex8 at any element size
+    h, shape, E, nu, sigma = 0.5, (8, 4, 4), 1000.0, 0.3, 2.0
+    nodes = tuple(n + 1 for n in shape)
+    fixed = np.zeros(nodes + (3,), dtype=bool)
+    fixed[0, :, :, 0] = fixed[:, 0, :, 1] = fixed[:, :, 0, 2] = True
+    force = np.zeros(nodes + (3,))
+    for j in range(shape[1]):
+        for k in range(shape[2]):
+            for dj in (0, 1):
+                for dk in (0, 1):
+                    force[-1, j + dj, k + dk, 0] += sigma * h * h / 4
+    ks, padded = plan_coarsenings(shape)
+    model = Model(FEGrid(np.zeros(3), h, shape, ks), np.ones(shape), fixed, force)
+    material = Material("test", E, nu, 1.0, 100.0)
+    u, its, res = solve(model, material)
+    L, W = shape[0] * h, shape[1] * h
+    assert np.allclose(u[-1, :, :, 0], sigma * L / E, rtol=1e-6)
+    assert np.allclose(u[:, -1, :, 1], -nu * sigma * W / E, rtol=1e-6)
+    assert np.allclose(element_stresses(model, material, u), sigma, rtol=1e-6)
+
+
+def test_multigrid_converges_with_holes_and_a_million_to_one_contrast():
+    # solid and nearly empty blobs (as in a topology optimization), solid plates where it is held
+    # and loaded. With damped Jacobi smoothing this stalled: lmax(D^-1 K) is 3.1 on a uniform part
+    # but 4.2-4.9 where stiff meets soft (see solver.DEGREE)
+    from scipy.ndimage import gaussian_filter
+    rng = np.random.default_rng(3)
+    blobs = gaussian_filter(rng.standard_normal((32, 32, 32)), 2.0)
+    scale = np.where(blobs > np.median(blobs), 1.0, 1e-6)
+    scale[:2] = scale[-2:] = 1.0
+    fixed = np.zeros((33, 33, 33, 3), dtype=bool)
+    fixed[0] = True
+    force = np.zeros((33, 33, 33, 3))
+    force[-1, :, :, 2] = -1.0
+    H = Hierarchy(scale, EL.stiffness(0.3), fixed, plan_coarsenings((32, 32, 32))[0])
+    x, y = rng.standard_normal((2,) + force.shape) * H.free
+    assert np.isclose(np.vdot(y, H.precondition(x)), np.vdot(x, H.precondition(y)), rtol=1e-9)  # symmetric
+    u, its, res = H.solve(force, tol=1e-6)
+    assert res <= 1e-6 and its < 80, its   # 56 when written
+    r = (force * H.free - H.apply(u))
+    assert np.linalg.norm(r) <= 1.01e-6 * np.linalg.norm(force * H.free)
+
+
+# --- the whole analysis on CAD geometry ------------------------------------------------------------
+def _box_step(path, size):
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
+    writer = STEPControl_Writer()
+    writer.Transfer(BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), *size).Shape(), STEPControl_AsIs)
+    writer.Write(str(path))
+    return str(path)
+
+
+@pytest.fixture(scope="module")
+def beam_step(tmp_path_factory):
+    return _box_step(tmp_path_factory.mktemp("fea") / "beam.step", (100, 10, 10))
+
+
+@pytest.fixture(scope="module")
+def beam(beam_step):
+    """A 100 x 10 x 10 mm box as Import STEP gives it."""
+    from engine.graph.nodes import import_step
+    return import_step(beam_step, 0.01, 1, 0.5)[0]
+
+
+def _face_id(mesh, axis, value):
+    """The CAD face lying in the plane coordinate[axis] == value."""
+    ids = mesh.face_attributes["cad_face"]
+    on = np.abs(mesh.triangles_center[:, axis] - value) < 1e-6
+    return int(np.bincount(ids[on]).argmax())
+
+
+def _face_triangles(mesh, axis, value):
+    return mesh.triangles[mesh.face_attributes["cad_face"] == _face_id(mesh, axis, value)]
+
+
+def test_tessellated_faces_point_outward(beam):
+    _, _, normals = sample_triangles(_face_triangles(beam, 2, 10.0), 5.0)
+    assert np.allclose(normals, [0, 0, 1])
+    _, _, normals = sample_triangles(_face_triangles(beam, 0, 0.0), 5.0)
+    assert np.allclose(normals, [-1, 0, 0])
+
+
+def test_loads_add_up_to_the_amount(beam):
+    part = F.body_from_mesh(beam, 2.0)
+    top = _face_triangles(beam, 2, 10.0)
+    conds = Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                        Condition("load", top, load="pressure", amount=0.5),
+                        Condition("load", top, load="force", amount=30.0, direction="custom", vector=(1, 0, 1))))
+    model = build_model(part, conds, h=1.0)
+    total = model.force.reshape(-1, 3).sum(axis=0)
+    # the fixed end's nodes take the load that sits on them: none of the top face's load is lost
+    # there except the strip within one element of the end (1 of 100 mm)
+    expect = np.array([0, 0, -0.5 * 100 * 10]) + 30 * np.array([1, 0, 1]) / np.sqrt(2)
+    assert np.allclose(total, expect, rtol=0.02)
+
+
+def test_cantilever_matches_beam_theory(beam):
+    # Timoshenko: tip deflection F L^3 / (3 E I) + F L / (k G A); bending stress M y / I
+    F_, L, b = 100.0, 100.0, 10.0
+    pla = PRESETS["PLA"]
+    I = b * b ** 3 / 12
+    G = pla.E / (2 * (1 + pla.nu))
+    tip = F_ * L ** 3 / (3 * pla.E * I) + F_ * L / (5 / 6 * G * b * b)
+    part = F.body_from_mesh(beam, 2.0)
+    conds = Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                        Condition("load", _face_triangles(beam, 0, 100.0), amount=F_, direction="-Z")))
+    result = static_analysis(part, conds, pla, h=1.0)
+    deflection = F.sample(result.fields["displacement"], (100.0, 5.0, 5.0))
+    # 1.1% short when written (the plain hex8 1.8%, and 8.8% before the grid started at the part's
+    # corner: half-filled elements on the flat faces); the clamped end makes up most of it
+    assert deflection == pytest.approx(tip, rel=0.02)
+    assert result.report["imbalance"] < 1e-6
+    # bending stress at the centres of the elements next to the top face, half way along
+    model = build_model(part, conds, h=1.0)
+    u, _, _ = solve(model, pla)
+    vm = element_stresses(model, pla, u)
+    i, j, k = 50, 5, 9
+    centre = model.grid.origin + (np.array([i, j, k]) + 0.5) * model.grid.h
+    expect = F_ * (L - centre[0]) * (centre[2] - b / 2) / I
+    assert vm[i, j, k] == pytest.approx(expect, rel=0.01)
+
+
+def test_a_part_without_support_is_refused(beam):
+    part = F.body_from_mesh(beam, 2.0)
+    conds = Conditions((Condition("load", _face_triangles(beam, 0, 100.0), amount=10.0, direction="-Z"),))
+    with pytest.raises(ConditionError, match="not held"):
+        build_model(part, conds, h=2.0)
+
+
+def test_loose_pieces_are_left_out(beam):
+    part = F.union(F.body_from_mesh(beam, 2.0), _ball((50, 40, 5), 4.0))
+    conds = Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                        Condition("load", _face_triangles(beam, 0, 100.0), amount=10.0, direction="-Z")))
+    model = build_model(part, conds, h=1.0, bounds=np.array([[0, 0, 0], [100, 45, 10]]))
+    assert any("loose piece" in n for n in model.notes)
+
+
+def _ball(centre, radius):
+    c = np.asarray(centre, dtype=float)
+    return F.sqrt((F.X - c[0]) * (F.X - c[0]) + (F.Y - c[1]) * (F.Y - c[1]) + (F.Z - c[2]) * (F.Z - c[2])) - radius
+
+
+def test_conditions_away_from_the_part_are_reported(beam):
+    far = _face_triangles(beam, 0, 0.0) + np.array([0.0, 0.0, 50.0])
+    with pytest.raises(ConditionError, match="not on the part"):
+        apply_conditions(*_grid_and_fill(beam), Conditions((Condition("fixed", far),)))
+
+
+def _grid_and_fill(beam):
+    model_part = F.body_from_mesh(beam, 2.0)
+    from engine.fea.model import element_fill, make_grid
+    grid = make_grid(beam.bounds, 2.0)
+    return grid, element_fill(model_part, grid)
+
+
+# --- the nodes -------------------------------------------------------------------------------------
+def _recipe(beam_step, beam, show="stress"):
+    end, tip = _face_id(beam, 0, 0.0), _face_id(beam, 0, 100.0)
+    link = lambda ref: {"link": ref}
+    return {"version": 1, "nodes": {
+        "import": {"type": "input.import_step", "inputs": {"path": beam_step}},
+        "body": {"type": "input.pick_body", "inputs": {"bodies": link("import.bodies")}},
+        "pla": {"type": "sim.material", "inputs": {"preset": "PLA"}},
+        "fixed": {"type": "sim.fixed", "inputs": {"cad": link("body.body"), "faces": str(end)}},
+        "load": {"type": "sim.load", "inputs": {"cad": link("body.body"), "faces": str(tip), "amount": 100.0,
+                                                "direction": "-Z", "add_to": link("fixed.conditions")}},
+        "static": {"type": "sim.static", "inputs": {"part": link("body.body"), "material": link("pla.material"),
+                                                    "conditions": link("load.conditions"), "detail": "draft",
+                                                    "show": show}},
+    }}
+
+
+def test_the_nodes_analyse_a_part_and_report(beam_step, beam):
+    from engine.graph import Evaluator, Graph
+    events = []
+    ev = Evaluator(Graph.from_dict(_recipe(beam_step, beam)), workers=1, log=None, on_event=events.append)
+    out = ev.run(["static"])["static"]
+    lines = [e["text"] for e in events if e["type"] == "message"]
+    assert any(t.startswith("Static analysis (draft") for t in lines), lines
+    assert any("max stress" in t and "safety factor" in t for t in lines), lines
+    stress = out["result"]
+    assert stress.unit == "MPa" and stress.range[1] > 10       # bending stress near the clamp ~60 MPa
+    assert F.sample(out["displacement"], (100.0, 5.0, 5.0)) == pytest.approx(11.4, rel=0.08)
+    done = {e["node"]: e for e in events if e["type"] == "node_done"}
+    fixed_markers, load_markers = done["fixed"]["markers"], done["load"]["markers"]
+    assert fixed_markers[0]["kind"] == "fixed" and len(fixed_markers[0]["points"]) > 0
+    assert load_markers[0]["kind"] == "load" and np.allclose(load_markers[0]["dirs"], [0, 0, -1])
+    assert all(p[0] == pytest.approx(100.0) for p in load_markers[0]["points"])
+
+
+def test_previews_show_supports_and_colour_the_analysed_part(beam_step, beam):
+    from engine.server import build_run_graph
+    _, targets, views, _ = build_run_graph(_recipe(beam_step, beam), "preview", "draft", ["static"])
+    assert {"fixed", "load"} <= set(targets)                         # markers even when nothing is shown
+    assert views["static"][3] == ("static", "result")                # coloured by its own result
+    half_wired = _recipe(beam_step, beam)
+    del half_wired["nodes"]["fixed"]["inputs"]["cad"]
+    _, targets, _, _ = build_run_graph(half_wired, "preview", "draft", [])
+    assert "fixed" not in targets and "load" not in targets         # would fail the run

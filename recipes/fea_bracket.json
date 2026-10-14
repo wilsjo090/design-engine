@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/bracket.step"
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "bracket": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 0
+      },
+      "pos": [
+        300,
+        0
+      ]
+    },
+    "petg": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "PETG"
+      },
+      "pos": [
+        300,
+        420
+      ]
+    },
+    "bolts": {
+      "type": "sim.fixed",
+      "inputs": {
+        "cad": {
+          "link": "bracket.body"
+        },
+        "faces": "8, 9"
+      },
+      "pos": [
+        620,
+        120
+      ]
+    },
+    "push": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "bracket.body"
+        },
+        "faces": "17",
+        "kind": "force",
+        "amount": 200.0,
+        "direction": "+X",
+        "add_to": {
+          "link": "bolts.conditions"
+        }
+      },
+      "pos": [
+        940,
+        120
+      ]
+    },
+    "analysis": {
+      "type": "sim.static",
+      "inputs": {
+        "part": {
+          "link": "bracket.body"
+        },
+        "material": {
+          "link": "petg.material"
+        },
+        "conditions": {
+          "link": "push.conditions"
+        },
+        "detail": "medium",
+        "show": "stress"
+      },
+      "pos": [
+        1260,
+        0
+      ],
+      "visible": true
+    }
+  }
+}
