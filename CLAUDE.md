@@ -101,6 +101,40 @@ Warp's CPU device in threads). All are pure functions of position, so block mesh
 lattice's distance values are sampled once (one cell, or the foam's box) and their quantiles give
 the thickness for each density (`lattice._density_curve`, `_lookup`).
 
+**FEA** (`engine/fea/`, nodes in `engine/graph/nodes_fea.py`; plan in docs/TOPOLOGY_PLAN.md):
+static stress analysis on a voxel grid. `model.py` lays the grid from the part's lowest corner
+(element size from `detail` and the part's volume), fills elements from the part's signed distance
+(`phi`, stiffness `phi * E`), and turns Fixed Faces / Load (CAD triangles sampled h/3 apart, via
+`facemask` face numbers) into fixed DOFs and nodal forces; `Condition.traction(normals, points)`
+gives force, pressure, bearing (contact side, cosine weighted) and torque, and a torque or a
+force's Offset is a rigid-connection turn about the faces' centre (`_turning`: w = I^-1 M, adds
+up to exactly M and no force). `element.py`: hex8 with Wilson's
+incompatible modes (bending exact on cubes). `solver.py`: matrix-free products (slabs for full
+levels, element lists for sparse ones), multigrid with Galerkin coarse levels and Chebyshev
+smoothing, CG; float32 hierarchies (GPU) run CG and the fine product in float64 (all-float32 was
+15% wrong while reporting convergence). `analysis.py`: element-centre von Mises stress, nodal
+fields (`Field.unit`, `display_range` without the artificial peak at supports), report lines,
+displacements kept on the SSD (`FEA_VERSION`). Port types `material`, `conditions`, `part`; node
+options `paint` (Static Analysis colours its own body, `paint_ready` source "result") and `preview`
+(Fixed Faces / Load run in every preview once wired, their `markers` go out with `node_done`).
+`topology.py`: SIMP with density filter, Heaviside projection and optimality criteria on the same
+grid and solver (`prepare` -> `Problem`, `Optimizer.step/run/state`); Max thickness adds a local
+volume constraint (Gaussian neighbourhoods at most `LOCAL_SHARE` full, adaptively scaled p-mean)
+handled by a two-multiplier OC update (`_update_two`, Illinois root finding); `density_mesh` turns the
+densities into a smooth closed mesh (extended straight out past the design space, the state's `space`
+mask, not into Avoid or the gap, from the nearest element inside, which the design space then crops;
+Gap to faces keeps elements near the design space's faces empty except around supports, loads and
+Keep, `_gap_cells`; blurred by the node's Smoothing, the level chosen
+so the volume in the design space stays that of the densities; Smoothing is not part of the
+topology key, so changing it never optimizes again). Node
+Topology Optimization only computes when its hidden `compute` input is set: `build_run_graph`
+sets it for the node of an "optimize" job (`/api/optimize`, queued like exports: `LONG_JOBS`) and
+in exports, and `stamp` (`Session.stamp`, bumped after such jobs) makes previews read the saved
+state again. States are in `cache\topology` (`load_topology` / `save_topology`, keyed by
+`topology_key`; bump `TOPO_VERSION` when the method changes), checkpointed every 5 iterations and
+on Stop; `core.report_view` shows the shape while it runs (`live_view` event); a node's first
+output can carry a `note` shown on its card.
+
 **Meshes** (`engine/meshing.py`): `simplify` (pyfqmr quadric collapse, error threshold scaled by
 voxel², so `keep` is reached at any voxel size) serves both `decimate` and the blocks. `reduce`
 (node Reduce Mesh) works to a tolerance instead: the threshold schedule ends at tolerance²
@@ -123,7 +157,8 @@ field type with a known range should pass `range=` to `Field`.
 at startup). `ArrayCache` is a small RAM LRU in front of `DiskCache`, an SSD folder of `.npy`
 files (`%LOCALAPPDATA%\DesignEngine\cache`) named by content fingerprint, so all processes share
 it and it survives restarts. Bump `CACHE_VERSION` whenever SDF or noise numerics change. Two
-subfolders: `step` (imported STEP meshes) and `shared` (arrays for workers); `clear()` empties all.
+subfolders: `step` (imported STEP meshes), `shared` (arrays for workers) and `topology`
+(optimization states); `clear()` empties all.
 
 **Graph** (`engine/graph/`): `core.py` holds ports, the `@node` registry, the JSON `Graph`
 model and the `Evaluator`. `Graph.from_dict` expands groups (recipe `groups`; a node of type
@@ -198,6 +233,10 @@ UI data lives in the same file. `lamp_noise.json` is the user's current main des
   part with cracks and a hole (the cases that broke earlier GPU versions).
 - Warp kernels run on Warp's own CUDA stream: synchronize between CuPy and Warp work
   (see `sdf_gpu._launch`).
+- FEA on the GPU: keep the conjugate gradients and the fine-level product in float64 (only the
+  multigrid in float32), and check a change against the CPU (`tests/test_gpu.py --gpu`): a
+  float32 solver can report convergence and still be 15% off. Fully fixed faces make artificial
+  stress peaks that grow with finer detail; don't read them as the part's strength.
 - Write TypeScript with the Edit/Write tools, not Python string patches: escapes (`\n`, `\\`)
   were silently changed twice.
 - Profile with the user's editor stopped, or say that it ran: an idle editor held 10.6 GB of RAM

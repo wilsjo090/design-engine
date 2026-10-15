@@ -22,7 +22,15 @@ from scipy.sparse.linalg import splu
 from ..backend import to_host, xp_of
 from .element import CORNERS, child_interpolation, child_offsets
 
-SLAB_BYTES = 64 * 2**20  # temporary memory per batch of elements in a product
+SLAB_BYTES = 64 * 2**20  # temporary memory per batch of elements in a product (CPU)
+# On the GPU each batch is a dozen small kernels, so batches must be big: a V-cycle on a full
+# 96 x 48 x 80 grid took 212 ms with 64 MB batches, 54 with 256 MB, 49 with 1 GB (the memory pool
+# grew from 0.11 to 0.16 and 0.32 GB)
+SLAB_BYTES_GPU = 256 * 2**20
+
+
+def slab_bytes(xp):
+    return SLAB_BYTES if xp is np else SLAB_BYTES_GPU
 # Smoothing: Chebyshev polynomials of the Jacobi-preconditioned operator D^-1 K, aimed at its
 # eigenvalues from lmax / EIG_RATIO to lmax. Plain damped Jacobi diverged where stiff and soft
 # material meet: lmax rose from 3.1 (uniform part) to 4.2-4.9 (1 : 1e6 contrast), so a damping
@@ -34,6 +42,12 @@ POWER_ITERATIONS = 12
 EIG_MARGIN = 1.15
 DIAG_EPS = 1e-12         # a DOF with a diagonal below this (relative) has no material: left out
 DENSE_FILL = 0.5         # levels at least this full go in slabs of the whole grid, emptier ones element by element
+# MIXED precision (float32 hierarchies, i.e. the GPU): conjugate gradients and the fine-level
+# product in float64, the multigrid preconditioner (most of the work) in float32. All-float32 CG
+# reported a residual of 7.6e-6 while the bracket bent 3.60 mm instead of 4.21: for smooth, nearly
+# rigid displacements the element terms of K u cancel, and float32 gets that product ~10% wrong.
+# Iterative refinement (float64 residuals, float32 corrections) was right but took 110 iterations
+# instead of 22, and reliable updates stalled at 6e-2, for the same reason.
 
 
 class NotConverged(RuntimeError):
@@ -44,8 +58,8 @@ def node_shape(shape):
     return tuple(n + 1 for n in shape)
 
 
-def _slabs(shape, bytes_per_element):
-    per = max(1, int(SLAB_BYTES // max(1, bytes_per_element * shape[1] * shape[2])))
+def _slabs(shape, bytes_per_element, xp=np):
+    per = max(1, int(slab_bytes(xp) // max(1, bytes_per_element * shape[1] * shape[2])))
     for x0 in range(0, shape[0], per):
         yield x0, min(shape[0], x0 + per)
 
@@ -192,6 +206,15 @@ class Level:
     def nodes(self):
         return node_shape(self.shape)
 
+    def with_data(self, per_full, const):
+        """A copy of this level with other element data (e.g. float64), sharing cells and nodes."""
+        level = Level.__new__(Level)
+        level.__dict__.update(self.__dict__)
+        n = int(np.prod(self.shape))
+        level.per = per_full if self.cells is None else per_full.reshape(n, *per_full.shape[3:])[self.cells]
+        level.const = const
+        return level
+
     def full(self):
         """`per` in grid layout (nx, ny, nz, ...), zeros where there is no material."""
         if self.cells is None:
@@ -228,7 +251,7 @@ class Level:
         as (m, 24) for the slab (x0, x1) or the node numbers (m, 8) of a batch of elements."""
         if self.cells is None:
             ny, nz = self.shape[1], self.shape[2]
-            for x0, x1 in _slabs(self.shape, row_bytes):
+            for x0, x1 in _slabs(self.shape, row_bytes, self.xp):
                 per = self.per[x0:x1].reshape(-1, *self.per.shape[3:])
                 V = element_values(per, (x0, x1))
                 scatter(out, V.reshape(x1 - x0, ny, nz, 8, 3), x0, x1, self.shape)
@@ -236,7 +259,7 @@ class Level:
         if not out.flags.c_contiguous:
             raise ValueError("the result array must be C-contiguous (its flat view is written to)")
         flat = out.reshape(-1, 3)
-        step = max(1, int(SLAB_BYTES // row_bytes))
+        step = max(1, int(slab_bytes(self.xp) // row_bytes))
         for i0 in range(0, self.count, step):
             conn = self.conn[i0:i0 + step]
             _scatter_add(flat, conn, element_values(self.per[i0:i0 + step], conn).reshape(-1, 8, 3))
@@ -263,6 +286,26 @@ class Level:
     def diagonal(self, dtype, absolute_rows=False):
         d = self.xp.zeros(self.nodes + (3,), dtype=dtype)
         return self._accumulate(lambda per, _: self._diagonals(per, absolute_rows), d, 2 * 24 * 8 * d.itemsize)
+
+    def unit_energies(self, u):
+        """u_e^T KE u_e for every element of a "fine" level (its stiffness factor left out), in grid
+        layout (nx, ny, nz); 0 where there is no material. For topology sensitivities."""
+        xp = self.xp
+        n = int(np.prod(self.shape))
+        out = xp.zeros(n, dtype=u.dtype)
+        KE = self.const.astype(u.dtype)
+        if self.cells is None:
+            per_x = self.shape[1] * self.shape[2]
+            for x0, x1 in _slabs(self.shape, 3 * 24 * 8 * u.itemsize, xp):
+                U = gather(u, x0, x1, self.shape).reshape(-1, 24)
+                out[x0 * per_x:x1 * per_x] = ((U @ KE) * U).sum(axis=1)
+        else:
+            flat = u.reshape(-1, 3)
+            step = max(1, int(slab_bytes(xp) // (3 * 24 * 8 * u.itemsize)))
+            for i0 in range(0, self.count, step):
+                U = flat[self.conn[i0:i0 + step]].reshape(-1, 24)
+                out[self.cells[i0:i0 + step]] = ((U @ KE) * U).sum(axis=1)
+        return out.reshape(self.shape)
 
     def cell_matrices(self):
         """(node numbers (m, 8), element matrices (m, 24, 24)) of the elements with material, on
@@ -332,7 +375,8 @@ def _direct_solver(level, dtype):
     free = np.flatnonzero(to_host(level.free).ravel() > 0)
     if len(free) == 0:
         return lambda r: xp.zeros_like(r)
-    lu = splu(A[free][:, free].tocsc())
+    # minimum degree on A + A^T suits a symmetric matrix: 3x faster than the default on a thin grid
+    lu = splu(A[free][:, free].tocsc(), permc_spec="MMD_AT_PLUS_A")
 
     def solve(r):
         x = np.zeros(n)
@@ -354,6 +398,7 @@ class Hierarchy:
         for n, k in zip(shape, coarsenings):
             if n % (2 ** k):
                 raise ValueError(f"{shape} elements cannot be halved {coarsenings} times")
+        scale_exact = scale
         scale = xp.asarray(scale, dtype=dtype)
         KE = np.asarray(KE, dtype=np.float64)
         fixed = np.asarray(to_host(fixed), dtype=bool)
@@ -389,6 +434,9 @@ class Hierarchy:
         for level in self.levels[:-1]:
             level.lmax = level.estimate_lmax(dtype)
         self.levels[-1].direct = _direct_solver(self.levels[-1], dtype)
+        # the exact operator for float32 solves (only the fine level, in float64)
+        self.exact = None if dtype == np.float64 else self.levels[0].with_data(
+            xp.asarray(scale_exact, dtype=np.float64), xp.asarray(KE, dtype=np.float64))
 
     @property
     def free(self):
@@ -411,22 +459,32 @@ class Hierarchy:
 
     def solve(self, f, u0=None, tol=1e-6, maxiter=1000, callback=None):
         """Solve K u = f on the free DOFs (u = 0 on the others). callback(iteration, relative
-        residual) is called every iteration (progress, cancelling). Returns (u, iterations, residual)."""
+        residual) is called every iteration (progress, cancelling). Returns (u, iterations, residual);
+        u is float64 also when the hierarchy is float32 (see MIXED above)."""
         xp = self.xp
-        f = xp.asarray(f, dtype=self.dtype) * self.free
-        u = xp.zeros_like(f) if u0 is None else xp.asarray(u0, dtype=self.dtype) * self.free
+        if self.exact is None:
+            apply, precondition = self.apply, self.precondition
+        else:
+            low = self.dtype
+            apply = self.exact.apply
+
+            def precondition(r):
+                return self.precondition(r.astype(low)).astype(np.float64)
+        free = self.free.astype(np.float64)
+        f = xp.asarray(f, dtype=np.float64) * free
+        u = xp.zeros_like(f) if u0 is None else xp.asarray(u0, dtype=np.float64) * free
         bnorm = np.sqrt(dot(f, f))
         if bnorm == 0:
             return u, 0, 0.0
-        r = f - self.apply(u)
-        z = self.precondition(r)
+        r = f - apply(u)
+        z = precondition(r)
         p = z.copy()
         rz = dot(r, z)
         res = np.sqrt(dot(r, r)) / bnorm
         for it in range(1, maxiter + 1):
             if res <= tol:
                 return u, it - 1, res
-            q = self.apply(p)
+            q = apply(p)
             alpha = rz / dot(p, q)
             u += alpha * p
             r -= alpha * q
@@ -435,9 +493,13 @@ class Hierarchy:
                 callback(it, res)
             if not np.isfinite(res):
                 break
-            z = self.precondition(r)
+            z_old = z
+            z = precondition(r)
+            # flexible (Polak-Ribiere) beta: robust to a preconditioner that is not exactly the same
+            # linear map every time (float32 rounding); equal to the usual one when it is
             rz, rz_old = dot(r, z), rz
-            p = z + (rz / rz_old) * p
+            beta = (rz - dot(r, z_old)) / rz_old if self.exact is not None else rz / rz_old
+            p = z + beta * p
         if res <= tol:
             return u, maxiter, res
         raise NotConverged(f"the solver did not converge (residual {res:.1e} after {maxiter} iterations)")

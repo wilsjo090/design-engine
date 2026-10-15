@@ -1,0 +1,13 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Material, Fixed Faces, Load and Static Analysis, wired together. Connect your part (Pick Body) to Fixed Faces and Load (Body) and to Static Analysis (Part), pick the held and the loaded faces, type the force, then click the eye on Static Analysis.",
+  "nodes": [
+    {"id": "held", "type": "sim.fixed", "inputs": {"faces": ""}, "links": {}, "pos": [0, 0]},
+    {"id": "force", "type": "sim.load", "inputs": {"faces": "", "kind": "force", "amount": 100.0, "direction": "into the face"},
+     "links": {"add_to": "held.conditions"}, "pos": [320, 0]},
+    {"id": "material", "type": "sim.material", "inputs": {"preset": "PLA"}, "links": {}, "pos": [320, 330]},
+    {"id": "analysis", "type": "sim.static", "inputs": {"detail": "medium", "show": "stress"},
+     "links": {"material": "material.material", "conditions": "force.conditions"}, "pos": [640, 0]}
+  ]
+}

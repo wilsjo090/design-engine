@@ -1,0 +1,13 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Material, Fixed Faces, Load and Topology Optimization, wired together. Connect your design space (Pick Body) to Fixed Faces and Load (Body) and to Topology Optimization (Design space), pick the held and the loaded faces, type the force, set Keep %, then press Optimize on the node.",
+  "nodes": [
+    {"id": "held", "type": "sim.fixed", "inputs": {"faces": ""}, "links": {}, "pos": [0, 0]},
+    {"id": "force", "type": "sim.load", "inputs": {"faces": "", "kind": "force", "amount": 100.0, "direction": "into the face"},
+     "links": {"add_to": "held.conditions"}, "pos": [320, 0]},
+    {"id": "material", "type": "sim.material", "inputs": {"preset": "PLA"}, "links": {}, "pos": [320, 330]},
+    {"id": "topology", "type": "sim.topology", "inputs": {"keep": 30.0, "min_thickness": 0.0, "skin": 2.0, "detail": "draft"},
+     "links": {"material": "material.material", "conditions": "force.conditions"}, "pos": [640, 0]}
+  ]
+}

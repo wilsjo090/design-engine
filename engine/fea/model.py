@@ -3,6 +3,7 @@ the supports and loads taken from CAD faces."""
 import hashlib
 import math
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 
@@ -14,13 +15,16 @@ from .element import CORNERS
 # detail -> (elements inside the part, most elements in the grid's box)
 DETAIL = {"draft": (40_000, 400_000), "medium": (250_000, 2_500_000), "fine": (1_000_000, 8_000_000)}
 PHI_MIN = 0.02            # elements filled less than this are left out
-MAX_COARSE = 4000         # elements on the coarsest multigrid level (solved directly)
+# elements on the coarsest multigrid level (factorized directly, and again every topology
+# iteration): 3000 elements (11k unknowns) took 1.0 s to factorize, 375 took 0.012 s
+MAX_COARSE = 500
 MAX_PADDING = 1.15        # an axis is padded by at most this much to allow another multigrid level
 MAX_SAMPLES = 4_000_000   # points sampled on the faces of one support or load
 FIXED_NEAR = 0.2          # a support fixes the corners whose trilinear weight is at least this per axis
 
 DIRECTIONS = ("into the face", "out of the face", "+X", "-X", "+Y", "-Y", "+Z", "-Z", "custom")
-LOAD_KINDS = ("force", "pressure")
+LOAD_KINDS = ("force", "pressure", "bearing", "torque")
+OFFSET_KINDS = ("force", "bearing")   # loads acting at a point, which Offset moves off the faces
 
 
 class ConditionError(ValueError):
@@ -143,34 +147,154 @@ class Condition:
     kind: str                       # "fixed" or "load"
     triangles: np.ndarray = field(repr=False)
     label: str = ""
-    load: str = "force"             # force (N, total) or pressure (MPa)
+    load: str = "force"             # force (N, total), pressure (MPa), bearing (N) or torque (N m)
     amount: float = 0.0
     direction: str = "into the face"
     vector: tuple = (0.0, 0.0, -1.0)
+    offset: tuple = (0.0, 0.0, 0.0)  # force and bearing: where the force acts, mm from the faces' centre
 
     @property
     def key(self):
         tri = np.ascontiguousarray(self.triangles, dtype=np.float64)
-        return _digest(self.kind, hashlib.sha1(tri.tobytes()).hexdigest(), self.load, float(self.amount),
-                       self.direction, tuple(float(v) for v in self.vector))
+        parts = (self.kind, hashlib.sha1(tri.tobytes()).hexdigest(), self.load, float(self.amount),
+                 self.direction, tuple(float(v) for v in self.vector))
+        if self.offset_moment() is not None:  # (loads without an offset keep their keys)
+            parts += (tuple(float(v) for v in self.offset),)
+        return _digest(*parts)
 
     @property
     def area(self):
         t = self.triangles
         return float(0.5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1).sum())
 
-    def traction(self, normals):
-        """Force per mm^2 at points with these outward normals (n, 3)."""
+    @cached_property
+    def geometry(self):
+        """(area, centre, inertia tensor of the area about the centre, area-weighted mean normal) of
+        the faces, exact for flat triangles (int r r^T dA = A/12 (sum v v^T + s s^T) per triangle)."""
+        t = np.asarray(self.triangles, dtype=np.float64).reshape(-1, 3, 3)
+        cross = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+        a = 0.5 * np.linalg.norm(cross, axis=1)
+        area = float(a.sum())
+        if area <= 0:
+            return 0.0, np.zeros(3), np.zeros((3, 3)), np.zeros(3)
+        centre = (a[:, None] * t.mean(axis=1)).sum(axis=0) / area
+        v = t - centre
+        s = v.sum(axis=1)
+        second = (np.einsum("k,kci,kcj->ij", a, v, v) + np.einsum("k,ki,kj->ij", a, s, s)) / 12
+        inertia = np.trace(second) * np.eye(3) - second
+        return area, centre, inertia, 0.5 * cross.sum(axis=0) / area
+
+    def traction(self, normals, points=None):
+        """Force per mm^2 at points on the faces with these outward normals (n, 3). A torque and a
+        force with an offset also need the points."""
         if self.kind != "load":
             return np.zeros_like(normals)
         if self.load == "pressure":
             return -float(self.amount) * normals  # a positive pressure pushes into the face
-        per_area = float(self.amount) / max(self.area, 1e-12)
-        if self.direction == "into the face":
-            return -per_area * normals
-        if self.direction == "out of the face":
-            return per_area * normals
-        return np.broadcast_to(per_area * direction_vector(self.direction, self.vector), normals.shape).copy()
+        if self.load == "torque":
+            return self._turning(points, 1000.0 * float(self.amount) * self.torque_axis())  # N m -> N mm
+        if self.load == "bearing":
+            # a pin pressing on the side of a hole the force points to: pressure square to the face,
+            # largest where the face looks straight against the force, falling as the cosine to 0 at
+            # the sides, none on the far side (as SolidWorks' bearing load); total = the force
+            d = self.bearing_direction()
+            w = np.maximum(-(normals @ d), 0.0)
+            t = (float(self.amount) / self._bearing_norm(d)) * w[:, None] * -normals
+        else:
+            per_area = float(self.amount) / max(self.area, 1e-12)
+            if self.direction == "into the face":
+                t = -per_area * normals
+            elif self.direction == "out of the face":
+                t = per_area * normals
+            else:
+                t = np.broadcast_to(per_area * direction_vector(self.direction, self.vector), normals.shape).copy()
+        moment = self.offset_moment()
+        return t if moment is None else t + self._turning(points, moment)
+
+    def resultant(self):
+        """The load's total force (N), as a vector."""
+        if self.kind != "load" or self.load == "torque":
+            return np.zeros(3)
+        if self.load == "pressure":
+            area, _, _, mean_normal = self.geometry
+            return -float(self.amount) * area * mean_normal
+        if self.load == "bearing" or self.direction not in ("into the face", "out of the face"):
+            return float(self.amount) * direction_vector(self.direction, self.vector)
+        sign = -1.0 if self.direction == "into the face" else 1.0
+        return sign * float(self.amount) * self.geometry[3]
+
+    def offset_moment(self):
+        """The moment (N mm, about the faces' centre) of a force acting at Offset, or None."""
+        if self.kind != "load" or self.load not in OFFSET_KINDS or not any(self.offset):
+            return None
+        return np.cross(np.asarray(self.offset, dtype=float), self.resultant())
+
+    def torque_axis(self):
+        """The axis a torque turns about (right-hand rule). into the face on a flat face: the way a
+        screw is driven into it (clockwise seen from outside); out of the face: loosening it."""
+        if self.direction not in ("into the face", "out of the face"):
+            return direction_vector(self.direction, self.vector)
+        n = self.geometry[3]
+        if np.linalg.norm(n) < 0.5:
+            raise ConditionError("a torque on a round face (a hole, a shaft) or on faces facing several ways needs "
+                                 "the axis it turns about, e.g. +Y (or drag the yellow arrow): into the face only "
+                                 "works on a flat face")
+        n = n / np.linalg.norm(n)
+        return -n if self.direction == "into the face" else n
+
+    def arrow(self):
+        """The direction to draw the load's big arrow: its force, or a torque's axis (None for none)."""
+        if self.kind != "load" or self.load == "pressure":
+            return None
+        v = self.torque_axis() if self.load == "torque" else self.resultant()
+        size = np.linalg.norm(v)
+        return v / size if size > 1e-12 else None
+
+    def _turning(self, points, moment):
+        """Traction adding up to no force and to `moment` (N mm) about the faces' centre: a turn
+        about the centre that grows with the distance from it, as through a rigid connection (a
+        shaft's torque on its hole, bolts on a circle; SolidWorks' rigid remote load). For the turn
+        w: moment = sum of r x (w x r) dA = inertia w."""
+        if points is None:
+            raise ValueError("this load needs the points as well as the normals")
+        area, centre, inertia, _ = self.geometry
+        if area <= 0:
+            return np.zeros((len(points), 3))
+        spin = np.linalg.lstsq(inertia, np.asarray(moment, dtype=float), rcond=1e-9)[0]
+        return np.cross(spin, np.asarray(points, dtype=float) - centre)
+
+    def check(self):
+        """Raise ConditionError now for settings this load cannot use (rather than in the analysis)."""
+        if self.kind == "load" and len(self.triangles):
+            self.traction(np.zeros((0, 3)), np.zeros((0, 3)))
+            self.arrow()
+
+    def presses(self, normals):
+        """Where the load acts on its own (not counting an offset's moment): a bearing load only on
+        the contact side, the others everywhere."""
+        if self.kind == "load" and self.load == "bearing":
+            return -(normals @ self.bearing_direction()) > 0
+        return np.ones(len(normals), dtype=bool)
+
+    def bearing_direction(self):
+        if self.direction in ("into the face", "out of the face"):
+            raise ConditionError("a bearing load needs a direction (e.g. -Z): the side of the hole the pin "
+                                 "presses on")
+        return direction_vector(self.direction, self.vector)
+
+    def _bearing_norm(self, d):
+        """sum over the faces of area x w^2 (w = cos of the angle against the force): the pressure
+        p0 w along -n then adds up to p0 x this along the force."""
+        t = self.triangles
+        cross = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+        double = np.linalg.norm(cross, axis=1)
+        n = cross / np.maximum(double, 1e-300)[:, None]
+        w = np.maximum(-(n @ d), 0.0)
+        total = float((0.5 * double * w * w).sum())
+        if total <= 0:
+            raise ConditionError("bearing load: no part of the faces faces against the force (check the "
+                                 "direction: a pin pulled down presses on the bottom of the hole: -Z)")
+        return total
 
 
 def direction_vector(direction, vector=(0, 0, -1)):
@@ -253,6 +377,11 @@ def markers(condition, count=24):
         return np.zeros((0, 3)), np.zeros((0, 3))
     cell = math.sqrt(area / count)
     pts, _, normals = sample_triangles(condition.triangles, cell / 3)
+    if condition.kind == "load":  # only where the load acts (a bearing load: the contact side)
+        size = np.linalg.norm(condition.traction(normals, pts), axis=1)
+        on = size > 0.05 * size.max() if size.max() > 0 else np.ones(len(size), dtype=bool)
+        pts, normals = pts[on], normals[on]
+        cell = math.sqrt(area * on.mean() / count) if on.any() else cell
     keys = np.floor(pts / cell).astype(np.int64)
     _, first = np.unique(keys, axis=0, return_index=True)
     if len(first) > count:
@@ -261,7 +390,7 @@ def markers(condition, count=24):
     if condition.kind == "fixed":
         dirs = -normals
     else:
-        dirs = condition.traction(normals)
+        dirs = condition.traction(normals, pts)
         norm = np.linalg.norm(dirs, axis=1, keepdims=True)
         dirs = np.where(norm > 0, dirs / np.maximum(norm, 1e-300), -normals)
     return pts, dirs
@@ -309,7 +438,11 @@ def apply_conditions(grid, phi, conditions):
         ws, total, corners = ws[ok], total[ok], corners[ok]
         ws /= total[:, None]
         keep_full = areas.sum() / areas[ok].sum()   # the share off the part is put on the rest
-        f = cond.traction(normals[ok]) * areas[ok, None] * keep_full
+        f = cond.traction(normals[ok], pts[ok]) * areas[ok, None] * keep_full
+        moment = cond.offset_moment()
+        if moment is not None:
+            notes.append(f"{cond.label or 'load'}: acts {np.linalg.norm(cond.offset):.3g} mm from the centre of its "
+                         f"faces, so they also carry a moment of {np.linalg.norm(moment) / 1000:.3g} N·m")
         flat = np.ravel_multi_index((corners[..., 0], corners[..., 1], corners[..., 2]), nodes).ravel()
         for d in range(3):
             force[:, d] += np.bincount(flat, weights=(ws * f[:, None, d]).ravel(), minlength=len(force))

@@ -1,6 +1,21 @@
 # FEA and topology optimization: plan
 
-Status 2026-10-14: plan only, nothing built yet. Decisions marked **(open)** are the user's.
+Status 2026-10-14: phases 1 (static analysis) and 2 (topology optimization, with the Optimize
+button: the user's choice) built and tested; measurements and what changed from this plan in
+FINDINGS.md, "Static analysis" and "Topology optimization". Phase 3 is open. Decisions still
+marked **(open)** are the user's.
+
+Changes from the plan in phase 2: the stopping test is the compliance settling (no density
+changing by < 0.01 never happened); inner solves to 1e-2; the result body is the density's
+smoothed 0.5 surface as an exact distance field (no separate connectivity filter beyond dropping
+pieces under 1% of the largest); `compute` / `stamp` hidden inputs as planned; the live shape is
+the raw 0.5 surface every 3 iterations.
+
+Changes from the plan in phase 1: "Show stress" is the node's own eye plus a *Show* input
+(stress / safety factor / displacement); supports and loads are drawn as cones and arrows at a
+few points of their faces (over the part), not as hatching; the GPU runs CG in float64 with a
+float32 multigrid (all-float32 was wrong); the report and colours leave out the artificial stress
+peak at fully fixed faces.
 
 Goal: find where a part is weak (static analysis) and let the engine remove material where it
 does no work (topology optimization), as easily as the texture tools: pick faces, type a force,
@@ -322,6 +337,18 @@ Targets, to be measured in phase 1/2 (estimates, editor stopped):
   shape shows progress.
 - Thresholding can leave thin or disconnected bits: projection, the connectivity filter and min
   thickness handle most; Smoothen Body is still available.
+
+Added after phase 2 (2026-10-15): **Max thickness** on Topology Optimization (local volume
+constraint), for branchier, more organic designs; see FINDINGS.md, "Max thickness".
+
+Added 2026-10-15: a **bearing** Load kind (a pin presses only on the side of its hole the force
+points to) and Members **struts only**; the answer to "a big flat member" turned out to be holding
+the part where it is really held (bolt holes, not a whole glued face). See FINDINGS.md, "Bearing
+load, and the big flat member".
+
+Added 2026-10-15: a **torque** Load kind and an **Offset** for forces (a force acting away from
+its faces), both as a rigid-connection moment on the faces; dragged in the 3D view. See
+FINDINGS.md, "Torque and offset forces".
 
 ## Open questions for the user
 

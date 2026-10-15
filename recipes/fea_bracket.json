@@ -55,7 +55,7 @@
         },
         "faces": "17",
         "kind": "force",
-        "amount": 200.0,
+        "amount": 50.0,
         "direction": "+X",
         "add_to": {
           "link": "bolts.conditions"

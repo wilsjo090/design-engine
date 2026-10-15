@@ -66,13 +66,13 @@ export interface CheckReport {
 
 /** Colours for a view (a value per vertex) from the engine. */
 export async function fetchPaint(node: string, meta: { version: number; view_version: number; min: number; max: number;
-  label: string; unit?: string; reverse?: boolean }, source: Paint['source']) {
+  label: string; unit?: string; reverse?: boolean; clipped?: boolean }, source: Paint['source']) {
   const res = await fetch(`/api/view/${encodeURIComponent(`paint:${node}`)}`)
   if (!res.ok) return
   const values = new Float32Array(await res.arrayBuffer())
   const version = Number(res.headers.get('X-View-Version') ?? meta.version)
   useStore.getState().setPaint(node, { version, viewVersion: meta.view_version, values, min: meta.min, max: meta.max,
-    label: meta.label, source, unit: meta.unit, reverse: meta.reverse })
+    label: meta.label, source, unit: meta.unit, reverse: meta.reverse, clipped: meta.clipped })
 }
 
 /** A short name for an export in the queue: the recipe and the time it was asked for. */
@@ -80,6 +80,18 @@ function exportLabel() {
   const path = useStore.getState().recipePath
   const name = path ? path.split(/[\\/]/).pop()!.replace(/\.json$/i, '') : 'untitled'
   return `${name} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+}
+
+/** Optimize a Topology Optimization node: a long job, queued like an export (previews wait for it).
+ *  The node is shown so its shape can be watched growing. */
+export async function startOptimize(node: string) {
+  const s = useStore.getState()
+  if (!s.visible.includes(node)) s.toggleVisible(node)
+  try {
+    await postJSON('/api/optimize', { graph: s.recipe(), node, quality: s.quality, visible: useStore.getState().visible })
+  } catch (err) {
+    s.addLog(`Could not start: ${(err as Error).message}`, 'error')
+  }
 }
 
 /** Start a run with the current graph. Export always runs at final quality. */
@@ -145,14 +157,17 @@ async function fetchSlice(e: { node: string; version: number; axis: Axis; positi
   })
 }
 
-/** A desktop notification when an export finishes (exports can take minutes). */
+/** A desktop notification when an export or an optimization finishes (they can take minutes). */
 function notifyExport(e: { ok: boolean; label: string; files?: Record<string, string>; error?: string }) {
+  const optimizing = e.label.startsWith('optimize ')
   const files = Object.values(e.files ?? {}).filter(Boolean)
-  const body = e.ok ? (files.length ? files.join('\n') : 'Nothing was written') : (e.error ?? 'Failed')
+  const body = e.ok ? (optimizing ? 'The result is shown in the 3D view' : files.length ? files.join('\n') : 'Nothing was written')
+    : (e.error ?? 'Failed')
+  const what = optimizing ? 'Optimization' : 'Export'
   document.title = `${e.ok ? '✓' : '✗'} Design Engine`
   setTimeout(() => { document.title = 'Design Engine' }, 15000)
   if ('Notification' in window && Notification.permission === 'granted') {
-    try { new Notification(e.ok ? `Export finished: ${e.label}` : `Export failed: ${e.label}`, { body }) } catch { /* ignore */ }
+    try { new Notification(`${what} ${e.ok ? 'finished' : 'failed'}: ${e.label}`, { body }) } catch { /* ignore */ }
   }
 }
 

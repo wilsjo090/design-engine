@@ -91,6 +91,16 @@ def parallel_map(fn, arg_list, need=0, gpu=False, title="Blocks", gpu_need=0):
     return evaluator._map_in_workers(node_id, fn, arg_list, need, gpu, title, gpu_need)
 
 
+def report_view(mesh):
+    """Called by long node functions to show an intermediate shape in the 3D view (the editor shows
+    it as the node's view; the node's real result replaces it when it is done)."""
+    ctx = getattr(_current, "ctx", None)
+    if ctx is None:
+        return
+    evaluator, node_id = ctx
+    evaluator._emit(type="live_view", node=node_id, mesh=mesh)
+
+
 def report_message(text, level="info"):
     """Called by node functions to put a line in the editor's log (level: info or error)."""
     ctx = getattr(_current, "ctx", None)
@@ -145,6 +155,7 @@ class Port:
     choices: list = None   # for enum-like text inputs
     many: bool = False     # receive a whole Many instead of mapping over it
     optional: bool = False # may be left unconnected (value None)
+    hidden: bool = False   # set by the server, not shown in the editor (Topology Optimization's compute)
 
     def __post_init__(self):
         self.label = self.label or self.name.replace("_", " ").title()
@@ -153,7 +164,7 @@ class Port:
         d = {"name": self.name, "type": self.type, "label": self.label}
         if self.default is not REQUIRED:
             d["default"] = self.default
-        for k in ("doc", "choices", "many", "optional"):
+        for k in ("doc", "choices", "many", "optional", "hidden"):
             if getattr(self, k):
                 d[k] = getattr(self, k)
         return d
@@ -448,14 +459,16 @@ def _output_range(outputs):
     return None if lo is None else [lo, hi]
 
 
-def _output_markers(outputs):
-    """What a node wants drawn in the 3D view (supports, loads), from its first output's `markers`
-    (a list for a list of values)."""
+def _output_extras(outputs):
+    """Extra node_done fields from a node's first output: `markers` (supports and loads to draw in
+    the 3D view; a list for a list of values) and `note` (a line shown on the node's card)."""
     if not outputs:
-        return None
+        return {}
     value = next(iter(outputs.values()))
-    found = [m for v in (value if isinstance(value, list) else [value]) if (m := getattr(v, "markers", None))]
-    return found or None
+    items = value if isinstance(value, list) else [value]
+    found = [m for v in items if (m := getattr(v, "markers", None))]
+    notes = [n for v in items if (n := getattr(v, "note", None))]
+    return {"markers": found or None, "note": notes[0] if notes else None}
 
 
 def _literal_signature(port, value):
@@ -628,7 +641,7 @@ class Evaluator:
             if cached and cached[0] == sig and not ntype.side_effect:
                 results[node_id] = cached[1]
                 self._emit(type="node_done", node=node_id, time=0.0, cached=True, range=_output_range(cached[1]),
-                           markers=_output_markers(cached[1]))
+                           **_output_extras(cached[1]))
                 continue
             start = time.perf_counter()
             self._emit(type="node_start", node=node_id)
@@ -650,7 +663,7 @@ class Evaluator:
             self.computed.append(node_id)
             took = time.perf_counter() - start
             self._emit(type="node_done", node=node_id, time=took, cached=False, range=_output_range(outputs),
-                       markers=_output_markers(outputs))
+                       **_output_extras(outputs))
             if took > 0.05 or ntype.side_effect:
                 self.log(f"[{time.perf_counter() - t0:6.1f}s] {node_id} ({ntype.title}) {took:.1f}s")
         return results

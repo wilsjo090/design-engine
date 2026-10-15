@@ -117,8 +117,8 @@ function QueueButton() {
   return (
     <span className="queue">
       <button className={open ? 'on' : ''} onClick={() => setOpen((o) => !o)}
-        title="Exports run one after another; previews wait until they are done">
-        Exports: {queue.current ? 1 : 0} running{waiting ? `, ${waiting} waiting` : ''}
+        title="Exports and optimizations run one after another; previews wait until they are done">
+        Jobs: {queue.current ? 1 : 0} running{waiting ? `, ${waiting} waiting` : ''}
       </button>
       {open && (
         <div className="queue-menu" onMouseLeave={() => setOpen(false)}>
@@ -130,7 +130,7 @@ function QueueButton() {
                 onClick={() => api.removeQueued(j.id).then((q) => useStore.getState().setQueue(q))}>×</button>
             </div>
           ))}
-          {queue.preview_waiting && <div className="queue-row muted">The preview updates after the exports</div>}
+          {queue.preview_waiting && <div className="queue-row muted">The preview updates after these jobs</div>}
         </div>
       )}
     </span>

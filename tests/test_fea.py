@@ -70,11 +70,11 @@ def test_coarse_levels_are_galerkin_operators_of_the_fixed_fine_one(layout):
 
 
 def test_coarsening_plan_pads_little():
-    ks, padded = plan_coarsenings((100, 10, 10))
-    assert padded == (100, 10, 10) and ks == (1, 1, 1)
-    ks, padded = plan_coarsenings((203, 61, 33))
-    assert all(p <= 1.15 * n for p, n in zip(padded, (203, 61, 33)))
-    assert np.prod([p // 2 ** k for p, k in zip(padded, ks)]) <= 4000
+    from engine.fea.model import MAX_COARSE, MAX_PADDING
+    for shape in ((100, 10, 10), (203, 61, 33), (30, 10, 10)):
+        ks, padded = plan_coarsenings(shape)
+        assert all(n <= p <= MAX_PADDING * n and p % 2 ** k == 0 for p, n, k in zip(padded, shape, ks))
+        assert np.prod([p // 2 ** k for p, k in zip(padded, ks)]) <= MAX_COARSE
 
 
 def test_uniform_tension_is_exact():
@@ -175,6 +175,105 @@ def test_loads_add_up_to_the_amount(beam):
     # there except the strip within one element of the end (1 of 100 mm)
     expect = np.array([0, 0, -0.5 * 100 * 10]) + 30 * np.array([1, 0, 1]) / np.sqrt(2)
     assert np.allclose(total, expect, rtol=0.02)
+
+
+def test_a_bearing_load_presses_only_on_the_contact_side():
+    # a pin pulled down in the wall bracket's hole (axis along Y at x = 50, z = 40, radius 4): the
+    # 200 N go on the bottom half only, square to the face, adding up to 200 N straight down
+    from engine.fea.model import markers
+    from engine.graph.nodes import import_step
+    from pathlib import Path
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
+                       0.01, 1, 0.5)[0]
+    ids = mesh.face_attributes["cad_face"]
+    hole = Condition("load", mesh.triangles[ids == 6], load="bearing", amount=200.0, direction="-Z")
+    pts, areas, normals = sample_triangles(hole.triangles, 0.5)
+    t = hole.traction(normals)
+    assert np.allclose((t * areas[:, None]).sum(axis=0), [0, 0, -200], atol=2.0)   # within 1%
+    assert np.all(np.linalg.norm(t[pts[:, 2] > 40.01], axis=1) == 0)                # nothing on the top half
+    bottom = np.argmin(pts[:, 2])
+    assert t[bottom] @ [0, 0, -1] > 0.95 * np.linalg.norm(t, axis=1).max()        # most at the very bottom
+    marker_points, _ = markers(hole)
+    assert len(marker_points) and np.all(marker_points[:, 2] <= 40.0 + 1e-6)
+    with pytest.raises(ConditionError, match="needs a direction"):
+        Condition("load", hole.triangles, load="bearing", amount=1.0, direction="into the face").traction(normals)
+
+
+def test_a_torque_turns_about_its_axis_and_adds_up_to_no_force():
+    # 2 N m about +Y on the wall bracket's pin hole (axis along Y at x = 50, z = 40, radius 4):
+    # tangential everywhere, no net force, exactly the moment; right-hand rule: the bottom moves -X
+    from engine.graph.nodes import import_step
+    from pathlib import Path
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
+                       0.01, 1, 0.5)[0]
+    hole = Condition("load", mesh.triangles[mesh.face_attributes["cad_face"] == 6], load="torque", amount=2.0,
+                     direction="+Y")
+    pts, areas, normals = sample_triangles(hole.triangles, 0.25)
+    t = hole.traction(normals, pts)
+    f = t * areas[:, None]
+    centre = hole.geometry[1]
+    assert np.allclose(centre, [50, 15, 40], atol=1e-6)
+    assert np.allclose(f.sum(axis=0), 0, atol=1e-6)
+    assert np.allclose(np.cross(pts - centre, f).sum(axis=0), [0, 2000, 0], atol=0.1)
+    size = np.linalg.norm(t, axis=1)
+    assert np.allclose(size, size.mean(), rtol=0.01)                                # the same all round
+    assert np.all(np.abs(np.einsum("ij,ij->i", t, normals)) < 0.06 * size)          # along the (faceted) wall
+    assert np.all(np.abs(t[:, 1]) < 1e-9) and t[np.argmin(pts[:, 2]), 0] < 0
+    with pytest.raises(ConditionError, match="needs the axis"):                    # a round face has no "into"
+        Condition("load", hole.triangles, load="torque", amount=1.0).check()
+
+
+def test_a_force_with_an_offset_acts_as_if_it_were_there(beam):
+    # 100 N down, 50 mm beyond the beam's end face: the face carries the force and its moment, so
+    # about the point where the force acts the face's load turns nothing
+    end = Condition("load", _face_triangles(beam, 0, 100.0), amount=100.0, direction="-Z", offset=(50.0, 0, 0))
+    pts, areas, normals = sample_triangles(end.triangles, 0.5)
+    f = end.traction(normals, pts) * areas[:, None]
+    there = end.geometry[1] + [50, 0, 0]
+    assert np.allclose(f.sum(axis=0), [0, 0, -100], atol=1e-9)
+    assert np.allclose(np.cross(pts - there, f).sum(axis=0), 0, atol=10)         # of 5000 N mm (4 when written)
+    plain = Condition("load", end.triangles, amount=100.0, direction="-Z")
+    assert plain.key == Condition("load", end.triangles, amount=100.0, direction="-Z", offset=(0, 0, 0)).key
+    assert plain.key != end.key
+    assert Condition("load", end.triangles, load="pressure", amount=1.0, offset=(5, 0, 0)).offset_moment() is None
+
+
+def test_an_offset_force_bends_a_cantilever_like_the_force_and_its_moment(beam):
+    # Timoshenko tip deflection plus that of the end moment M = F e: F L^3/(3EI) + F L/(kGA) + M L^2/(2EI)
+    F_, L, b, e = 100.0, 100.0, 10.0, 50.0
+    pla = PRESETS["PLA"]
+    I = b * b ** 3 / 12
+    G = pla.E / (2 * (1 + pla.nu))
+    tip = F_ * L ** 3 / (3 * pla.E * I) + F_ * L / (5 / 6 * G * b * b) + F_ * e * L ** 2 / (2 * pla.E * I)
+    conds = Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                        Condition("load", _face_triangles(beam, 0, 100.0), amount=F_, direction="-Z",
+                                  offset=(e, 0, 0))))
+    result = static_analysis(F.body_from_mesh(beam, 2.0), conds, pla, h=1.0)
+    assert F.sample(result.fields["displacement"], (100.0, 5.0, 5.0)) == pytest.approx(tip, rel=0.02)
+    assert any("also carry a moment of 5 N·m" in n for n in result.report["notes"])
+
+
+def test_a_torque_twists_a_square_bar_as_saint_venant(beam):
+    # twist per length T / (G J), J = 0.1406 a^4 for a square bar; measured between 10 and 90 mm
+    # (away from the clamped end and the loaded one) on the middle of the top face, where the
+    # section does not warp, so it moves by the twist angle x 5 mm
+    T_, a = 5.0, 10.0
+    pla = PRESETS["PLA"]
+    G = pla.E / (2 * (1 + pla.nu))
+    rate = 1000 * T_ / (G * 0.1406 * a ** 4)
+    conds = Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                        Condition("load", _face_triangles(beam, 0, 100.0), load="torque", amount=T_,
+                                  direction="+X")))
+    model = build_model(F.body_from_mesh(beam, 2.0), conds, h=1.0)
+    total = model.force.reshape(-1, 3)
+    nodes = model.grid.origin + np.stack(np.meshgrid(*[np.arange(n) for n in model.grid.nodes], indexing="ij"),
+                                         axis=-1).reshape(-1, 3) * model.grid.h
+    assert np.allclose(total.sum(axis=0), 0, atol=1e-6)
+    assert np.allclose(np.cross(nodes - [100, 5, 5], total).sum(axis=0), [1000 * T_, 0, 0], rtol=1e-3)
+    result = static_analysis(F.body_from_mesh(beam, 2.0), conds, pla, h=1.0)
+    turn = lambda x: F.sample(result.fields["displacement"], (x, 5.0, 10.0)) / 5.0
+    assert (turn(90.0) - turn(10.0)) / 80.0 == pytest.approx(rate, rel=0.03)
+    assert result.report["imbalance"] < 1e-6
 
 
 def test_cantilever_matches_beam_theory(beam):

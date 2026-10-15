@@ -11,9 +11,11 @@ const STOPS: Record<ColorMap, string[]> = {
   heat: ['#30123b', '#4662d7', '#36aaf9', '#1ae4b6', '#72fe5e', '#c8ef34', '#faba39', '#f66b19', '#ca2a04', '#7a0403'],
   // blue below zero, red above: for distances (inside / outside)
   signed: ['#2166ac', '#67a9cf', '#f7f7f7', '#ef8a62', '#b2182b'],
+  // blue to red as in FEA programs: turbo without its near-black ends (a safe part read as black)
+  rainbow: ['#3b6fe0', '#36aaf9', '#1ae4b6', '#72fe5e', '#c8ef34', '#faba39', '#f66b19', '#d92b04'],
 }
 
-export const COLOR_MAP_LABELS: Record<ColorMap, string> = { bands: 'Bands', heat: 'Heat', signed: '± Signed' }
+export const COLOR_MAP_LABELS: Record<ColorMap, string> = { bands: 'Bands', heat: 'Heat', signed: '± Signed', rainbow: 'Rainbow' }
 
 export function lut(cmap: ColorMap) {
   const stops = STOPS[cmap].map((h) => new THREE.Color(h))

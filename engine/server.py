@@ -55,6 +55,7 @@ DISPLAY_MAX_FACES = 15_000_000
 PAINT_CELLS = {"draft": 128, "medium": 192, "final": 256}
 PAINT_MAX_VOXELS = 12_000_000
 PRESET_NAME = re.compile(r"^[\w\- ]{1,60}$")
+LONG_JOBS = ("export", "optimize")  # queued, never cancelled by previews (which wait for them)
 
 
 class Hub:
@@ -83,7 +84,18 @@ def _wired(graph, node_id):
         return False
 
 
-def build_run_graph(graph_dict, mode, quality, visible):
+def _set_compute(graph, mode, optimize, stamp):
+    """Hidden inputs of nodes that run long jobs only on request (Topology Optimization): compute
+    for the node being optimized (and in exports), stamp so their results are read again after a job."""
+    for node_id, spec in graph.nodes.items():
+        ntype = REGISTRY.get(spec.get("type"))
+        if ntype is not None and any(p.name == "compute" and p.hidden for p in ntype.inputs):
+            inputs = spec.setdefault("inputs", {})
+            inputs["compute"] = 1 if (mode == "export" or node_id == optimize) else 0
+            inputs["stamp"] = int(stamp)
+
+
+def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0):
     """The graph actually evaluated: preview quality applied to mesh nodes, plus hidden
     `mesh.view` nodes for visible implicit bodies. Returns (graph, targets, views, slices) where
     views maps a visible node id to (node id, port, type) holding its displayable output and
@@ -105,6 +117,11 @@ def build_run_graph(graph_dict, mode, quality, visible):
             # looks the same unfused, and coarse draft meshes may not overlap enough to join
             spec.setdefault("inputs", {})["fuse"] = "no"
 
+    _set_compute(graph, mode, optimize, stamp)
+    if mode == "optimize":
+        if optimize not in graph.nodes:
+            raise GraphError(f"no node '{optimize}' to optimize")
+        return graph, [optimize], {}, {}
     targets, views, slices = [], {}, {}
     if mode == "export":
         targets = [n for n, s in graph.nodes.items() if s.get("type") in REGISTRY and REGISTRY[s["type"]].side_effect]
@@ -233,9 +250,21 @@ class Session:
         self._lock = threading.Lock()
         self._start_lock = threading.Lock()
         self._requests = 0
+        self.stamp = 0  # bumped after optimize/export jobs: previews then read optimization results again
 
     def _on_event(self, event):
         node = event.get("node", "")
+        if event.get("type") == "live_view":  # a shape while optimizing, shown as the node's view
+            node = self._owners.get(node, node)
+            data, nv, nf = pack_meshes(event["mesh"])
+            with self._lock:
+                self.view_version += 1
+                self.views[node] = (self.view_version, data)
+                self.view_faces.pop(node, None)
+                version = self.view_version
+            self.hub.publish({"type": "view_ready", "node": node, "version": version, "verts": nv, "faces": nf,
+                              "kind": "mesh", "live": True, "run": self.run_id})
+            return
         if node.startswith("__view__"):  # report hidden preview nodes as the node they show
             event = dict(event, node=node[len("__view__"):], view=True)
         elif node in self._owners:
@@ -256,11 +285,11 @@ class Session:
         return out
 
     # --- runs and the export queue ------------------------------------------------------
-    def start(self, graph_dict, mode, quality, visible, slice_settings=None, label=None):
+    def start(self, graph_dict, mode, quality, visible, slice_settings=None, label=None, optimize=None):
         if quality not in QUALITY:
             raise HTTPException(400, f"unknown quality '{quality}'")
         try:
-            graph, targets, views, slices = build_run_graph(graph_dict, mode, quality, visible)
+            graph, targets, views, slices = build_run_graph(graph_dict, mode, quality, visible, optimize, self.stamp)
         except Exception as err:
             raise HTTPException(400, f"bad graph: {err}")
         job = {"id": next(self._job_ids), "graph": graph, "targets": targets, "views": views, "slices": slices,
@@ -274,13 +303,13 @@ class Session:
         # only the newest preview of them runs. Exports are never dropped or cancelled by others.
         with self._start_lock:
             if self.exporting():
-                if mode == "export":
+                if mode in LONG_JOBS:
                     self.queue.append(job)
                 else:
                     self.pending = job  # runs when the exports are done
                 self._publish_queue()
                 return self.run_id
-            if mode != "export" and ticket != self._requests:
+            if mode not in LONG_JOBS and ticket != self._requests:
                 return self.run_id
             self.cancel()
             self._launch(job)
@@ -288,7 +317,7 @@ class Session:
 
     def exporting(self):
         job = self.current or {}
-        return self.thread is not None and self.thread.is_alive() and job.get("mode") == "export" and not job.get("done")
+        return self.thread is not None and self.thread.is_alive() and job.get("mode") in LONG_JOBS and not job.get("done")
 
     def _launch(self, job):
         graph = job["graph"]
@@ -369,6 +398,10 @@ class Session:
         try:
             self._run_job(run_id, job)
         finally:
+            if job["mode"] in LONG_JOBS:
+                self.stamp += 1
+                if job["mode"] == "optimize":
+                    self.hub.publish({"type": "optimized", "run": run_id})  # the editor updates its preview
             job["done"] = True  # the thread is still alive for a moment: the queue must not show it
             if self.queue or self.pending is not None:
                 threading.Thread(target=self._advance, args=(threading.current_thread(),), daemon=True).start()
@@ -484,10 +517,15 @@ class Session:
             self.views[f"paint:{node_id}"] = (self.view_version, values.astype(np.float32).tobytes())
             version = self.view_version
         lo, hi = _range(values)
+        clipped = False
+        shown = getattr(field, "display_range", None) if source == "result" else None
+        if shown is not None:  # e.g. stress without the artificial peak at a support
+            clipped = hi > shown[1] + 1e-9 or lo < shown[0] - 1e-9
+            lo, hi = float(shown[0]), float(shown[1])
         unit = getattr(field, "unit", "") if source == "result" else ""
         label = getattr(field, "name", field_node) if source == "result" else field_node
         publish(type="paint_ready", node=node_id, field=field_node, version=version, view_version=view_version,
-                min=lo, max=hi, label=label, unit=unit, source=source,
+                min=lo, max=hi, label=label, unit=unit, source=source, clipped=clipped,
                 reverse=source == "result" and label == "safety factor")
 
     # --- print checks -------------------------------------------------------------------
@@ -667,6 +705,16 @@ def create_app():
         run_id = session.start(body.get("graph") or {"version": 1, "nodes": {}}, body.get("mode", "preview"),
                                body.get("quality", "draft"), body.get("visible", []), body.get("slice"),
                                body.get("label"))
+        return {"run": run_id}
+
+    @app.post("/api/optimize")
+    def optimize(body: dict = Body(...)):
+        node = body.get("node")
+        if not node:
+            raise HTTPException(400, "which node to optimize?")
+        run_id = session.start(body.get("graph") or {"version": 1, "nodes": {}}, "optimize",
+                               body.get("quality", "draft"), body.get("visible", []), body.get("slice"),
+                               f"optimize {node}", optimize=node)
         return {"run": run_id}
 
     @app.get("/api/queue")

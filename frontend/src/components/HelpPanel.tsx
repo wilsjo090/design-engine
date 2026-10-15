@@ -48,7 +48,7 @@ export function HelpPanel() {
       <div className="help-body">
         {spec.doc && <p className="help-doc">{spec.doc}</p>}
         {spec.inputs.length > 0 && <div className="help-section">Inputs</div>}
-        {spec.inputs.map((p) => <PortHelp key={p.name} port={p} />)}
+        {spec.inputs.filter((p) => !p.hidden).map((p) => <PortHelp key={p.name} port={p} />)}
         {spec.outputs.length > 0 && <div className="help-section">Outputs</div>}
         {spec.outputs.map((p) => <PortHelp key={p.name} port={p} />)}
       </div>

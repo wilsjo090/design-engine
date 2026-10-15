@@ -173,7 +173,8 @@ class DiskCache:
 
     def clear(self):
         for f in [*self.folder.glob("*.npy"), *(self.folder / STEP_FOLDER).glob("*.npz"),
-                  *(self.folder / "shared").glob("*.npy")]:  # engine/shared.py
+                  *(self.folder / "shared").glob("*.npy"),  # engine/shared.py
+                  *(self.folder / TOPOLOGY_FOLDER).glob("*.npz")]:
             try:
                 f.unlink()
             except OSError:
@@ -239,6 +240,51 @@ def save_step_meshes(path, tolerance, angle, meshes):
     for _, size, f in files:  # newest first: keep until the budget is used up
         total += size
         if total > STEP_MAX_BYTES and f != file:
+            f.unlink(missing_ok=True)
+
+
+# --- topology optimization states ---------------------------------------------------------------
+# A finished or stopped optimization (minutes of work), and checkpoints of a running one, keyed by a
+# fingerprint of all its inputs: previews read them, Optimize continues from them.
+TOPOLOGY_FOLDER = "topology"
+TOPOLOGY_MAX_BYTES = 2 * 2**30
+
+
+def _topology_file(key):
+    return default_cache_dir() / TOPOLOGY_FOLDER / f"{key}.npz"
+
+
+def load_topology(key):
+    """The saved state {name: array} of the optimization with this key, or None."""
+    file = _topology_file(key)
+    try:
+        with np.load(file, allow_pickle=False) as data:
+            state = {k: data[k] for k in data.files}
+        os.utime(file)
+    except (OSError, ValueError, EOFError):
+        return None
+    return state
+
+
+def save_topology(key, **arrays):
+    file = _topology_file(key)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = file.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            np.savez(f, **arrays)
+        os.replace(tmp, file)  # atomic: a preview never reads half a state
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return
+    try:
+        files = sorted(((f.stat().st_mtime, f.stat().st_size, f) for f in file.parent.glob("*.npz")), reverse=True)
+    except OSError:
+        return
+    total = 0
+    for _, size, f in files:
+        total += size
+        if total > TOPOLOGY_MAX_BYTES and f != file:
             f.unlink(missing_ok=True)
 
 

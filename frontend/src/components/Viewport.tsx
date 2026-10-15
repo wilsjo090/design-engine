@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber'
-import { GizmoHelper, GizmoViewport, Grid, OrbitControls } from '@react-three/drei'
+import { GizmoHelper, GizmoViewport, Grid, Html, OrbitControls } from '@react-three/drei'
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh'
 import { api, fetchPaint, type CheckReport } from '../api'
@@ -58,7 +58,8 @@ function paintColors(view: ViewMesh, paint: Paint | undefined, cmap: ColorMap, r
 }
 
 /** Thickness and results have their own colours (red = the bad end); fields use the chosen map. */
-const paintMap = (paint: Paint, cmap: ColorMap): ColorMap => (paint.source === 'field' ? cmap : 'heat')
+const paintMap = (paint: Paint, cmap: ColorMap): ColorMap =>
+  (paint.source === 'field' ? cmap : paint.source === 'result' ? 'rainbow' : 'heat')
 
 /** Colour range of a paint that is not a field (fields share one range across all bodies). */
 function ownRange(paint: Paint): [number, number] {
@@ -534,10 +535,248 @@ function MarkerArrows({ markers, size }: { markers: Record<string, Marker[]>; si
         })
       }
     }
+    // drawn over the part: supports and loads often sit inside holes (bolt holes, a pin hole)
+    g.traverse((o) => {
+      const mat = (o as THREE.Mesh).material as THREE.Material | undefined
+      if (!mat) return
+      mat.depthTest = false
+      mat.transparent = true
+      mat.opacity = 0.9
+      o.renderOrder = 10
+    })
     return g
   }, [markers, size])
   useEffect(() => () => group.children.forEach((c) => (c as THREE.ArrowHelper).dispose()), [group])
   return <primitive object={group} />
+}
+
+// --- aiming a load: a big arrow you drag by its head ---------------------------------------------
+const GIZMO_COLOR = '#ffc93c'
+const GIZMO_HOVER = '#ffe9a8'
+const AXIS_DIRECTIONS: Record<string, [number, number, number]> = {
+  '+X': [1, 0, 0], '-X': [-1, 0, 0], '+Y': [0, 1, 0], '-Y': [0, -1, 0], '+Z': [0, 0, 1], '-Z': [0, 0, -1],
+}
+// the arrow snaps to the axes, the 45° diagonals between two axes and the cube diagonals within 6°
+const SNAP_DIRECTIONS = [-1, 0, 1].flatMap((x) => [-1, 0, 1].flatMap((y) => [-1, 0, 1].map((z) => [x, y, z])))
+  .filter(([x, y, z]) => x || y || z).map(([x, y, z]) => new THREE.Vector3(x, y, z).normalize())
+const SNAP_ANGLE = (6 * Math.PI) / 180
+
+function snapDirection(v: THREE.Vector3) {
+  let best: THREE.Vector3 | null = null
+  let angle = SNAP_ANGLE
+  for (const s of SNAP_DIRECTIONS) {
+    const a = v.angleTo(s)
+    if (a < angle) { angle = a; best = s }
+  }
+  return (best ?? v).clone()
+}
+
+const fmtComponent = (x: number) => String(Number(x.toFixed(3)))
+const vectorText = (v: THREE.Vector3) => `${fmtComponent(v.x)}, ${fmtComponent(v.y)}, ${fmtComponent(v.z)}`
+const parseVec = (value: unknown) => {
+  const v = String(value ?? '').split(/[\s,;]+/).filter(Boolean).map(Number)
+  return v.length === 3 && v.every(Number.isFinite) ? new THREE.Vector3(...v) : null
+}
+/** Offsets are dragged in whole steps: 0.5 mm in small scenes, 1 mm up to 300 mm, else 5 mm. */
+const offsetStep = (sceneSize: number) => (sceneSize <= 50 ? 0.5 : sceneSize <= 300 ? 1 : 5)
+const Y_UP = new THREE.Vector3(0, 1, 0)
+const Z_UP = new THREE.Vector3(0, 0, 1)
+
+/** The arrow of the selected Load node: drag its head to point the force (a torque: its axis); on
+ *  release the node's Direction becomes the axis it snapped to, or custom with that Vector. With
+ *  `onMove`, drag the ball at its tail to move where the force acts (the node's Offset from the
+ *  faces' centre, in steps of `step` mm). Esc cancels a drag. */
+function DirectionGizmo({ anchor, dir, length, onCommit, torque = false, centre, step = 1, onMove }: {
+  anchor: THREE.Vector3; dir: THREE.Vector3; length: number; onCommit: (v: THREE.Vector3) => void
+  torque?: boolean; centre?: THREE.Vector3; step?: number; onMove?: (offset: THREE.Vector3) => void
+}) {
+  const camera = useThree((s) => s.camera)
+  const gl = useThree((s) => s.gl)
+  const controls = useThree((s) => s.controls) as unknown as OrbitControlsImpl | null
+  const [aiming, setAiming] = useState<THREE.Vector3 | null>(null)
+  const [moving, setMoving] = useState<THREE.Vector3 | null>(null)
+  const [hover, setHover] = useState<'head' | 'tail' | null>(null)
+  const latest = useRef<THREE.Vector3 | null>(null)
+  const grab = useRef<{ plane: THREE.Plane; from: THREE.Vector3; offset: THREE.Vector3 | null } | null>(null)
+  const active = aiming !== null
+  const shifting = moving !== null
+
+  useEffect(() => {
+    if (!shifting || !centre || !onMove) return
+    const raycaster = new THREE.Raycaster()
+    const move = (ev: PointerEvent) => {
+      const g = grab.current
+      if (!g) return
+      const r = gl.domElement.getBoundingClientRect()
+      raycaster.setFromCamera(new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1,
+        -((ev.clientY - r.top) / r.height) * 2 + 1), camera)
+      // the ball moves in the plane facing the camera (turn the view to move it in depth)
+      const hit = raycaster.ray.intersectPlane(g.plane, new THREE.Vector3())
+      if (!hit) return
+      const off = hit.sub(g.from).add(anchor).sub(centre)
+      off.set(Math.round(off.x / step) * step, Math.round(off.y / step) * step, Math.round(off.z / step) * step)
+      g.offset = off
+      setMoving(centre.clone().add(off))
+    }
+    const finish = (commit: boolean) => {
+      if (controls) controls.enabled = true
+      if (commit && grab.current?.offset) onMove(grab.current.offset)
+      grab.current = null
+      setMoving(null)
+    }
+    const up = () => finish(true)
+    const key = (ev: KeyboardEvent) => { if (ev.key === 'Escape') finish(false) }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('keydown', key)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('keydown', key)
+    }
+  }, [shifting, anchor, centre, step, camera, gl, controls, onMove])
+
+  useEffect(() => {
+    if (!active) return
+    const raycaster = new THREE.Raycaster()
+    const aim = (ev: PointerEvent) => {
+      const r = gl.domElement.getBoundingClientRect()
+      raycaster.setFromCamera(new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1,
+        -((ev.clientY - r.top) / r.height) * 2 + 1), camera)
+      // where the pointer meets the sphere the arrow's head moves on (or comes closest to it)
+      const ray = raycaster.ray
+      const v = ray.origin.clone().sub(anchor)
+      const b = v.dot(ray.direction)
+      const disc = b * b - (v.lengthSq() - length * length)
+      const t = disc >= 0 ? -b - Math.sqrt(disc) : -b
+      const hit = ray.origin.clone().addScaledVector(ray.direction, Math.max(t, 0)).sub(anchor)
+      if (hit.lengthSq() < 1e-12) return
+      latest.current = snapDirection(hit.normalize())
+      setAiming(latest.current)
+    }
+    const finish = (commit: boolean) => {
+      if (controls) controls.enabled = true
+      if (commit && latest.current) onCommit(latest.current)
+      latest.current = null
+      setAiming(null)
+    }
+    const up = () => finish(true)
+    const key = (ev: KeyboardEvent) => { if (ev.key === 'Escape') finish(false) }
+    window.addEventListener('pointermove', aim)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('keydown', key)
+    return () => {
+      window.removeEventListener('pointermove', aim)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('keydown', key)
+    }
+  }, [active, anchor, length, camera, gl, controls, onCommit])
+
+  const at = moving ?? anchor
+  const d = (aiming ?? dir).clone().normalize()
+  const quat = new THREE.Quaternion().setFromUnitVectors(Y_UP, d)
+  const head = at.clone().addScaledVector(d, length * 0.86)
+  const headColor = hover === 'head' || active ? GIZMO_HOVER : GIZMO_COLOR
+  const tailColor = hover === 'tail' || shifting ? GIZMO_HOVER : GIZMO_COLOR
+  const material = (color: string, opacity = 0.95) => (
+    <meshBasicMaterial color={color} depthTest={false} transparent opacity={opacity} />
+  )
+  const hoverOn = (part: 'head' | 'tail') => (e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation()
+    setHover(part)
+    gl.domElement.style.cursor = 'grab'
+  }
+  const hoverOff = () => { setHover(null); gl.domElement.style.cursor = '' }
+  // a line from the faces' centre to where the force acts, when that is elsewhere
+  const lever = centre && at.distanceTo(centre) > 1e-6 ? at.clone().sub(centre) : null
+  const ring = length * 0.2
+  return (
+    <group>
+      <mesh position={at.clone().addScaledVector(d, length * 0.36)} quaternion={quat} renderOrder={20} raycast={() => null}>
+        <cylinderGeometry args={[length * 0.03, length * 0.03, length * 0.72, 12]} />
+        {material(headColor)}
+      </mesh>
+      <mesh position={head} quaternion={quat} renderOrder={21} raycast={() => null}>
+        <coneGeometry args={[length * 0.12, length * 0.28, 24]} />
+        {material(headColor)}
+      </mesh>
+      {torque && (  // the turn about the axis (right-hand rule): an arc with an arrowhead
+        <group position={at.clone().addScaledVector(d, length * 0.42)}
+          quaternion={new THREE.Quaternion().setFromUnitVectors(Z_UP, d)}>
+          <mesh renderOrder={20} raycast={() => null}>
+            <torusGeometry args={[ring, length * 0.022, 8, 48, Math.PI * 1.5]} />
+            {material(headColor)}
+          </mesh>
+          <mesh position={[length * 0.07, -ring, 0]} rotation={[0, 0, -Math.PI / 2]} renderOrder={21} raycast={() => null}>
+            <coneGeometry args={[length * 0.06, length * 0.14, 16]} />
+            {material(headColor)}
+          </mesh>
+        </group>
+      )}
+      {/* an invisible ball around the head: a bigger target to grab */}
+      <mesh position={head} renderOrder={22} onPointerOver={hoverOn('head')} onPointerOut={hoverOff}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return
+          e.stopPropagation()
+          if (controls) controls.enabled = false
+          latest.current = d.clone()
+          setAiming(d.clone())
+        }}>
+        <sphereGeometry args={[length * 0.2, 16, 12]} />
+        <meshBasicMaterial transparent opacity={0} depthTest={false} depthWrite={false} />
+      </mesh>
+      {onMove && centre && (
+        <>
+          <mesh position={at} renderOrder={21} raycast={() => null}>
+            <sphereGeometry args={[length * 0.055, 16, 12]} />
+            {material(tailColor)}
+          </mesh>
+          <mesh position={at} renderOrder={22} onPointerOver={hoverOn('tail')} onPointerOut={hoverOff}
+            onPointerDown={(e) => {
+              if (e.button !== 0) return
+              e.stopPropagation()
+              if (controls) controls.enabled = false
+              const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), anchor)
+              grab.current = { plane, from: e.ray.intersectPlane(plane, new THREE.Vector3()) ?? anchor.clone(), offset: null }
+              setMoving(anchor.clone())
+            }}>
+            <sphereGeometry args={[length * 0.12, 16, 12]} />
+            <meshBasicMaterial transparent opacity={0} depthTest={false} depthWrite={false} />
+          </mesh>
+        </>
+      )}
+      {lever && centre && (
+        <>
+          <mesh position={centre.clone().addScaledVector(lever, 0.5)}
+            quaternion={new THREE.Quaternion().setFromUnitVectors(Y_UP, lever.clone().normalize())}
+            renderOrder={19} raycast={() => null}>
+            <cylinderGeometry args={[length * 0.012, length * 0.012, lever.length(), 8]} />
+            {material(GIZMO_COLOR, 0.6)}
+          </mesh>
+          <mesh position={centre} renderOrder={19} raycast={() => null}>
+            <sphereGeometry args={[length * 0.025, 12, 8]} />
+            {material(GIZMO_COLOR, 0.6)}
+          </mesh>
+        </>
+      )}
+      {active && (
+        <>
+          <mesh position={at} raycast={() => null} renderOrder={19}>
+            <sphereGeometry args={[length, 32, 16]} />
+            <meshBasicMaterial color={GIZMO_COLOR} wireframe transparent opacity={0.08} depthTest={false} />
+          </mesh>
+          <Html position={head} center style={{ pointerEvents: 'none' }}>
+            <div className="gizmo-label">{torque ? 'axis ' : ''}{vectorText(d)}</div>
+          </Html>
+        </>
+      )}
+      {shifting && centre && (
+        <Html position={at} center style={{ pointerEvents: 'none' }}>
+          <div className="gizmo-label gizmo-label-below">offset {vectorText(at.clone().sub(centre))} mm</div>
+        </Html>
+      )}
+    </group>
+  )
 }
 
 /** Colour scale of a node's result (Static Analysis) with its unit, and the value under the mouse. */
@@ -548,7 +787,7 @@ function ResultPanel({ node, paint, hover }: { node: string; paint: Paint; hover
       <div className="slice-row">
         <span className="slice-title"><b>{node}</b>: {paint.label}{paint.unit ? ` (${paint.unit})` : ''}</span>
       </div>
-      <div className="slice-bar" style={{ background: gradientCss('heat'), transform: paint.reverse ? 'scaleX(-1)' : undefined }} />
+      <div className="slice-bar" style={{ background: gradientCss('rainbow'), transform: paint.reverse ? 'scaleX(-1)' : undefined }} />
       <div className="slice-row slice-range">
         <span>{fmt(paint.min)}{unit}</span>
         <span className="slice-hover">
@@ -557,6 +796,12 @@ function ResultPanel({ node, paint, hover }: { node: string; paint: Paint; hover
         <span>{fmt(paint.max)}{unit}</span>
       </div>
       {paint.reverse && <div className="muted small">Below 1 the material yields or breaks (shown up to 10).</div>}
+      {paint.clipped && (
+        <div className="muted small">
+          Right at the fixed faces it goes past this scale: holding them perfectly rigid makes an artificial peak
+          there (see the log).
+        </div>
+      )}
     </div>
   )
 }
@@ -594,6 +839,48 @@ export function Viewport() {
   const setShowMarkers = (on: boolean) => { setShowMarkersState(on); write('markers.shown', on) }
   const anyMarkers = Object.values(markers).some((list) => list.some((m) => m.points.length))
   const results = visible.filter((id) => paints[id]?.source === 'result')
+
+  // --- aiming the selected Load node's force (a draggable arrow at its faces) ---
+  const aimNode = useStore((s) => (s.editing ? undefined
+    : s.nodes.find((n) => n.selected && n.data.typeId === 'sim.load')))
+  const aim = useMemo(() => {
+    if (!aimNode) return null
+    const inputs = aimNode.data.inputs
+    const kind = String(inputs.kind ?? 'force')
+    const direction = String(inputs.direction ?? 'into the face')
+    const load = markers[aimNode.id]?.find((m) => m.kind === 'load' && m.points.length)
+    if (kind === 'pressure' || !load || isLink(inputs.direction) || isLink(inputs.vector)) return null
+    const torque = kind === 'torque'
+    // the force acts at the faces' centre, moved by Offset (a torque has no point it acts at)
+    const centre = load.centre ? new THREE.Vector3(...load.centre)
+      : load.points.reduce((a, p) => a.add(new THREE.Vector3(...p)), new THREE.Vector3()).divideScalar(load.points.length)
+    const movable = !torque && !isLink(inputs.offset)
+    const offset = movable ? parseVec(inputs.offset ?? '0, 0, 0') ?? new THREE.Vector3() : new THREE.Vector3()
+    let dir: THREE.Vector3
+    if (AXIS_DIRECTIONS[direction]) dir = new THREE.Vector3(...AXIS_DIRECTIONS[direction])
+    else if (direction === 'custom') {
+      const v = parseVec(inputs.vector ?? '0, 0, -1')
+      dir = v && v.lengthSq() > 0 ? v : new THREE.Vector3(0, 0, -1)
+    } else if (load.arrow) dir = new THREE.Vector3(...load.arrow)  // into / out of the face, from the engine
+    else {  // the average of the arrows drawn there
+      dir = load.dirs.reduce((a, p) => a.add(new THREE.Vector3(...p)), new THREE.Vector3())
+      if (dir.lengthSq() < 1e-12) dir = new THREE.Vector3(0, 0, -1)
+    }
+    return { id: aimNode.id, torque, movable, centre, anchor: centre.clone().add(offset), dir: dir.normalize() }
+  }, [aimNode, markers])
+  const setAimInput = useStore((s) => s.setInput)
+  const commitAim = useMemo(() => (v: THREE.Vector3) => {
+    if (!aim) return
+    const axis = Object.entries(AXIS_DIRECTIONS).find(([, a]) => v.angleTo(new THREE.Vector3(...a)) < 1e-3)?.[0]
+    if (axis) setAimInput(aim.id, 'direction', axis)
+    else {
+      setAimInput(aim.id, 'vector', vectorText(v))
+      setAimInput(aim.id, 'direction', 'custom')
+    }
+  }, [aim, setAimInput])
+  const commitOffset = useMemo(() => (v: THREE.Vector3) => {
+    if (aim) setAimInput(aim.id, 'offset', vectorText(v))
+  }, [aim, setAimInput])
 
   // --- face picking (a Face Mask node's Pick button) ---
   const picking = useStore((s) => s.picking)
@@ -707,6 +994,11 @@ export function Viewport() {
               paint={paints[id]} cmap={cmap} range={paints[id] && paints[id].source !== 'field' ? ownRanges[id] : fieldRange}
               onHover={setHover} node={id} />))}
         {showMarkers && anyMarkers && <MarkerArrows markers={markers} size={Math.max(size.x, size.y, size.z, 1)} />}
+        {aim && !picking && (
+          <DirectionGizmo anchor={aim.anchor} dir={aim.dir} length={Math.max(size.x, size.y, size.z, 1) * 0.3}
+            onCommit={commitAim} torque={aim.torque} centre={aim.centre}
+            step={offsetStep(Math.max(size.x, size.y, size.z, 1))} onMove={aim.movable ? commitOffset : undefined} />
+        )}
         {shownVariants.map((v, i) => (
           <group key={v.id} position={[-(i + 1) * variantStep, 0, 0]}>
             {v.views.map((view, k) => <ViewObject key={k} view={view} wireframe={wireframe} clip={[]} cmap={cmap}
@@ -743,6 +1035,16 @@ export function Viewport() {
         ))}
         <VariantsList variants={variants} />
       </div>
+      {aim && !picking && (
+        <div className="gizmo-hint">
+          {aim.torque
+            ? <>Drag the yellow arrowhead to set the axis <b>{aim.id}</b> turns about (right-hand rule: thumb along
+              the arrow, fingers show the turn)</>
+            : <>Drag the yellow arrowhead to aim the force of <b>{aim.id}</b>, the ball at its tail to move where it
+              acts (in the view's plane)</>}
+          {' '}· snaps to the axes and 45° · Esc cancels
+        </div>
+      )}
       {picking && (
         <div className="pick-banner">
           <span>{leaveOut ? 'Faces to leave out' : 'Picking faces'} for <b className={leaveOut ? 'left-out' : ''}>{picking.node}</b></span>
@@ -773,7 +1075,9 @@ export function Viewport() {
         )}
       </div>
       <div className="tool-panels">
-        {results.map((id) => <ResultPanel key={id} node={id} paint={paints[id]} hover={hover?.node === id ? hover : null} />)}
+        {!picking && results.map((id) => (
+          <ResultPanel key={id} node={id} paint={paints[id]} hover={hover?.node === id ? hover : null} />
+        ))}
         {section.on && <SectionPanel section={section} setSection={setSection} lo={lo} hi={hi} />}
         {checking && <CheckPanel candidates={checkCandidates} onClose={() => { clearPaints('thickness'); setChecking(false) }} />}
       </div>

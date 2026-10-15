@@ -181,3 +181,24 @@ def test_gpu_wall_thickness_matches_cpu(gpu, cad_part):
     cpu = checks.wall_thickness(cad_part.vertices, cad_part.faces)
     both = np.isfinite(on_gpu) & np.isfinite(cpu)
     assert both.mean() > 0.99 and np.abs(on_gpu - cpu)[both].max() < 1e-3   # the same kernel on both devices
+
+
+def test_gpu_static_analysis_matches_cpu(gpu):
+    # float32 multigrid, float64 conjugate gradients: all-float32 CG bent this bracket 3.60 mm
+    # instead of 4.21 while reporting convergence (see engine/fea/solver.py, MIXED)
+    from engine.fea import analysis
+    from engine.fea.analysis import static_analysis
+    from engine.fea.materials import PRESETS
+    from engine.fea.model import Condition, Conditions
+    mesh = tessellate(load_step(ROOT / "samples" / "bracket.step")[0], tolerance=0.01)
+    ids = mesh.face_attributes["cad_face"]
+    conds = Conditions((Condition("fixed", mesh.triangles[np.isin(ids, [8, 9])]),
+                        Condition("load", mesh.triangles[ids == 17], amount=50.0, direction="+X")))
+    part = F.body_from_mesh(mesh, 2.0)
+    cpu = static_analysis(part, conds, PRESETS["PETG"], "draft", xp=np)
+    analysis._RESULTS.clear()  # else the same inputs give back the CPU result
+    on_gpu = static_analysis(part, conds, PRESETS["PETG"], "draft", xp=gpu)
+    assert on_gpu.report["device"] == "GPU"
+    for k in ("max_displacement", "max_stress"):
+        assert on_gpu.report[k] == pytest.approx(cpu.report[k], rel=1e-4), k
+    assert on_gpu.report["imbalance"] < 1e-5

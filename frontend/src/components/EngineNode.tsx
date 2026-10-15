@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { useShallow } from 'zustand/react/shallow'
+import { api, startOptimize } from '../api'
 import { isFieldNode, useStore } from '../store'
 import { useBrowser } from './FileBrowser'
 import type { EngineNode, PortSpec } from '../types'
@@ -214,6 +215,24 @@ function EyeIcon({ open }: { open: boolean }) {
   )
 }
 
+/** Topology Optimization's long job: Optimize (queued like an export) and Stop (keeps the shape so far). */
+const OPTIMIZERS = ['sim.topology']
+
+function OptimizeBar({ nodeId }: { nodeId: string }) {
+  const running = useStore((s) => s.run?.running && s.run.mode === 'optimize' && s.status[nodeId]?.state === 'running')
+  const editing = useStore((s) => !!s.editing)
+  return (
+    <div className="enode-row optimize-row">
+      {running
+        ? <button className="nodrag optimize-btn stop" title="Stop: keeps the shape so far; Optimize continues from it"
+            onClick={() => api.cancel()}>Stop</button>
+        : <button className="nodrag optimize-btn" disabled={editing}
+            title={editing ? 'Optimize outside the group' : 'Find the stiffest shape (takes a while: the shape grows in the 3D view)'}
+            onClick={() => startOptimize(nodeId)}>Optimize</button>}
+    </div>
+  )
+}
+
 function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
   const spec = useStore((s) => s.specs[data.typeId])
   const links = useStore(useShallow((s) =>
@@ -275,7 +294,7 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
         </div>
       ))}
 
-      {spec.inputs.map((p) => {
+      {spec.inputs.filter((p) => !p.hidden).map((p) => {
         const value = data.inputs[p.name] ?? p.default
         const scrubbable = !linked[p.name] && NUMERIC.includes(p.type) && !p.choices && !ignoredByAuto(data, p.name)
         return (
@@ -294,6 +313,8 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
         )
       })}
 
+      {OPTIMIZERS.includes(data.typeId) && <OptimizeBar nodeId={id} />}
+      {status?.note && status.state !== 'running' && <div className="enode-note">{status.note}</div>}
       {status?.state === 'running' && status.progress && (
         <div className="progress"><div style={{ width: `${(100 * status.progress[0]) / status.progress[1]}%` }} /></div>
       )}

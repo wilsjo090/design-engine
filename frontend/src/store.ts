@@ -380,6 +380,8 @@ export const useStore = create<State>((set, get) => ({
   handleEvent: (e) =>
     set((s) => {
       if (e.type === 'queue') return { queue: e as unknown as QueueState }
+      // an optimization finished or stopped: update the preview so the result (and what depends on it) shows
+      if (e.type === 'optimized') return { graphVersion: s.graphVersion + 1 }
       if (e.run !== undefined && s.run && e.run < s.run.id) return {} // stale event from an older run
       switch (e.type) {
         case 'run_start':
@@ -394,15 +396,25 @@ export const useStore = create<State>((set, get) => ({
           }
           return { problems }
         }
-        case 'node_start':
-          return { status: { ...s.status, [e.node]: { state: 'running' } } }
-        case 'progress':
-          return { status: { ...s.status, [e.node]: { state: 'running', progress: [e.done, e.total] } } }
+        // e.view: events of the hidden mesher drawing a node's body; they keep the node's own range and note
+        case 'node_start': {
+          const prev = s.status[e.node]
+          const keep = e.view ? { range: prev?.range, note: prev?.note } : {}
+          return { status: { ...s.status, [e.node]: { state: 'running', ...keep } } }
+        }
+        case 'progress': {
+          const prev = s.status[e.node]
+          const keep = e.view ? { range: prev?.range, note: prev?.note } : {}
+          return { status: { ...s.status, [e.node]: { state: 'running', progress: [e.done, e.total], ...keep } } }
+        }
         case 'node_done': {
           const prev = s.status[e.node]
           if (e.view && prev && prev.state !== 'running') return {} // keep the node's own result
           const status: Record<string, NodeStatus> = {
-            ...s.status, [e.node]: { state: e.cached ? 'cached' : 'done', time: e.time, range: e.range },
+            ...s.status,
+            [e.node]: e.view
+              ? { state: e.cached ? 'cached' : 'done', time: e.time, range: prev?.range, note: prev?.note }
+              : { state: e.cached ? 'cached' : 'done', time: e.time, range: e.range, note: e.note },
           }
           if (!e.markers || e.inner) return { status }
           return { status, markers: { ...s.markers, [e.node]: e.markers as Marker[] } }

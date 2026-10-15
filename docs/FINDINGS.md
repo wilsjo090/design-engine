@@ -333,6 +333,283 @@ Final 149M voxels in 216 blocks). The Voronoi branch is not connected to the mes
   At 0.05 mm: 464k triangles, but the surface moved up to 0.09 mm (quadric error underestimates on
   curved detail).
 
+## Static analysis (FEA phase 1, 2026-10-14)
+
+Plan and design: [TOPOLOGY_PLAN.md](TOPOLOGY_PLAN.md). Test parts: a 100 x 10 x 10 mm cantilever
+(tests) and `samples/bracket.step`, an L bracket (70 x 40 x 6 base, 55 mm upright, 6 mm inner
+fillet, two bolt holes held, 50 N +X on a pin hole near the top; `recipes/fea_bracket.json`).
+
+- Accuracy, cantilever (1 mm elements, 10 through the height): tip deflection 8.8% short at
+  first. Two causes: the grid started half an element outside the part, so the flat faces were
+  half-filled elements (stiffness smeared further out), and plain hex8 locks in bending. Grid
+  starting at the part's lowest corner + Wilson's incompatible modes (condensed out: on identical
+  cubes still one constant 24x24 matrix, so free): 1.1% short (2 mm elements: 1.3%; plain hex8
+  1.8% / 3.9%), bending stress at element centres exact; the rest is the fully clamped end.
+  Supports fix only the corners within 0.8 h per axis of a face point (a face on element faces
+  clamps one layer of nodes, not two).
+- Multigrid smoothing: damped Jacobi (omega 0.6) diverged where stiff meets soft material:
+  lmax(D^-1 K) is 3.1 on a uniform part, 4.2-4.9 with 1:1e6 contrast. Chebyshev (degree 3, aimed at
+  lmax/10..lmax, lmax by 12 power iterations x 1.15, capped by Gershgorin): 56 iterations to 1e-6
+  on 32^3 blobs at 1e-6 and 1e-9 contrast, 6-8 on uniform parts.
+- Sparse parts: the bracket fills 17% of its box. Products over the whole grid (8 slices) cost 66 ms
+  at draft; element by element over the filled ones only (index gather, bincount / scatter_add):
+  16 ms, 0.86 -> 0.27 s per CPU iteration. Levels at least half full keep the slab path.
+- Bug met: `xp.zeros_like` of a transposed view (prolong output) keeps that layout, its
+  `reshape(-1, 3)` is then a copy, and scatter-adds into it were lost (the product came back 0).
+  The result arrays are now created C-ordered and checked.
+- GPU precision: all-float32 CG said "converged, residual 7.6e-6" while the bracket bent 3.60 mm
+  instead of 4.21. For smooth, nearly rigid displacements the element terms of K u cancel and
+  float32 gets the product ~10% wrong (products and smoothers alone agreed with the CPU to 1e-7).
+  Iterative refinement (float64 residual, float32 corrections) was right but took 110 iterations
+  instead of 22; reliable updates stalled at 6e-2. Mixed precision works: CG and the fine-level
+  product in float64, the multigrid preconditioner in float32, flexible (Polak-Ribiere) beta:
+  22 iterations, same answer as the CPU to every printed digit.
+- Times, bracket, warm (CuPy compiles its kernels on the first analysis in a process: +26 s once):
+
+  | detail | elements (box / with material) | GPU | CPU |
+  |---|---|---|---|
+  | draft | 246k / 42k, 0.89 mm | 0.9 s | 6 s |
+  | medium | 1.5M / 255k, 0.49 mm | 3.3 s | 47 s |
+  | fine | 6.6M / 985k, 0.31 mm | 11.6 s | (not run) |
+
+  Memory per box element: CPU 480-620 bytes, GPU 540 (fine: 3.6 GB of GPU memory, the float64
+  CG vectors over the whole box are most of it). The node frees CuPy's pool afterwards.
+- Artificial peaks at supports: the bracket's max stress was 12.8 / 14.0 / 21.8 MPa at draft /
+  medium / fine, at the edge of a held bolt hole (perfectly rigid faces make a singular stress
+  there). The report and the colour scale use the highest stress more than 2 elements from fixed
+  nodes (11.6 MPa at medium, next to a bolt hole, where the section is smallest) and mention the
+  peak separately.
+- In the editor: a medium analysis of the bracket took 5.5 s on the GPU, colours with units and
+  hover values, supports and loads drawn over the part (they sit inside holes), safety factor in
+  reversed colours. The turbo map's near-black ends made safe areas look black: results use a
+  blue-to-red "rainbow" (turbo without its ends).
+
+## Topology optimization (FEA phase 2, 2026-10-14)
+
+`engine/fea/topology.py`, node Topology Optimization. Test parts: a 60 x 20 x 10 mm cantilever box
+(probe) and 30 x 10 x 10 (tests); `samples/wall_bracket_space.step`, a 60 x 30 x 50 mm block glued
+on its back face with 200 N down on a pin hole near the far top edge
+(`recipes/topo_wall_bracket.json`).
+
+- Method: SIMP (penalty 3, empty = 1e-6 E), cone density filter (radius min thickness / 2, at
+  least 1.5 elements), Heaviside projection (beta 1 -> 16, doubled when the compliance settles or
+  after 25 iterations), optimality criteria with the projected volume held by bisection. Holds
+  Keep % to 0.1%, ends nearly black and white (0.02% grey on the cantilever), the cantilever shows
+  the textbook flanges and web.
+- "No density changes more than 0.01" never happened: a few elements flip back and forth for ever
+  (change stuck at the move limit while the compliance had stopped moving at iteration ~105 of
+  125). Stopping and sharpening when the compliance changes < 0.1% over 5 iterations: 68
+  iterations, compliance 242.6 instead of 242.1.
+- Inner solves to 1e-2 (warm-started from the last displacement) gave the same design as 1e-5 and
+  1e-3 (compliance 242.1 all three) at 1.1 instead of 2.8 s per CPU iteration.
+- Coarsest multigrid level: with up to 4000 elements a small grid (30 x 10 x 10) had no multigrid at
+  all and SuperLU refactorized 11k unknowns every iteration: 1.0 s, the tests took 118 s. Now at
+  most 500 elements (375: 0.012 s) and minimum-degree ordering on A + A^T (3x faster than COLAMD on
+  thin grids): tests 7.5 s. Static analysis results unchanged.
+- Density to body: 0.5 surface on a 2x finer trilinear grid, 10 Taubin passes, pieces under 1% of
+  the largest dropped, the exact distance field of that mesh, intersected with the design space.
+  The FE grid starts at the part's lowest corner, so the densities are padded and extended 2
+  elements outward first: otherwise the surface sat exactly on the clamped face and the crop left
+  it 0.005 mm short instead of giving back the CAD face.
+- Times (fresh cache, through the node):
+
+  | case | design elements | GPU | CPU |
+  |---|---|---|---|
+  | cantilever probe, draft | 39k | 29 s (68 it.) | 91 s |
+  | cantilever probe, medium | 240k | 107 s | - |
+  | wall bracket, draft | 32k | 29 s (80 it.) | ~80 s in the editor |
+  | wall bracket, medium | 241k | 146 s (79 it.) | - |
+
+  An optimization is ~70 solves, so the node uses the GPU from 10k grid elements (one analysis
+  from 60k). The GPU memory pool is released at the end.
+- Wall bracket result: back plate, wide upper flange and a strut to the pin; 25% of the block kept,
+  stiffness 26% of the full block (medium: 25%). At draft the flat top is a little wavy.
+- In the editor: Optimize queues like an export (label "optimize <node>", the queue button now says
+  Jobs), the shape is drawn every 3 iterations (raw 0.5 surface), Stop saves the state (every 5
+  iterations anyway) and the stopped shape shows; Optimize continued at iteration 30 -> 80. States
+  live in `cache\topology` (keyed by every input), so a finished result loads after a restart
+  without running again. The hidden mesher's events used to overwrite a node's status (note and
+  range tag) when its body was shown; they keep them now.
+
+## Max thickness (2026-10-15)
+
+The user wanted designs that look better rather than the stiffest: thick members split into thin
+branches.
+
+- Local volume constraint (Wu et al. 2018): every neighbourhood at most `LOCAL_SHARE` (0.6) full.
+  Gaussian neighbourhoods (separable, cheap at any size), sigma = max thickness / 1.68 (a plate of
+  that thickness fills 0.6 at its middle), aggregated as a p-mean (p = 16) scaled adaptively to
+  the maximum; only free elements count. Two constraints need a two-multiplier update:
+  OC x * sqrt(-dc / (l1 dv + l2 dg)), l1 for the exact projected volume, l2 for the linearized
+  local constraint, found by nested Illinois root finding (~60 evaluations an iteration; nested
+  bisection needed ~300). A linearized volume ended 3.5 points under Keep %.
+- Wall bracket, medium, GPU: without, thickest member 10.0 mm (99%), 25% kept, stiffness 25%;
+  max thickness 4 mm: 4.3 mm, fullest neighbourhood 0.61, but only 21.5% kept (stiffness 18%):
+  25% does not fit in that block with no neighbourhood over 60% full. The max thickness wins and
+  the node says so; the demo `recipes/topo_wall_bracket_branchy.json` keeps 20%.
+- The look: the single truss web becomes a branchy web of thin struts, with openings in the side
+  plates. At draft (1.4 mm elements) a max thickness under ~6 mm cannot be resolved (it must be
+  1.5 x the min member of 3 elements): it is raised with a note.
+- Smoothing: the result's flat faces showed terraces where a plate's thickness changed by one
+  element. A Gaussian blur of the densities (sigma 1 element) before taking the 0.5 surface turns
+  them into smooth waves (volume -1.8%); the live view stays raw.
+- GPU products in batches of 256 MB instead of 64: a V-cycle on a full 96 x 48 x 80 grid 212 ->
+  54 ms, the medium wall bracket 150 -> 54 s (with max thickness 404 -> 143 s). Static analysis
+  of full parts gains the same.
+- The topology fingerprint only includes the max thickness when it is set, so results from before
+  stay valid.
+
+## Bearing load, and the big flat member (2026-10-15)
+
+The user asked why the wall bracket kept a big flat member (its top flange) and for a contact
+load: a pin pulled down presses only on the bottom of its hole, not all round it.
+
+- Bearing load (Load kind `bearing`, as SolidWorks'): pressure square to the face, cosine
+  weighted (largest where the face looks straight against the force, 0 at the sides), none on the
+  far side, scaled so the resultant is the force: p0 = F / sum(area w^2). On the 8 mm pin hole,
+  200 N -Z: resultant within 1% of (0, 0, -200), nothing above the hole's middle. Needs an axis
+  or custom direction; the markers show only the contact side.
+- Medium, GPU, Keep 20%, PETG, bearing 200 N on the pin (`docs/topology_bracket_variants.png`):
+
+  | design space | variant | iterations | time | kept | stiffness | thickest |
+  |---|---|---|---|---|---|---|
+  | block, back face glued | no max | 80 | 53 s | 20.0% | 19% | 9.8 mm |
+  | | max 4 mm | 95 | 100 s | 19.1% | 16% | 4.3 mm |
+  | | max 4 mm, struts only | 125 (cap) | 220 s | 17.3% | 12% | 4.3 mm |
+  | block, 4 bolt holes | no max | 81 | 57 s | 20.0% | 25% | 7.1 mm |
+  | | max 4 mm | 110 | 109 s | 17.7% | 20% | 4.0 mm |
+  | | max 4 mm, struts only | 125 (cap) | 136 s | 15.2% | 18% | 3.2 mm |
+
+- The flat flange came from the setup: with the whole back face glued and the pin through the
+  full width, every cross-section is loaded alike (a nearly 2D problem) and the stiffest answer
+  is extruded plates. A thickness limit cannot forbid a wide plate; "struts only" (Max thickness
+  measured on round struts, so plates at most 0.62 of it, members at least 0.65 of it) still left
+  a perforated top plate and did not settle in 125 iterations.
+- Held by 4 M5 insert holes instead (`samples/wall_bracket_bolts.step`, demo
+  `recipes/topo_wall_bracket_bolted.json`): four organic arms from the bolts to the pin, no
+  flange, and stiffer at the same mass (25% vs 19%). With max thickness 4 mm the arms split into
+  finger-like branches; struts only gives a web with holes but is softer and slower.
+- Lesson for the user: hold the design space where the real part is held (bolt holes, clamp
+  faces) and load it the way it is loaded (bearing for pins); whole glued faces and loads spread
+  over whole holes make plate-like designs.
+- The pin eye stayed a whole tube even with the bearing load: Skin kept 2 mm solid around every
+  picked face. For a bearing load the skin now covers only the contact side (where the pressure
+  is > 0); whether the top of the eye is needed is up to the optimizer (a Keep body closes it if
+  wanted). Topology keys with a bearing load got a marker, so older results are not reused.
+- Aiming a load: with a Load node selected the 3D view draws a yellow arrow at its faces (from the
+  centre of its faces plus Offset, 30% of the scene long; a bigger invisible ball around the head
+  is the grab target). Dragging the head moves it on a sphere (pointer ray against the sphere, or
+  its closest point when the pointer is off it), snapping within 6° to the axes, 45° diagonals and
+  cube diagonals; on release Direction becomes that axis, or custom with the Vector. Esc cancels;
+  camera rotation is off while dragging.
+
+## Torque and offset forces (2026-10-15)
+
+- One mechanism for both: a moment M on the picked faces as a "turn" w x r about their area
+  centre c, w = I^-1 M with I the faces' area inertia tensor about c (exact per flat triangle:
+  int r r^T dA = A/12 (sum v v^T + s s^T)). It adds up to no force and exactly M; it is SolidWorks'
+  rigid remote load / a distributing coupling. On a full hole about its axis it is the usual
+  tangential torque, the same size all round; on bolts on a circle each gets a share by radius.
+- Load kind `torque`: N·m about Direction (right-hand rule). "into the face" on a flat face = the
+  axis into it (driving a screw in); on a round face it is refused (no single normal), the user
+  picks an axis or drags the arrow. 2 N·m on the bracket's pin hole: no net force (1e-11 N),
+  moment 2000 N·mm, tangential within the facets' 3°.
+- Offset (force and bearing): the force acts at c + offset, so the faces carry the force plus
+  offset x F. Keys of loads without an offset are unchanged (results stay valid).
+- Checked against textbooks (100 x 10 x 10 PLA beam, 1 mm elements): 100 N with a 50 mm offset
+  beyond the free end, tip deflection 1.0% under Timoshenko + end moment (the plain cantilever is
+  1.1% under); 5 N·m torque, twist rate between 10 and 90 mm 0.9% under Saint-Venant (J = 0.1406
+  a^4), 0.2% at 0.5 mm elements. Measured on the top face's middle line, where the square section
+  does not warp.
+- The reaction check divided by the net load, which is ~0 for a torque: it now divides by the
+  larger of the net load and a tenth of the summed nodal force sizes (unchanged for plain forces).
+- 3D view: a torque draws an arc with an arrowhead round its axis arrow; a force or bearing load
+  has a ball at the arrow's tail that drags the point of action in the plane facing the camera
+  (rounded to 0.5 / 1 / 5 mm by scene size), with a thin line from the faces' centre. The markers
+  carry `centre` and `arrow` (the force's direction or the torque axis) for this.
+- Bolted wall bracket, medium, GPU, PETG, Keep 20% (`docs/topology_bracket_torque.png`): bearing
+  200 N -Z, max 4 mm: 106 it, 100 s, 17.4% kept, stiffness 22% (an open cradle under the pin);
+  torque 5 N·m about the pin axis, max 4 mm: 123 it, 87 s, 19.0%, 38%; torque, no max: 82 it,
+  39 s, 20.0%, 45%. Under torque the optimizer wraps the pin in a closed thin-walled tube, the
+  textbook answer (a closed section is far stiffer in torsion than an open one), tied to the bolts
+  by arms above and below. The size of the torque does not change the shape (one load case).
+
+## Smoother surfaces (2026-10-15)
+
+The user asked how to make the optimized parts look better. The visible flaw was rings (terraces)
+on gently sloped faces: an optimized result is nearly black and white per element, so where the
+surface lies inside an element is lost, and the 0.5 level follows the element steps.
+
+- Tried on the bolted bracket (medium, bearing, max 4 mm; `docs/topology_smoothing.png`):
+  60 instead of 10 Taubin passes: no visible change. Blur 1.5 instead of 1 at level 0.5: most
+  terraces gone but 5% of the volume lost. Smoothing the signed distance while keeping it within
+  half an element of where it was: worse (the terraces stay inside that band). Blur 2 with the
+  level chosen to keep the volume: smooth, rounded arms, same mass (15.3 vs 15.2 cm³ cropped).
+  Blur 2.5+: soft, small dimples appear.
+- Node input Smoothing (elements, 0-5; default 2 at first, back to 1 since: see "Smoothing 2 was
+  weaker"); `density_mesh` picks the level so the
+  samples above it inside the design space match the densities' volume there (clamped to
+  0.3-0.7). The count must be a share of the design space's samples: the upsampled grid has
+  slightly more than up^3 samples per element (it asked for 27% instead of 30% on the test beam).
+  The level must also be matched inside the design space only: the extension's outer edge loses
+  volume when blurred, and matching the total moved it into the part (28% -> 43% on the beam).
+- The extension past the design space grew by dilation, which also spread material sideways along
+  the outside; with 3-4 elements (needed for the blur) it closed the test beam's open sides into a
+  cavity. Now each outside element takes the density of the nearest inside one (EDT indices).
+- Fine detail on the same setup: 0.45 mm elements, 111 iterations, 279 s on the GPU (medium:
+  100 s), 17.1% kept, stiffness 21%, thinner branches and an extra opening in the side plate.
+  Smoothing and fine detail add up: Smoothing for any result, fine for the final design.
+
+## Gap to faces, and material leaking into Avoid (2026-10-15)
+
+The user asked for an option that keeps the shape off the design space's box: the bracket's top
+and side plates lay flat against it (the stiffest place for bending material), and the crop by the
+design space then cut them flat.
+
+- Node input Gap to faces (mm, 0 = off): elements whose centre is less than the gap inside the
+  design space's faces (its signed distance) are kept empty, except within skin + gap of the faces
+  of supports and loads (all their faces, also a bearing load's far side, so the optimizer may close
+  a pin eye) and within the gap of Keep. Keep % stays a share of the whole design space (`total`
+  counts the gap), and "stiffness % of the full design space" still compares with the whole design
+  space filled (`full_phi`), so a gap's cost shows. Keep % above 97% of what is left is refused.
+- First look (bolted bracket, medium, bearing, max 4 mm): gap 3 mm, 17.0% kept, stiffness 22%,
+  "free rounded arms"; 6 mm: 16.3%, 20%. That look was false: see "Smoothing 2 was weaker" below.
+  On the 10 mm test beam a 2 mm gap cost 2.5x the compliance (its outer 2 mm are where bending
+  material helps most).
+- Bug found on the way: `density_mesh` extended material past "phi > 0", but Avoid regions (and now
+  the gap) have phi 0, so the extension filled them from the side, 2-4 elements deep, and the crop
+  by the design space did not remove it. The state now saves `space` (design space and Keep, before
+  Avoid and the gap) and the extension goes only outside it; the result is also cut by the Avoid
+  body exactly. Older saved states have no `space` and fall back to phi > 0.
+
+## Smoothing 2 was weaker; what the gap really does (2026-10-15)
+
+The user saw short sharp stubs and found the new versions "look much weaker". They were: checked
+with Static Analysis of each cropped surface (bolt holes held, bearing 200 N -Z, medium, PETG;
+max deflection, `scratchpad/analyze_surfaces.py`):
+
+  | design | plain 0.5 surface | Smoothing 1 | Smoothing 2 | filtered field x~ at 0.5 |
+  |---|---|---|---|---|
+  | no gap | 0.199 mm | 0.200 | 0.199 (10.7% of the solid moved) | 0.199 |
+  | gap 3 mm, first version | 0.212 | 0.220 | 0.265 (25% weaker, 14% moved) | 0.204 |
+  | gap 3 mm, fixed | 0.177 | 0.174 | 0.183 | |
+  | gap 3 mm, struts only, fixed | 0.212 | 0.215 | 0.258 (21% weaker) | |
+
+- Smoothing 2 blurs a 3-element member to a peak of 0.25, below any level: thin members vanish
+  and leave stubs where they joined. It also erased the thin plates the gap made, which is what
+  had looked like "free rounded arms". Default back to 1 (at most 1-4% here).
+- The gap does not remove plates: the first layer past it was 38% solid (1-5% in the gap): the
+  plate just moves in to the gap's edge, the outermost place left. There it was 1-2 elements thin,
+  because the density filter is renormalized at domain edges. Fixed: the filter now averages over
+  the gap as over empty material, so members along it are as thick as elsewhere (gap 3 mm then:
+  112 it, 65 s, 18.4% kept, stiffness 24%, a closed shell 3 mm inside the box).
+- Plates come from the amount of material: at Keep 20% a wide bracket's stiffest answer is a
+  shell. Keep 10% (max 4 mm): 101 it, 92 s, stiffness 10% at half the mass, four clean arms from
+  the bolts to the pin and no plates; with gap 3 mm (91 it, 63 s) the arms also keep off the side
+  faces (`docs/topology_gap.png`). Struts only with a gap gave a perforated shell, not branches.
+- Lesson: judge a surface change with an analysis, not a picture; a blur that "looks organic" can
+  be deleting material.
+
 ## The PC freeze during a test run (2026-10-12, 21:15)
 
 - The user's editor exported the lamp at 21:10 (762 MB STL) and was computing full-resolution
@@ -498,7 +775,12 @@ Final 149M voxels in 216 blocks). The Voronoi branch is not connected to the mes
 - Done 2026-10-14: key cabinet profiled (memory pressure; wide-fade masks sampled coarser),
   Face Mask *Apply to: all other faces*, Reduce Mesh node, tolerance reduction folded into
   Mesh from Implicit Body (per block in the workers + seam pass).
-- Candidates: GPU marching cubes for blocks (the weld identifies border vertices by exact grid
+- Done 2026-10-14: FEA phase 1, static stress analysis (Material, Custom Material, Fixed Faces,
+  Load, Static Analysis; see "Static analysis" above and TOPOLOGY_PLAN.md).
+- Done 2026-10-14 (evening): FEA phase 2, topology optimization (node, Optimize / Stop, live shape, saved
+  states; see "Topology optimization" above).
+- Candidates: FEA phase 3 (TOPOLOGY_PLAN.md: symmetry, several load cases, overhang limit,
+  stress-graded lattices); GPU marching cubes for blocks (the weld identifies border vertices by exact grid
   coordinates, < 1e-6 voxel; Warp's float32 positions would need snapping first); faster noise on
   the GPU (one fused kernel: 50 of ~80 ms per Final block of the key cabinet is the wave noise);
   remove loose specks without fusing (the key cabinet's texture pinches off 4); release idle

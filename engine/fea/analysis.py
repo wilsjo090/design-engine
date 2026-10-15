@@ -24,6 +24,7 @@ from .solver import Hierarchy, Level, _slabs, gather
 
 FEA_VERSION = 1      # bump when the numerics change: results kept on the SSD are then ignored
 SAFETY_CAP = 10.0    # safety factors above this are shown as this
+SUPPORT_PEAK = 1.2   # a peak at a support this much above the stress elsewhere is called artificial
 _RESULTS = OrderedDict()  # analysis key -> Result, so switching what is shown is instant
 KEEP_RESULTS = 4
 
@@ -85,10 +86,10 @@ def build_model(part, conditions, detail="medium", xp=np, cache=None, volume=Non
     return Model(grid, phi, fixed, force, notes + more)
 
 
-def solve(model, material, xp=np, dtype=None, tol=None, callback=None):
-    """Displacements (X, Y, Z, 3) on xp's device. Returns (u, iterations, relative residual)."""
+def solve(model, material, xp=np, dtype=None, tol=1e-6, callback=None):
+    """Displacements (X, Y, Z, 3, float64) on xp's device; the solver works in `dtype` (float32 on
+    the GPU, refined to float64 accuracy). Returns (u, iterations, relative residual)."""
     dtype = dtype or (np.float64 if xp is np else np.float32)
-    tol = tol or (1e-6 if dtype == np.float64 else 2e-5)
     scale = material.E * model.grid.h * model.phi
     H = Hierarchy(scale, stiffness(material.nu), model.fixed, model.grid.coarsenings, xp, dtype)
     return H.solve(model.force, tol=tol, callback=callback)
@@ -100,10 +101,20 @@ def element_stresses(model, material, u):
     grid = model.grid
     S = xp.asarray(elasticity(material.E, material.nu) @ strain_matrix() / grid.h, dtype=u.dtype)  # (6, 24)
     vm = xp.zeros(grid.shape, dtype=u.dtype)
-    for x0, x1 in _slabs(grid.shape, 24 * 8 * u.itemsize):
+    for x0, x1 in _slabs(grid.shape, 24 * 8 * u.itemsize, xp):
         U = gather(u, x0, x1, grid.shape).reshape(-1, 24)
         vm[x0:x1] = von_mises(U @ S.T).reshape(x1 - x0, grid.shape[1], grid.shape[2])
     return np.asarray(to_host(vm), dtype=np.float64) * (model.phi > 0)
+
+
+def _near_supports(model, reach=2):
+    """Elements touching a fixed node, and those within `reach` elements of them."""
+    nx, ny, nz = model.phi.shape
+    fixed = model.fixed.any(axis=-1)
+    touch = np.zeros(model.phi.shape, dtype=bool)
+    for cx, cy, cz in CORNERS:
+        touch |= fixed[cx:cx + nx, cy:cy + ny, cz:cz + nz]
+    return ndimage.binary_dilation(touch, structure=np.ones((3, 3, 3), dtype=bool), iterations=reach)
 
 
 def _neighbour_fill(values, valid, passes=2):
@@ -168,12 +179,16 @@ class Result:
 
     def summary(self):
         r = self.report
-        where = ", ".join(f"{v:.1f}" for v in r["max_stress_at"])
+        point = lambda p: "(" + ", ".join(f"{v:.1f}" for v in p) + ")"
         lines = [f"Static analysis ({r['detail']}, {r['grid']}, {r['elements']:,} with material, {r['device']}, "
                  f"{r['time']:.1f} s{', from the SSD cache' if r['cached'] else ''})",
-                 f"max stress {r['max_stress']:.3g} MPa at ({where}) · smallest safety factor "
+                 f"max stress {r['max_away']:.3g} MPa at {point(r['max_away_at'])} · smallest safety factor "
                  f"{r['min_safety']:.2g} ({r['material']}, strength {r['strength']:g} MPa) · max deflection "
                  f"{r['max_displacement']:.3g} mm · mass {r['mass']:.3g} g"]
+        if r["peak_at_support"]:
+            lines.append(f"note: {r['max_stress']:.3g} MPa right at the fixed faces {point(r['max_stress_at'])}: faces "
+                         f"held perfectly rigid make an artificial peak at their edge (it grows with finer detail), "
+                         f"so it is left out above and of the colour scale. Real bolts and clamps give a little.")
         if r.get("imbalance") is not None and r["imbalance"] > 1e-3:
             lines.append(f"warning: the support reactions differ from the loads by {100 * r['imbalance']:.1f}%")
         lines += [f"note: {n}" for n in r["notes"]]
@@ -211,7 +226,9 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
                  .apply(u, masked=False))
     applied = model.force.reshape(-1, 3).sum(axis=0)
     reaction = np.array([np.asarray(Ku[..., d], dtype=np.float64)[model.fixed[..., d]].sum() for d in range(3)])
-    imbalance = float(np.linalg.norm(reaction + applied) / max(np.linalg.norm(applied), 1e-30))
+    # relative to the total force, or for loads adding up to (nearly) none (a torque) to their size
+    scale = max(np.linalg.norm(applied), 0.1 * np.linalg.norm(model.force.reshape(-1, 3), axis=1).sum(), 1e-30)
+    imbalance = float(np.linalg.norm(reaction + applied) / scale)
     del Ku, scale
 
     u_host = np.asarray(to_host(u), dtype=np.float64)
@@ -223,6 +240,13 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
 
     i_max = np.unravel_index(int(np.argmax(vm_e)), vm_e.shape)
     max_stress = float(vm_e[i_max])
+    # Faces held perfectly rigid make an artificial stress peak at their edge, which grows with finer
+    # detail (bracket: 12.8, 14.0, 21.8 MPa at draft, medium, fine). Report the highest stress
+    # away from the supports too, and use it for the safety factor and the colour scale.
+    near = _near_supports(model)
+    away = np.where(near, 0.0, vm_e)
+    i_away = np.unravel_index(int(np.argmax(away)), away.shape)
+    max_away = float(away[i_away]) if (~near & (model.phi > 0)).any() else max_stress
     n_disp = np.where(act, np.linalg.norm(u_host, axis=-1), 0.0)
     elements = int((model.phi > 0).sum())
     partial = int(((model.phi > 0) & (model.phi < 0.99)).sum())
@@ -234,7 +258,9 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
         "device": "GPU" if xp is not np else "CPU", "iterations": iterations, "cached": u_saved is not None,
         "time": time.perf_counter() - t0, "material": material.name, "strength": material.strength,
         "max_stress": max_stress, "max_stress_at": tuple(grid.origin + (np.asarray(i_max) + 0.5) * grid.h),
-        "min_safety": material.strength / max(max_stress, 1e-9), "max_displacement": float(n_disp.max()),
+        "max_away": max_away, "max_away_at": tuple(grid.origin + (np.asarray(i_away) + 0.5) * grid.h),
+        "peak_at_support": bool(near[i_max]) and max_stress > SUPPORT_PEAK * max_away,
+        "min_safety": material.strength / max(max_away, 1e-9), "max_displacement": float(n_disp.max()),
         "mass": float(model.phi.sum() * grid.h ** 3 * material.density / 1000.0),
         "load": tuple(applied), "imbalance": imbalance, "notes": notes,
     }
@@ -246,6 +272,9 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
                               extent),
         "displacement": nodal_field(disp, grid, key + "-u", "displacement", "mm", (0.0, float(n_disp.max())), extent),
     }
+    if report["peak_at_support"]:  # colour scales that the peak at a support does not wash out
+        fields["stress"].display_range = (0.0, max_away)
+        fields["safety"].display_range = (material.strength / max(max_away, 1e-9), SAFETY_CAP)
     result = Result(key, grid, report, fields)
     _RESULTS[key] = result
     while len(_RESULTS) > KEEP_RESULTS:

@@ -9,6 +9,8 @@ export interface PortSpec {
   choices?: string[]
   many?: boolean
   optional?: boolean
+  /** set by the engine (e.g. Topology Optimization's compute flag), not shown on the node */
+  hidden?: boolean
 }
 
 export interface NodeSpec {
@@ -76,6 +78,8 @@ export interface NodeStatus {
   progress?: [number, number]
   /** the values the node's output can take, when the engine can tell (e.g. 0 ... 1 for a mask) */
   range?: [number, number] | null
+  /** a line from the node about its result (e.g. "not optimized for these settings yet") */
+  note?: string | null
 }
 
 export interface ViewMesh {
@@ -88,7 +92,7 @@ export interface ViewMesh {
 }
 
 export type Axis = 'x' | 'y' | 'z'
-export type ColorMap = 'bands' | 'heat' | 'signed'
+export type ColorMap = 'bands' | 'heat' | 'signed' | 'rainbow'
 
 export interface SliceView {
   version: number
@@ -126,6 +130,8 @@ export interface Paint {
   unit?: string
   /** low values are the bad ones (a safety factor): red at the low end */
   reverse?: boolean
+  /** some values lie beyond min..max (a stress peak at a support), shown in the end colour */
+  clipped?: boolean
 }
 
 /** Supports and loads drawn in the 3D view (from Fixed Faces and Load nodes). */
@@ -136,6 +142,10 @@ export interface Marker {
   dirs: [number, number, number][]
   /** the arrow pushes into the surface (its tip touches it); else it pulls away from it */
   push: boolean[]
+  /** loads: their kind, the centre of their faces and the direction of the force (a torque's axis) */
+  load?: string
+  centre?: [number, number, number]
+  arrow?: [number, number, number] | null
 }
 
 export interface QueueState {
