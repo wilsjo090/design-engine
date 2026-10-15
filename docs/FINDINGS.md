@@ -610,6 +610,56 @@ max deflection, `scratchpad/analyze_surfaces.py`):
 - Lesson: judge a surface change with an analysis, not a picture; a blur that "looks organic" can
   be deleting material.
 
+## Frame optimization F1 (2026-10-15)
+
+Plan: docs/FRAME_PLAN.md ("F1 as built" lists what differs from it). Engine only, no node yet.
+
+- Checked against textbooks (`tests/test_frame.py`): sections of every profile against a pixel
+  integration (0.5%); two- and three-bar trusses and Hemp's 45 degree two-bar truss off a long wall
+  (V = 2 F L / sigma) exactly; member adding = the full LP; cantilever deflection and fixed-end
+  moment to 1e-9 (with and without shear); a clamped column's buckling factor within 1% of Euler.
+- First run on the bolted wall bracket: 323 bars, 16.6 g, 108 s, a tangle. Three causes:
+  1. The plain LP spreads the load over hundreds of bars carrying a few N (1.7 g of plastic
+     layout); at the 2 mm smallest size that is 17 g. Fixed by reweighted LPs that price weak
+     bars at the smallest size's real cost: 170 bars, 9.4 g.
+  2. Bolt and pin nodes were off the lattice and bars reached only 3 spacings, so a straight bolt
+     to pin bar could only be imitated by zig-zag chains; and the pin's bearing load was split over
+     6 nodes on the hole's wall, whose sideways pushes needed bars across. Fixed: a hole (or a
+     load whose pushes cancel) is one node at its centre, and support / load nodes connect to every
+     node: 24 bars at joint cost 0, 9 bars (3 joints, 3.8 g) at 0.02-0.05.
+  3. All four bolt holes were one Fixed Faces whose normals cancel like one hole's: one support
+     node in the middle, which cannot hold a moment (HiGHS: "status unknown, primal infeasible").
+     Supports and loads are now split into connected pieces of faces first.
+- Member adding stopped at its 60-round limit on 15,000 candidates (107 s); solving them all at
+  once is faster here: HiGHS interior point 0.9 s, its simplex 2.5 s, same optimum. Whole runs
+  now 11-16 s, mostly the 12 reweighted LPs.
+- Sideways load: 80 N along the pin on top of the 200 N bearing load (a second Load on the pin;
+  both land on one merged node) makes the truss lean over and thicker on one side: 9 bars, 4.4 g.
+- Against SIMP (bolted, Keep 20%, max 4 mm): 19.3 g and 0.199 mm (voxel) vs the frame's 3.8 g and
+  0.84 mm (beam model): about the same stiffness per gram; the frame is sized for strength.
+- First editor version (node, round bars, plain joints, skin): the skin was first the size of the
+  open support / load faces' signed distance field (`abs(body_from_mesh(...)) - skin`): away from
+  the exact band it is interpolated with arbitrary signs, which showed as stair-stepped sheets and
+  specks. Now the exact distance per connected piece of faces (libigl AABB, in the piece's box).
+- Voxel Static Analysis of the demo's body agrees on deflection (1.05 mm vs 0.91 mm from the frame
+  check) but shows 81-92 MPa (24 allowed) at the sharp corner where a bar meets a bolt boss, growing
+  with finer elements. The frame check cannot see joints: fillets are needed (F2).
+- The layout used only 3 of the 4 bolts (the fourth carried nothing in the optimum), but the skin
+  put a boss around every hole: a loose ring in the part. Supports the layout leaves out are now
+  joined to the frame by the shortest bars to a node that is not held (option Supports: connect
+  all), or get no skin (only needed).
+- Profiles and curving (FRAME_PLAN.md, "Profiles, joints and curving"): rounding only free two-bar
+  corners changed nothing on the bracket (every bend there has a third bar); a curve through the
+  joint (control point 2v - (A+B)/2) curves the knee. The I section's 12% flange and web were
+  0.3 mm at 2.5 mm (mesh in 41 pieces): now at least 0.8 mm. A ball at the pin node bulged out of
+  the eye: no balls at bolts and pins. Extra mesh surfaces were all cavities (negative volume):
+  closed tube ends, and two I bars side by side enclosing pockets.
+- The user found the curves unnatural and the ball joints clumsy. Curving now makes each path of
+  bars one spline through all its nodes (no local bends), and the joints are fillets: one Warp
+  kernel draws every profile and blends only *different* bars (the two nearest at each point),
+  also into the bosses. The first spline version curved nothing on the bracket: the curve check
+  failed next to the pin, whose node sits in its hole (now exempt within the node's free radius).
+
 ## The PC freeze during a test run (2026-10-12, 21:15)
 
 - The user's editor exported the lamp at 21:10 (762 MB STL) and was computing full-resolution

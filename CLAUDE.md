@@ -135,6 +135,23 @@ state again. States are in `cache\topology` (`load_topology` / `save_topology`, 
 on Stop; `core.report_view` shows the shape while it runs (`live_view` event); a node's first
 output can carry a `note` shown on its card.
 
+**Frames** (`engine/frame/`, plan and status in docs/FRAME_PLAN.md; node Frame Optimization in
+`engine/graph/nodes_frame.py`, run on Optimize like Topology Optimization, results in `cache\frame`,
+bump `FRAME_VERSION` when the method changes; the body, `frame/geometry.py`: one Warp kernel for
+every profile (capsules, annulus, rectangles with holes, mitred pieces) that blends the two nearest
+*different* bars with a smooth minimum (fillet joints; pieces of one bar never blend), plus the skin
+at support / load faces joined with the same fillet; `frame/curves.py`: `smooth_bars` makes each
+path of linked bars one Hermite spline through all its nodes, and the bars' orientation, shared
+with the frame check):
+`optimize.optimize_frame` builds a ground structure (`ground.py`: lattice nodes inside the design
+space, one node per hole or pin and clustered nodes on flat support / load faces, candidate bars
+that stay inside), solves the plastic minimum-volume truss LP (`layout.py`, HiGHS interior point;
+member adding above 80k candidates; reweighted LPs so weak bars pay for the smallest size; joint
+cost as extra length per bar), joins straight-through pieces into continuous bars, sizes them
+(`sizing.py`: stress, Euler/Johnson buckling over the unbraced length, optimal grouping into *max
+sizes*) and checks the frame with 12-dof beam elements (`beam.py`: clamped supports, von Mises at
+the bar ends, linear buckling factor), bumping sizes until it passes.
+
 **Meshes** (`engine/meshing.py`): `simplify` (pyfqmr quadric collapse, error threshold scaled by
 voxel², so `keep` is reached at any voxel size) serves both `decimate` and the blocks. `reduce`
 (node Reduce Mesh) works to a tolerance instead: the threshold schedule ends at tolerance²

@@ -215,19 +215,30 @@ function EyeIcon({ open }: { open: boolean }) {
   )
 }
 
-/** Topology Optimization's long job: Optimize (queued like an export) and Stop (keeps the shape so far). */
-const OPTIMIZERS = ['sim.topology']
+/** Long jobs run on request: Optimize (queued like an export) and Stop. Per node type: what the
+ *  buttons say they do. */
+const OPTIMIZERS: Record<string, { run: string; stop: string }> = {
+  'sim.topology': {
+    run: 'Find the stiffest shape (takes a while: the shape grows in the 3D view)',
+    stop: 'Stop: keeps the shape so far; Optimize continues from it',
+  },
+  'sim.frame': {
+    run: 'Find the lightest frame of bars that carries the loads (takes some seconds)',
+    stop: 'Stop the frame optimization',
+  },
+}
 
-function OptimizeBar({ nodeId }: { nodeId: string }) {
+function OptimizeBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
   const running = useStore((s) => s.run?.running && s.run.mode === 'optimize' && s.status[nodeId]?.state === 'running')
   const editing = useStore((s) => !!s.editing)
+  const text = OPTIMIZERS[typeId]
   return (
     <div className="enode-row optimize-row">
       {running
-        ? <button className="nodrag optimize-btn stop" title="Stop: keeps the shape so far; Optimize continues from it"
+        ? <button className="nodrag optimize-btn stop" title={text.stop}
             onClick={() => api.cancel()}>Stop</button>
         : <button className="nodrag optimize-btn" disabled={editing}
-            title={editing ? 'Optimize outside the group' : 'Find the stiffest shape (takes a while: the shape grows in the 3D view)'}
+            title={editing ? 'Optimize outside the group' : text.run}
             onClick={() => startOptimize(nodeId)}>Optimize</button>}
     </div>
   )
@@ -313,7 +324,7 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
         )
       })}
 
-      {OPTIMIZERS.includes(data.typeId) && <OptimizeBar nodeId={id} />}
+      {OPTIMIZERS[data.typeId] && <OptimizeBar nodeId={id} typeId={data.typeId} />}
       {status?.note && status.state !== 'running' && <div className="enode-note">{status.note}</div>}
       {status?.state === 'running' && status.progress && (
         <div className="progress"><div style={{ width: `${(100 * status.progress[0]) / status.progress[1]}%` }} /></div>

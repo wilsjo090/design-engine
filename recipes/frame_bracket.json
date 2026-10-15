@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/wall_bracket_bolts.step"
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "space": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 0
+      },
+      "pos": [
+        300,
+        0
+      ]
+    },
+    "pa12": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "Nylon PA12"
+      },
+      "pos": [
+        300,
+        460
+      ]
+    },
+    "bolts": {
+      "type": "sim.fixed",
+      "inputs": {
+        "cad": {
+          "link": "space.body"
+        },
+        "faces": "5, 6, 7, 8"
+      },
+      "pos": [
+        620,
+        100
+      ]
+    },
+    "hang": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "space.body"
+        },
+        "faces": "10",
+        "kind": "bearing",
+        "amount": 200.0,
+        "direction": "-Z",
+        "add_to": {
+          "link": "bolts.conditions"
+        }
+      },
+      "pos": [
+        940,
+        100
+      ]
+    },
+    "push": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "space.body"
+        },
+        "faces": "10",
+        "kind": "force",
+        "amount": 80.0,
+        "direction": "+Y",
+        "add_to": {
+          "link": "hang.conditions"
+        }
+      },
+      "pos": [
+        1260,
+        100
+      ]
+    },
+    "frame": {
+      "type": "sim.frame",
+      "inputs": {
+        "space": {
+          "link": "space.body"
+        },
+        "material": {
+          "link": "pa12.material"
+        },
+        "conditions": {
+          "link": "push.conditions"
+        }
+      },
+      "pos": [
+        1580,
+        0
+      ],
+      "visible": true
+    }
+  }
+}

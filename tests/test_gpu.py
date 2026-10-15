@@ -202,3 +202,22 @@ def test_gpu_static_analysis_matches_cpu(gpu):
     for k in ("max_displacement", "max_stress"):
         assert on_gpu.report[k] == pytest.approx(cpu.report[k], rel=1e-4), k
     assert on_gpu.report["imbalance"] < 1e-5
+
+
+@pytest.mark.parametrize("kind, joints", [("round", "fillet"), ("square tube", "fillet"), ("I", "ball"),
+                                          ("round tube", "plain")])
+def test_gpu_frame_bars_match_cpu(gpu, kind, joints):
+    # the frame kernel (profiles, mitres, fillets between different bars) on the GPU and on Warp's CPU
+    from engine.frame import curves as CV
+    from engine.frame.geometry import frame_solid
+    from engine.frame.profiles import Profile
+    nodes = np.array([(0, 0, 0), (30, 0, 5), (45, 20, 10), (5, 15, 20)], float)
+    bars = np.array([(0, 1), (1, 2), (2, 3), (3, 0), (0, 2)])
+    fixed = np.zeros((4, 3), dtype=bool)
+    n2, b2, _, c2, _, _ = CV.smooth_bars(nodes, bars, np.ones(5), np.arange(5), fixed, np.zeros((4, 3)), 1.0)
+    sizes = np.linspace(3.0, 6.0, int(c2.max()) + 1)
+    body = frame_solid(n2, b2, c2, sizes, Profile(kind, ratio=1.5 if kind == "I" else 1.0), joints, f"gpu-{kind}")
+    grid = Grid((-6, -6, -6), (52, 27, 27), 0.4)
+    cpu = F.Context(grid, None, np).eval_full(body)
+    on_gpu = backend.to_host(F.Context(grid, None, gpu).eval_full(body))
+    assert np.abs(on_gpu - cpu).max() < 1e-4                           # float32 both, same kernel

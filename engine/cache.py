@@ -174,7 +174,7 @@ class DiskCache:
     def clear(self):
         for f in [*self.folder.glob("*.npy"), *(self.folder / STEP_FOLDER).glob("*.npz"),
                   *(self.folder / "shared").glob("*.npy"),  # engine/shared.py
-                  *(self.folder / TOPOLOGY_FOLDER).glob("*.npz")]:
+                  *(self.folder / TOPOLOGY_FOLDER).glob("*.npz"), *(self.folder / FRAME_FOLDER).glob("*.npz")]:
             try:
                 f.unlink()
             except OSError:
@@ -248,15 +248,16 @@ def save_step_meshes(path, tolerance, angle, meshes):
 # fingerprint of all its inputs: previews read them, Optimize continues from them.
 TOPOLOGY_FOLDER = "topology"
 TOPOLOGY_MAX_BYTES = 2 * 2**30
+FRAME_FOLDER = "frame"     # frame optimizations (small: nodes, bars, sizes)
+FRAME_MAX_BYTES = 2**28
 
 
-def _topology_file(key):
-    return default_cache_dir() / TOPOLOGY_FOLDER / f"{key}.npz"
+def _state_file(folder, key):
+    return default_cache_dir() / folder / f"{key}.npz"
 
 
-def load_topology(key):
-    """The saved state {name: array} of the optimization with this key, or None."""
-    file = _topology_file(key)
+def _load_state(folder, key):
+    file = _state_file(folder, key)
     try:
         with np.load(file, allow_pickle=False) as data:
             state = {k: data[k] for k in data.files}
@@ -266,8 +267,26 @@ def load_topology(key):
     return state
 
 
+def load_topology(key):
+    """The saved state {name: array} of the optimization with this key, or None."""
+    return _load_state(TOPOLOGY_FOLDER, key)
+
+
 def save_topology(key, **arrays):
-    file = _topology_file(key)
+    _save_state(TOPOLOGY_FOLDER, key, arrays, TOPOLOGY_MAX_BYTES)
+
+
+def load_frame(key):
+    """The saved result {name: array} of the frame optimization with this key, or None."""
+    return _load_state(FRAME_FOLDER, key)
+
+
+def save_frame(key, **arrays):
+    _save_state(FRAME_FOLDER, key, arrays, FRAME_MAX_BYTES)
+
+
+def _save_state(folder, key, arrays, max_bytes):
+    file = _state_file(folder, key)
     file.parent.mkdir(parents=True, exist_ok=True)
     tmp = file.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     try:
@@ -284,7 +303,7 @@ def save_topology(key, **arrays):
     total = 0
     for _, size, f in files:
         total += size
-        if total > TOPOLOGY_MAX_BYTES and f != file:
+        if total > max_bytes and f != file:
             f.unlink(missing_ok=True)
 
 
