@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/two_blocks.step"
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "wall_block": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 0
+      },
+      "pos": [
+        300,
+        0
+      ]
+    },
+    "arm_block": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 1
+      },
+      "pos": [
+        300,
+        360
+      ]
+    },
+    "pa12": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "Nylon PA12"
+      },
+      "pos": [
+        300,
+        620
+      ]
+    },
+    "wall": {
+      "type": "sim.fixed",
+      "inputs": {
+        "cad": {
+          "link": "wall_block.body"
+        },
+        "faces": "0"
+      },
+      "pos": [
+        620,
+        0
+      ]
+    },
+    "load_a": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "wall_block.body"
+        },
+        "faces": "1",
+        "kind": "force",
+        "amount": 120.0,
+        "direction": "-Z",
+        "add_to": {
+          "link": "wall.conditions"
+        }
+      },
+      "pos": [
+        940,
+        0
+      ]
+    },
+    "frame_a": {
+      "type": "sim.frame",
+      "inputs": {
+        "space": {
+          "link": "wall_block.body"
+        },
+        "material": {
+          "link": "pa12.material"
+        },
+        "conditions": {
+          "link": "load_a.conditions"
+        }
+      },
+      "pos": [
+        1260,
+        0
+      ]
+    },
+    "load_b": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "arm_block.body"
+        },
+        "faces": "1",
+        "kind": "force",
+        "amount": 120.0,
+        "direction": "-Z"
+      },
+      "pos": [
+        940,
+        360
+      ]
+    },
+    "frame_b": {
+      "type": "sim.frame",
+      "inputs": {
+        "space": {
+          "link": "arm_block.body"
+        },
+        "material": {
+          "link": "pa12.material"
+        },
+        "conditions": {
+          "link": "load_b.conditions"
+        },
+        "connect_to": {
+          "link": "frame_a.frame"
+        }
+      },
+      "pos": [
+        1260,
+        360
+      ]
+    },
+    "join": {
+      "type": "sim.join_frames",
+      "inputs": {
+        "a": {
+          "link": "frame_a.frame"
+        },
+        "b": {
+          "link": "frame_b.frame"
+        }
+      },
+      "pos": [
+        1580,
+        180
+      ],
+      "visible": true
+    }
+  }
+}

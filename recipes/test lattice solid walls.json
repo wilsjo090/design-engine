@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {"path": "parts/tavlaunderl\u00e4gg.stp"},
+      "pos": [0, 0]
+    },
+    "board": {
+      "type": "implicit.from_cad",
+      "inputs": {"cad": {"link": "import.bodies"}, "band": 3.0},
+      "pos": [380, -200]
+    },
+    "solid_faces": {
+      "type": "field.face_mask",
+      "inputs": {"cad": {"link": "import.bodies"}, "faces": "15", "fade": 20, "position": "inside", "reach": "volume"},
+      "pos": [380, 120]
+    },
+    "strut_thickness": {
+      "type": "math.remap",
+      "inputs": {"x": {"link": "solid_faces.out"}, "auto": "yes", "from_low": 0, "from_high": 1, "to_low": 3, "to_high": 25},
+      "pos": [760, 160]
+    },
+    "foam": {
+      "type": "lattice.voronoi",
+      "inputs": {"domain": {"link": "import.bodies"}, "cell": 20, "thickness": {"link": "strut_thickness.out"},
+                 "randomness": 1, "seed": 0},
+      "pos": [1140, 160]
+    },
+    "fill": {
+      "type": "lattice.fill",
+      "inputs": {"body": {"link": "board.out"}, "lattice": {"link": "foam.out"}, "skin": 0},
+      "pos": [1520, 0]
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {"body": {"link": "fill.out"}, "voxel": 0.5, "padding": 1.5},
+      "pos": [1900, 0],
+      "visible": true
+    },
+    "export": {
+      "type": "output.export",
+      "inputs": {"path": "samples/out.stl", "mesh": {"link": "mesh.mesh"}},
+      "pos": [2280, 0]
+    }
+  }
+}

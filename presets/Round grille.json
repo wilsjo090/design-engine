@@ -1,0 +1,36 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Round holes in a sunflower spiral, for round faces (speaker or fan grilles). Connect your CAD bodies to the pattern's Body and your part (e.g. Implicit Body from CAD Body) to Boolean Subtract's A, pick the faces, then show the subtract.",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.holes",
+      "inputs": {
+        "faces": "",
+        "shape": "round",
+        "size": 2.5,
+        "layout": "spiral",
+        "spacing": 4.0,
+        "margin": 2.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cut",
+      "type": "implicit.subtract",
+      "inputs": {},
+      "links": {
+        "b": "pattern.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    }
+  ]
+}

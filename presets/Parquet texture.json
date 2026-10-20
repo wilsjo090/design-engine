@@ -1,0 +1,64 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Rectangles turned 90° in a checkerboard. Connect your CAD bodies to the pattern's Body and your part to Offset Body's Body, pick the faces, then show Offset Body. The Number is the height in mm (negative sinks it).",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.surface",
+      "inputs": {
+        "faces": "",
+        "shape": "rectangle",
+        "size": 2.5,
+        "length": 8.0,
+        "layout": "grid",
+        "spacing": 4.0,
+        "alternate": "checker 90",
+        "softness": 0.3,
+        "margin": 1.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "amplitude",
+      "type": "input.number",
+      "inputs": {
+        "value": 0.5
+      },
+      "links": {},
+      "pos": [
+        0,
+        760
+      ]
+    },
+    {
+      "id": "height",
+      "type": "math.multiply",
+      "inputs": {},
+      "links": {
+        "a": "pattern.out",
+        "b": "amplitude.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    },
+    {
+      "id": "textured",
+      "type": "implicit.offset",
+      "inputs": {},
+      "links": {
+        "distance": "height.out"
+      },
+      "pos": [
+        680,
+        0
+      ]
+    }
+  ]
+}

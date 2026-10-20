@@ -1,0 +1,686 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "parts/lamskarmhalldelar.STEP",
+        "tolerance": 0.01,
+        "skip_duplicates": 1
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "petals": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "band": 1.5,
+        "cad": {
+          "link": "scaled.body"
+        }
+      },
+      "pos": [
+        1506,
+        -526
+      ]
+    },
+    "pattern_noise": {
+      "type": "field.noise",
+      "inputs": {
+        "scale": 55,
+        "octaves": 3,
+        "roughness": 0.45,
+        "seed": 3
+      },
+      "pos": [
+        -205,
+        236
+      ]
+    },
+    "density": {
+      "type": "input.number",
+      "inputs": {
+        "value": 140
+      },
+      "pos": [
+        0,
+        500
+      ]
+    },
+    "phase": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "pattern_noise.out"
+        },
+        "b": {
+          "link": "density.out"
+        }
+      },
+      "pos": [
+        320,
+        260
+      ]
+    },
+    "cos": {
+      "type": "math.cos",
+      "inputs": {
+        "x": {
+          "link": "phase.out"
+        }
+      },
+      "pos": [
+        640,
+        260
+      ]
+    },
+    "triangle": {
+      "type": "math.acos",
+      "inputs": {
+        "x": {
+          "link": "cos.out"
+        }
+      },
+      "pos": [
+        960,
+        260
+      ]
+    },
+    "wave_0_1": {
+      "type": "math.remap",
+      "inputs": {
+        "from_low": 0,
+        "from_high": 3.141593,
+        "to_low": 0,
+        "to_high": 1,
+        "x": {
+          "link": "triangle.out"
+        }
+      },
+      "pos": [
+        1280,
+        220
+      ]
+    },
+    "variation": {
+      "type": "field.noise",
+      "inputs": {
+        "scale": 20,
+        "octaves": 2,
+        "roughness": 0.5,
+        "seed": 7
+      },
+      "pos": [
+        0,
+        680
+      ]
+    },
+    "height_factor": {
+      "type": "math.remap",
+      "inputs": {
+        "from_low": -1,
+        "from_high": 1,
+        "to_low": 0.6,
+        "to_high": 1.4,
+        "x": {
+          "link": "variation.out"
+        }
+      },
+      "pos": [
+        320,
+        640
+      ]
+    },
+    "amplitude": {
+      "type": "input.number",
+      "inputs": {
+        "value": 0.63
+      },
+      "pos": [
+        320,
+        940
+      ]
+    },
+    "ridge_height": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "height_factor.out"
+        },
+        "b": {
+          "link": "amplitude.out"
+        }
+      },
+      "pos": [
+        640,
+        680
+      ]
+    },
+    "uneven_wave": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "wave_0_1.out"
+        },
+        "b": {
+          "link": "ridge_height.out"
+        }
+      },
+      "pos": [
+        1600,
+        420
+      ]
+    },
+    "distance": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "uneven_wave.out"
+        },
+        "b": {
+          "link": "clip_fade.out"
+        }
+      },
+      "pos": [
+        1958,
+        526
+      ]
+    },
+    "offset": {
+      "type": "implicit.offset",
+      "inputs": {
+        "body": {
+          "link": "petals.out"
+        },
+        "distance": {
+          "link": "total_offset.out"
+        }
+      },
+      "pos": [
+        2021,
+        -11
+      ]
+    },
+    "smooth": {
+      "type": "implicit.smoothen",
+      "inputs": {
+        "iterations": 3,
+        "grid_size": 0.1,
+        "body": {
+          "link": "offset.out"
+        }
+      },
+      "pos": [
+        2560,
+        0
+      ]
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "voxel": 0.1,
+        "padding": 1.5,
+        "keep": 0.3,
+        "body": {
+          "link": "seated.out"
+        }
+      },
+      "pos": [
+        3256,
+        -255
+      ],
+      "visible": true
+    },
+    "export": {
+      "type": "output.export",
+      "inputs": {
+        "path": "samples/lamp_noise.stl",
+        "mesh": {
+          "link": "merge.mesh"
+        }
+      },
+      "pos": [
+        3940,
+        -176
+      ]
+    },
+    "preview": {
+      "type": "output.preview",
+      "inputs": {
+        "path": "samples/lamp_noise.png",
+        "mesh": {
+          "link": "merge.mesh"
+        }
+      },
+      "pos": [
+        3940,
+        208
+      ]
+    },
+    "import_step_1": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "parts/lamskarmhall-center.STEP"
+      },
+      "pos": [
+        -2031,
+        -568
+      ]
+    },
+    "center_body": {
+      "type": "input.pick_body",
+      "inputs": {
+        "index": 0,
+        "bodies": {
+          "link": "import_step_1.bodies"
+        }
+      },
+      "pos": [
+        -1256,
+        -524
+      ]
+    },
+    "center_sdf": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "band": 2,
+        "cad": {
+          "link": "center_body.body"
+        }
+      },
+      "pos": [
+        304,
+        -286
+      ]
+    },
+    "size_noise": {
+      "type": "field.noise",
+      "inputs": {
+        "scale": 35,
+        "octaves": 2,
+        "roughness": 0.5,
+        "seed": 11
+      },
+      "pos": [
+        0,
+        -760
+      ]
+    },
+    "size_mask": {
+      "type": "math.smoothstep",
+      "inputs": {
+        "edge0": 0.05,
+        "edge1": 0.35,
+        "x": {
+          "link": "size_noise.out"
+        }
+      },
+      "pos": [
+        320,
+        -760
+      ]
+    },
+    "size_amount": {
+      "type": "input.number",
+      "inputs": {
+        "value": 0.3
+      },
+      "pos": [
+        320,
+        -520
+      ]
+    },
+    "size_extra": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "size_mask.out"
+        },
+        "b": {
+          "link": "size_amount.out"
+        }
+      },
+      "pos": [
+        640,
+        -760
+      ]
+    },
+    "scale_factor": {
+      "type": "math.add",
+      "inputs": {
+        "b": 1,
+        "a": {
+          "link": "size_extra.out"
+        }
+      },
+      "pos": [
+        960,
+        -760
+      ]
+    },
+    "scaled": {
+      "type": "cad.scale",
+      "inputs": {
+        "body": {
+          "link": "import.bodies"
+        },
+        "scale": {
+          "link": "scale_factor.out"
+        },
+        "support": {
+          "link": "center_body.body"
+        }
+      },
+      "pos": [
+        1200,
+        -462
+      ]
+    },
+    "clip_fade": {
+      "type": "math.smoothstep",
+      "inputs": {
+        "edge0": 0,
+        "edge1": 0.4,
+        "x": {
+          "link": "center_sdf.out"
+        }
+      },
+      "pos": [
+        1138,
+        690
+      ]
+    },
+    "seated": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {
+          "link": "smooth.out"
+        },
+        "b": {
+          "link": "center_clearance.out"
+        }
+      },
+      "pos": [
+        2880,
+        -200
+      ]
+    },
+    "center_clearance": {
+      "type": "implicit.offset",
+      "inputs": {
+        "body": {
+          "link": "center_sdf.out"
+        },
+        "distance": {
+          "link": "overlap_cut.out"
+        }
+      },
+      "pos": [
+        2560,
+        -420
+      ]
+    },
+    "center_mesh": {
+      "type": "mesh.from_cad",
+      "inputs": {
+        "cad": {
+          "link": "center_body.body"
+        }
+      },
+      "pos": [
+        3300,
+        414
+      ]
+    },
+    "overlap": {
+      "type": "input.number",
+      "inputs": {
+        "value": 0.3
+      },
+      "pos": [
+        1448,
+        -15
+      ]
+    },
+    "overlap_cut": {
+      "type": "math.multiply",
+      "inputs": {
+        "b": -1,
+        "a": {
+          "link": "overlap.out"
+        }
+      },
+      "pos": [
+        2094,
+        -218
+      ]
+    },
+    "contact_grow": {
+      "type": "math.remap",
+      "inputs": {
+        "from_low": 0,
+        "from_high": 1,
+        "to_high": 0,
+        "x": {
+          "link": "clip_fade.out"
+        },
+        "to_low": {
+          "link": "overlap.out"
+        }
+      },
+      "pos": [
+        2097,
+        761
+      ]
+    },
+    "total_offset": {
+      "type": "math.add",
+      "inputs": {
+        "a": {
+          "link": "distance.out"
+        },
+        "b": {
+          "link": "contact_grow.out"
+        }
+      },
+      "pos": [
+        2555,
+        604
+      ]
+    },
+    "merge": {
+      "type": "mesh.merge",
+      "inputs": {
+        "fuse": "yes",
+        "a": {
+          "link": "mesh.mesh"
+        },
+        "b": {
+          "link": "center_mesh.mesh"
+        }
+      },
+      "pos": [
+        3600,
+        0
+      ]
+    },
+    "offset_2": {
+      "type": "implicit.offset",
+      "inputs": {
+        "body": {
+          "link": "center_sdf.out"
+        },
+        "distance": {
+          "link": "uneven_wave_2.out"
+        }
+      },
+      "pos": [
+        1149,
+        -216
+      ]
+    },
+    "pattern_noise_2": {
+      "type": "field.noise",
+      "inputs": {
+        "scale": 55,
+        "octaves": 3,
+        "roughness": 0.45,
+        "seed": 3
+      },
+      "pos": [
+        -2540,
+        -279
+      ]
+    },
+    "density_2": {
+      "type": "input.number",
+      "inputs": {
+        "value": 140
+      },
+      "pos": [
+        -2605,
+        54
+      ]
+    },
+    "phase_2": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "pattern_noise_2.out"
+        },
+        "b": {
+          "link": "density_2.out"
+        }
+      },
+      "pos": [
+        -2101,
+        -135
+      ]
+    },
+    "cos_2": {
+      "type": "math.cos",
+      "inputs": {
+        "x": {
+          "link": "phase_2.out"
+        }
+      },
+      "pos": [
+        -1730,
+        -118
+      ]
+    },
+    "triangle_2": {
+      "type": "math.acos",
+      "inputs": {
+        "x": {
+          "link": "cos_2.out"
+        }
+      },
+      "pos": [
+        -1369,
+        -164
+      ]
+    },
+    "wave_0_2": {
+      "type": "math.remap",
+      "inputs": {
+        "from_low": 0,
+        "from_high": 3.141593,
+        "to_low": 0,
+        "to_high": 1,
+        "x": {
+          "link": "triangle_2.out"
+        }
+      },
+      "pos": [
+        -1061,
+        -209
+      ]
+    },
+    "variation_2": {
+      "type": "field.noise",
+      "inputs": {
+        "scale": 20,
+        "octaves": 2,
+        "roughness": 0.5,
+        "seed": 7
+      },
+      "pos": [
+        -2593,
+        515
+      ]
+    },
+    "height_factor_2": {
+      "type": "math.remap",
+      "inputs": {
+        "from_low": -1,
+        "from_high": 1,
+        "to_low": 0.6,
+        "to_high": 1.4,
+        "x": {
+          "link": "variation_2.out"
+        }
+      },
+      "pos": [
+        -2015,
+        360
+      ]
+    },
+    "amplitude_2": {
+      "type": "input.number",
+      "inputs": {
+        "value": 0.63
+      },
+      "pos": [
+        -2009,
+        1004
+      ]
+    },
+    "ridge_height_2": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "height_factor_2.out"
+        },
+        "b": {
+          "link": "amplitude_2.out"
+        }
+      },
+      "pos": [
+        -1110,
+        366
+      ]
+    },
+    "uneven_wave_2": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "wave_0_2.out"
+        },
+        "b": {
+          "link": "ridge_height_2.out"
+        }
+      },
+      "pos": [
+        -724,
+        -158
+      ]
+    },
+    "from_implicit_1": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "voxel": 0.3,
+        "body": {
+          "link": "offset_2.out"
+        }
+      },
+      "pos": [
+        3006,
+        154
+      ],
+      "visible": true
+    }
+  }
+}

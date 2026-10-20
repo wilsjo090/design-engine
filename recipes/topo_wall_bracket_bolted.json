@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/wall_bracket_bolts.step"
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "space": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 0
+      },
+      "pos": [
+        300,
+        0
+      ]
+    },
+    "petg": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "PETG"
+      },
+      "pos": [
+        300,
+        420
+      ]
+    },
+    "wall": {
+      "type": "sim.fixed",
+      "inputs": {
+        "cad": {
+          "link": "space.body"
+        },
+        "faces": "5, 6, 7, 8"
+      },
+      "pos": [
+        620,
+        120
+      ]
+    },
+    "hang": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "space.body"
+        },
+        "faces": "10",
+        "kind": "bearing",
+        "amount": 200.0,
+        "direction": "-Z",
+        "add_to": {
+          "link": "wall.conditions"
+        }
+      },
+      "pos": [
+        940,
+        120
+      ]
+    },
+    "topology": {
+      "type": "sim.topology",
+      "inputs": {
+        "space": {
+          "link": "space.body"
+        },
+        "material": {
+          "link": "petg.material"
+        },
+        "conditions": {
+          "link": "hang.conditions"
+        },
+        "keep": 20.0,
+        "skin": 2.0,
+        "detail": "medium",
+        "max_thickness": 4.0,
+        "members": "plates and struts"
+      },
+      "pos": [
+        1260,
+        0
+      ],
+      "visible": true
+    }
+  }
+}

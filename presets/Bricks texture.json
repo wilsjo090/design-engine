@@ -1,0 +1,63 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Raised bricks in a running bond (staggered rectangles, 1 mm mortar). Connect your CAD bodies to the pattern's Body and your part to Offset Body's Body, pick the faces, then show Offset Body. The Number is the height in mm (negative sinks it).",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.surface",
+      "inputs": {
+        "faces": "",
+        "shape": "rectangle",
+        "size": 3.5,
+        "length": 9.0,
+        "layout": "staggered",
+        "spacing": 4.5,
+        "softness": 0.3,
+        "margin": 1.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "amplitude",
+      "type": "input.number",
+      "inputs": {
+        "value": 0.6
+      },
+      "links": {},
+      "pos": [
+        0,
+        760
+      ]
+    },
+    {
+      "id": "height",
+      "type": "math.multiply",
+      "inputs": {},
+      "links": {
+        "a": "pattern.out",
+        "b": "amplitude.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    },
+    {
+      "id": "textured",
+      "type": "implicit.offset",
+      "inputs": {},
+      "links": {
+        "distance": "height.out"
+      },
+      "pos": [
+        680,
+        0
+      ]
+    }
+  ]
+}

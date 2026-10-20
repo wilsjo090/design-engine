@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "design-engine",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".\\start.bat", "--no-browser"],
+      "port": 8765
+    },
+    {
+      "name": "design-engine-test",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".\\start.bat", "--no-browser", "--port", "8766"],
+      "port": 8766
+    }
+  ]
+}

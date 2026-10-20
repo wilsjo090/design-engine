@@ -1,0 +1,209 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/test_part.step",
+        "tolerance": 0.01
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "part_0": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 0
+      },
+      "pos": [
+        320,
+        0
+      ]
+    },
+    "implicit_body_6": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "cad": {
+          "link": "part_0.body"
+        },
+        "band": 1.6
+      },
+      "pos": [
+        640,
+        0
+      ]
+    },
+    "implicit_body_1": {
+      "type": "field.coordinate",
+      "inputs": {
+        "axis": "x"
+      },
+      "pos": [
+        0,
+        250
+      ]
+    },
+    "implicit_body_2": {
+      "type": "input.number",
+      "inputs": {
+        "value": 1.909859
+      },
+      "pos": [
+        640,
+        440
+      ]
+    },
+    "result_14": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": 2,
+        "b": {
+          "link": "implicit_body_1.out"
+        }
+      },
+      "pos": [
+        320,
+        250
+      ]
+    },
+    "result_13": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": 2,
+        "b": {
+          "link": "result_14.out"
+        }
+      },
+      "pos": [
+        640,
+        250
+      ]
+    },
+    "result_15": {
+      "type": "math.divide",
+      "inputs": {
+        "a": {
+          "link": "result_13.out"
+        },
+        "b": {
+          "link": "implicit_body_2.out"
+        }
+      },
+      "pos": [
+        960,
+        250
+      ]
+    },
+    "result_0": {
+      "type": "math.cos",
+      "inputs": {
+        "x": {
+          "link": "result_15.out"
+        }
+      },
+      "pos": [
+        0,
+        600
+      ]
+    },
+    "result_16": {
+      "type": "math.acos",
+      "inputs": {
+        "x": {
+          "link": "result_0.out"
+        }
+      },
+      "pos": [
+        320,
+        600
+      ]
+    },
+    "wave": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "result_16.out"
+        },
+        "b": 0.35
+      },
+      "pos": [
+        640,
+        600
+      ]
+    },
+    "implicit_body_0": {
+      "type": "implicit.offset",
+      "inputs": {
+        "body": {
+          "link": "implicit_body_6.out"
+        },
+        "distance": {
+          "link": "wave.out"
+        }
+      },
+      "pos": [
+        960,
+        600
+      ]
+    },
+    "implicit_body_3": {
+      "type": "implicit.smoothen",
+      "inputs": {
+        "body": {
+          "link": "implicit_body_0.out"
+        },
+        "iterations": 3
+      },
+      "pos": [
+        1280,
+        600
+      ]
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "body": {
+          "link": "implicit_body_3.out"
+        },
+        "voxel": 0.1,
+        "padding": 1.6
+      },
+      "pos": [
+        1280,
+        230
+      ],
+      "visible": true
+    },
+    "export": {
+      "type": "output.export",
+      "inputs": {
+        "mesh": {
+          "link": "mesh.mesh"
+        },
+        "path": "samples/test_part_wave.stl"
+      },
+      "pos": [
+        1600,
+        130
+      ]
+    },
+    "preview": {
+      "type": "output.preview",
+      "inputs": {
+        "mesh": {
+          "link": "mesh.mesh"
+        },
+        "path": "samples/test_part_wave.png"
+      },
+      "pos": [
+        1600,
+        370
+      ]
+    }
+  }
+}

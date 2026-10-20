@@ -1,0 +1,21 @@
+cadquery-ocp>=7.8
+libigl>=2.6
+numpy
+scipy
+scikit-image
+trimesh
+vtk
+cloudpickle
+fast-simplification
+pyfqmr
+manifold3d
+fastapi
+uvicorn[standard]
+psutil
+pillow
+pytest
+httpx
+# GPU (optional: the engine falls back to the CPU without them or without an NVIDIA card)
+cupy-cuda12x[ctk]
+warp-lang
+nvidia-ml-py

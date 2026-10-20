@@ -1,0 +1,53 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "A picture as round holes, bigger where it is darker (Picture into Size scale). Choose the picture file and Width on Picture, pick the same face on both, connect your CAD bodies to both Body inputs and your part to Boolean Subtract's A.",
+  "nodes": [
+    {
+      "id": "picture",
+      "type": "pattern.picture",
+      "inputs": {
+        "faces": "",
+        "path": "",
+        "width": 55.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "pattern",
+      "type": "pattern.holes",
+      "inputs": {
+        "faces": "",
+        "shape": "round",
+        "size": 3.0,
+        "layout": "staggered",
+        "spacing": 3.3,
+        "min_size": 0.7,
+        "margin": 1.5
+      },
+      "links": {
+        "size_scale": "picture.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    },
+    {
+      "id": "cut",
+      "type": "implicit.subtract",
+      "inputs": {},
+      "links": {
+        "b": "pattern.out"
+      },
+      "pos": [
+        720,
+        0
+      ]
+    }
+  ]
+}

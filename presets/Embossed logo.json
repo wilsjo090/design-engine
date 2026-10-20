@@ -1,0 +1,58 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "A picture (a logo) raised off a face: dark parts up. Choose the file and Width on Picture. Connect your CAD bodies to the pattern's Body and your part to Offset Body's Body, pick the faces, then show Offset Body. The Number is the height in mm (negative sinks it).",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.picture",
+      "inputs": {
+        "faces": "",
+        "path": "",
+        "width": 25.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "amplitude",
+      "type": "input.number",
+      "inputs": {
+        "value": 0.8
+      },
+      "links": {},
+      "pos": [
+        0,
+        760
+      ]
+    },
+    {
+      "id": "height",
+      "type": "math.multiply",
+      "inputs": {},
+      "links": {
+        "a": "pattern.out",
+        "b": "amplitude.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    },
+    {
+      "id": "textured",
+      "type": "implicit.offset",
+      "inputs": {},
+      "links": {
+        "distance": "height.out"
+      },
+      "pos": [
+        680,
+        0
+      ]
+    }
+  ]
+}

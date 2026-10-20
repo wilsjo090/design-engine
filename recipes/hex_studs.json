@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "parts/nyckellada.STEP",
+        "tolerance": 0.01
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "part": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "band": 2,
+        "cad": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        320,
+        0
+      ]
+    },
+    "studs": {
+      "type": "pattern.surface",
+      "inputs": {
+        "faces": "wall",
+        "shape": "hexagon",
+        "size": 4,
+        "corner_radius": 0.4,
+        "layout": "staggered",
+        "spacing": 5.5,
+        "margin": 3,
+        "softness": 0.6,
+        "invert": "no",
+        "band": 2,
+        "cad": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        320,
+        160
+      ]
+    },
+    "amplitude": {
+      "type": "input.number",
+      "inputs": {
+        "value": 0.8
+      },
+      "pos": [
+        320,
+        760
+      ]
+    },
+    "height": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "studs.out"
+        },
+        "b": {
+          "link": "amplitude.out"
+        }
+      },
+      "pos": [
+        700,
+        160
+      ]
+    },
+    "textured": {
+      "type": "implicit.offset",
+      "inputs": {
+        "body": {
+          "link": "part.out"
+        },
+        "distance": {
+          "link": "height.out"
+        }
+      },
+      "pos": [
+        1000,
+        0
+      ],
+      "visible": true
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "voxel": 0.1,
+        "padding": 2,
+        "tolerance": 0.01,
+        "body": {
+          "link": "textured.out"
+        }
+      },
+      "pos": [
+        1300,
+        0
+      ]
+    },
+    "export": {
+      "type": "output.export",
+      "inputs": {
+        "path": "out/hex_studs.stl",
+        "mesh": {
+          "link": "mesh.mesh"
+        }
+      },
+      "pos": [
+        1600,
+        0
+      ]
+    }
+  },
+  "selections": {
+    "wall": "0, 8, 9, 10, 11, 31, 32, 33, 52, 53, 54, 72, 73, 74"
+  }
+}

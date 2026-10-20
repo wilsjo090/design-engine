@@ -1,0 +1,38 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Flat-topped hexagons standing 1 mm off the face, straight sides. Connect your CAD bodies to the pattern's Body and your part to Boolean Union's A, pick the faces, then show the union.",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.holes",
+      "inputs": {
+        "faces": "",
+        "shape": "hexagon",
+        "size": 4.0,
+        "corner_radius": 0.3,
+        "layout": "staggered",
+        "spacing": 6.0,
+        "height": 1.0,
+        "margin": 2.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cut",
+      "type": "implicit.union",
+      "inputs": {},
+      "links": {
+        "b": "pattern.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    }
+  ]
+}

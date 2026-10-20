@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/vent_case.step",
+        "tolerance": 0.01
+      },
+      "pos": [0, 0]
+    },
+    "part": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "cad": {"link": "import.bodies"},
+        "band": 2.0
+      },
+      "pos": [320, 0]
+    },
+    "slots": {
+      "type": "pattern.holes",
+      "inputs": {
+        "cad": {"link": "import.bodies"},
+        "faces": "wall",
+        "shape": "slot",
+        "size": 2.5,
+        "length": 12.0,
+        "corner_radius": 0.0,
+        "rotation": 90.0,
+        "layout": "grid",
+        "spacing": 5.0,
+        "margin": 4.0
+      },
+      "pos": [320, 160]
+    },
+    "grille": {
+      "type": "pattern.holes",
+      "inputs": {
+        "cad": {"link": "import.bodies"},
+        "faces": "bottom",
+        "shape": "hexagon",
+        "size": 3.0,
+        "corner_radius": 0.4,
+        "layout": "rings",
+        "spacing": 5.0,
+        "margin": 2.0
+      },
+      "pos": [320, 620]
+    },
+    "cut_slots": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {"link": "part.out"},
+        "b": {"link": "slots.out"}
+      },
+      "pos": [700, 0]
+    },
+    "vented": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {"link": "cut_slots.out"},
+        "b": {"link": "grille.out"}
+      },
+      "pos": [1000, 0],
+      "visible": true
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "body": {"link": "vented.out"},
+        "voxel": 0.15,
+        "padding": 1.5,
+        "tolerance": 0.01
+      },
+      "pos": [1300, 0]
+    },
+    "export": {
+      "type": "output.export",
+      "inputs": {
+        "mesh": {"link": "mesh.mesh"},
+        "path": "out/vent_case.stl"
+      },
+      "pos": [1600, 0]
+    }
+  },
+  "selections": {
+    "wall": "0",
+    "bottom": "3"
+  }
+}

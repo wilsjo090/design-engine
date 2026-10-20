@@ -1,0 +1,140 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Maze-like raised lines along the contours of noise (the lamp's texture), only on the picked faces. Connect your CAD bodies to Face Mask's Body and your part to Offset Body's Body, pick the faces, then show Offset Body. Density sets how many lines, the Number their height.",
+  "nodes": [
+    {
+      "id": "noise",
+      "type": "field.noise",
+      "inputs": {
+        "scale": 30.0,
+        "octaves": 2,
+        "roughness": 0.5,
+        "seed": 1
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "density",
+      "type": "math.multiply",
+      "inputs": {
+        "b": 60.0
+      },
+      "links": {
+        "a": "noise.out"
+      },
+      "pos": [
+        320,
+        0
+      ]
+    },
+    {
+      "id": "cos",
+      "type": "math.cos",
+      "inputs": {},
+      "links": {
+        "x": "density.out"
+      },
+      "pos": [
+        620,
+        0
+      ]
+    },
+    {
+      "id": "lines",
+      "type": "math.acos",
+      "inputs": {},
+      "links": {
+        "x": "cos.out"
+      },
+      "pos": [
+        900,
+        0
+      ]
+    },
+    {
+      "id": "unit",
+      "type": "math.remap",
+      "inputs": {
+        "auto": "yes",
+        "to_low": 0.0,
+        "to_high": 1.0
+      },
+      "links": {
+        "x": "lines.out"
+      },
+      "pos": [
+        1180,
+        0
+      ]
+    },
+    {
+      "id": "faces",
+      "type": "field.face_mask",
+      "inputs": {
+        "faces": "",
+        "fade": 1.0,
+        "band": 2.0
+      },
+      "links": {},
+      "pos": [
+        900,
+        260
+      ]
+    },
+    {
+      "id": "on_faces",
+      "type": "math.multiply",
+      "inputs": {},
+      "links": {
+        "a": "unit.out",
+        "b": "faces.out"
+      },
+      "pos": [
+        1500,
+        0
+      ]
+    },
+    {
+      "id": "amplitude",
+      "type": "input.number",
+      "inputs": {
+        "value": 0.5
+      },
+      "links": {},
+      "pos": [
+        1500,
+        300
+      ]
+    },
+    {
+      "id": "height",
+      "type": "math.multiply",
+      "inputs": {},
+      "links": {
+        "a": "on_faces.out",
+        "b": "amplitude.out"
+      },
+      "pos": [
+        1800,
+        0
+      ]
+    },
+    {
+      "id": "textured",
+      "type": "implicit.offset",
+      "inputs": {},
+      "links": {
+        "distance": "height.out"
+      },
+      "pos": [
+        2100,
+        0
+      ]
+    }
+  ]
+}

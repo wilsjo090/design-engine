@@ -1,0 +1,190 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/bracket.step"
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "bracket": {
+      "type": "input.pick_body",
+      "inputs": {
+        "bodies": {
+          "link": "import.bodies"
+        },
+        "index": 0
+      },
+      "pos": [
+        300,
+        0
+      ]
+    },
+    "petg": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "PETG"
+      },
+      "pos": [
+        300,
+        420
+      ]
+    },
+    "bolts": {
+      "type": "sim.fixed",
+      "inputs": {
+        "cad": {
+          "link": "bracket.body"
+        },
+        "faces": "8, 9"
+      },
+      "pos": [
+        620,
+        120
+      ]
+    },
+    "push": {
+      "type": "sim.load",
+      "inputs": {
+        "cad": {
+          "link": "bracket.body"
+        },
+        "faces": "17",
+        "kind": "force",
+        "amount": 50.0,
+        "direction": "+X",
+        "add_to": {
+          "link": "bolts.conditions"
+        }
+      },
+      "pos": [
+        940,
+        120
+      ]
+    },
+    "analysis": {
+      "type": "sim.static",
+      "inputs": {
+        "part": {
+          "link": "bracket.body"
+        },
+        "material": {
+          "link": "petg.material"
+        },
+        "conditions": {
+          "link": "push.conditions"
+        },
+        "detail": "medium",
+        "show": "stress"
+      },
+      "pos": [
+        1260,
+        0
+      ]
+    },
+    "part": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "cad": {
+          "link": "bracket.body"
+        },
+        "band": 2.0
+      },
+      "pos": [
+        1260,
+        560
+      ]
+    },
+    "size": {
+      "type": "math.remap",
+      "inputs": {
+        "x": {
+          "link": "analysis.stress"
+        },
+        "from_low": 1.0,
+        "from_high": 6.0,
+        "to_low": 1.3,
+        "to_high": 0.0
+      },
+      "pos": [
+        1580,
+        0
+      ]
+    },
+    "scale": {
+      "type": "math.clamp",
+      "inputs": {
+        "x": {
+          "link": "size.out"
+        },
+        "low": 0.0,
+        "high": 1.3
+      },
+      "pos": [
+        1880,
+        0
+      ]
+    },
+    "holes": {
+      "type": "pattern.holes",
+      "inputs": {
+        "cad": {
+          "link": "bracket.body"
+        },
+        "faces": "10, 1",
+        "shape": "round",
+        "size": 5.0,
+        "layout": "staggered",
+        "spacing": 8.0,
+        "margin": 2.5,
+        "size_scale": {
+          "link": "scale.out"
+        }
+      },
+      "pos": [
+        2180,
+        0
+      ]
+    },
+    "vented": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {
+          "link": "part.out"
+        },
+        "b": {
+          "link": "holes.out"
+        }
+      },
+      "pos": [
+        2560,
+        0
+      ]
+    },
+    "check": {
+      "type": "sim.static",
+      "inputs": {
+        "part": {
+          "link": "vented.out"
+        },
+        "material": {
+          "link": "petg.material"
+        },
+        "conditions": {
+          "link": "push.conditions"
+        },
+        "detail": "medium",
+        "show": "stress"
+      },
+      "pos": [
+        2860,
+        0
+      ],
+      "visible": true
+    }
+  }
+}

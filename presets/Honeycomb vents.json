@@ -1,0 +1,37 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Hexagonal through holes packed as a honeycomb, rounded corners. Connect your CAD bodies to the pattern's Body and your part (e.g. Implicit Body from CAD Body) to Boolean Subtract's A, pick the faces, then show the subtract.",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.holes",
+      "inputs": {
+        "faces": "",
+        "shape": "hexagon",
+        "size": 4.0,
+        "corner_radius": 0.4,
+        "layout": "staggered",
+        "spacing": 5.2,
+        "margin": 2.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "cut",
+      "type": "implicit.subtract",
+      "inputs": {},
+      "links": {
+        "b": "pattern.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    }
+  ]
+}

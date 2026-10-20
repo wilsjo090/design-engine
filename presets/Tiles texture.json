@@ -1,0 +1,64 @@
+{
+  "kind": "design-engine/nodes",
+  "version": 1,
+  "doc": "Square tiles with rounded corners and 1 mm grout lines. Connect your CAD bodies to the pattern's Body and your part to Offset Body's Body, pick the faces, then show Offset Body. The Number is the height in mm (negative sinks it).",
+  "nodes": [
+    {
+      "id": "pattern",
+      "type": "pattern.surface",
+      "inputs": {
+        "faces": "",
+        "shape": "rectangle",
+        "size": 5.0,
+        "length": 5.0,
+        "corner_radius": 0.6,
+        "layout": "grid",
+        "spacing": 6.0,
+        "softness": 0.4,
+        "margin": 1.0
+      },
+      "links": {},
+      "pos": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "amplitude",
+      "type": "input.number",
+      "inputs": {
+        "value": 0.5
+      },
+      "links": {},
+      "pos": [
+        0,
+        760
+      ]
+    },
+    {
+      "id": "height",
+      "type": "math.multiply",
+      "inputs": {},
+      "links": {
+        "a": "pattern.out",
+        "b": "amplitude.out"
+      },
+      "pos": [
+        360,
+        0
+      ]
+    },
+    {
+      "id": "textured",
+      "type": "implicit.offset",
+      "inputs": {},
+      "links": {
+        "distance": "height.out"
+      },
+      "pos": [
+        680,
+        0
+      ]
+    }
+  ]
+}

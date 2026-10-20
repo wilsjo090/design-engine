@@ -1,0 +1,224 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "parts/lamskarmhalldelar.STEP",
+        "tolerance": 0.01,
+        "skip_duplicates": 1
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "petals": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "cad": {
+          "link": "import.bodies"
+        },
+        "band": 1.2
+      },
+      "pos": [
+        320,
+        0
+      ]
+    },
+    "axis_pos": {
+      "type": "field.coordinate",
+      "inputs": {
+        "axis": "y"
+      },
+      "pos": [
+        0,
+        230
+      ]
+    },
+    "frequency": {
+      "type": "input.number",
+      "inputs": {
+        "value": 1.908816
+      },
+      "pos": [
+        0,
+        390
+      ]
+    },
+    "phase": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "axis_pos.out"
+        },
+        "b": {
+          "link": "frequency.out"
+        }
+      },
+      "pos": [
+        320,
+        230
+      ]
+    },
+    "cos": {
+      "type": "math.cos",
+      "inputs": {
+        "x": {
+          "link": "phase.out"
+        }
+      },
+      "pos": [
+        640,
+        230
+      ]
+    },
+    "triangle": {
+      "type": "math.acos",
+      "inputs": {
+        "x": {
+          "link": "cos.out"
+        }
+      },
+      "pos": [
+        960,
+        230
+      ]
+    },
+    "amplitude": {
+      "type": "input.number",
+      "inputs": {
+        "value": 0.2
+      },
+      "pos": [
+        960,
+        410
+      ]
+    },
+    "wave_raw": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "triangle.out"
+        },
+        "b": {
+          "link": "amplitude.out"
+        }
+      },
+      "pos": [
+        1280,
+        230
+      ]
+    },
+    "radius": {
+      "type": "field.cylindrical",
+      "inputs": {
+        "axis": "y",
+        "component": "radius"
+      },
+      "pos": [
+        960,
+        590
+      ]
+    },
+    "mount_fade": {
+      "type": "math.smoothstep",
+      "inputs": {
+        "x": {
+          "link": "radius.out"
+        },
+        "edge0": 59.2,
+        "edge1": 60.0
+      },
+      "pos": [
+        1280,
+        590
+      ]
+    },
+    "wave": {
+      "type": "math.multiply",
+      "inputs": {
+        "a": {
+          "link": "wave_raw.out"
+        },
+        "b": {
+          "link": "mount_fade.out"
+        }
+      },
+      "pos": [
+        1600,
+        400
+      ]
+    },
+    "offset": {
+      "type": "implicit.offset",
+      "inputs": {
+        "body": {
+          "link": "petals.out"
+        },
+        "distance": {
+          "link": "wave.out"
+        }
+      },
+      "pos": [
+        1600,
+        0
+      ]
+    },
+    "smooth": {
+      "type": "implicit.smoothen",
+      "inputs": {
+        "body": {
+          "link": "offset.out"
+        },
+        "iterations": 3
+      },
+      "pos": [
+        1920,
+        0
+      ]
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "body": {
+          "link": "smooth.out"
+        },
+        "voxel": 0.1,
+        "padding": 1.2,
+        "keep": 0.3
+      },
+      "pos": [
+        1920,
+        260
+      ],
+      "visible": true
+    },
+    "export": {
+      "type": "output.export",
+      "inputs": {
+        "mesh": {
+          "link": "mesh.mesh"
+        },
+        "path": "samples/lamp_wave.stl"
+      },
+      "pos": [
+        2240,
+        160
+      ]
+    },
+    "preview": {
+      "type": "output.preview",
+      "inputs": {
+        "mesh": {
+          "link": "mesh.mesh"
+        },
+        "path": "samples/lamp_wave.png"
+      },
+      "pos": [
+        2240,
+        400
+      ]
+    }
+  }
+}
