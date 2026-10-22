@@ -1,6 +1,7 @@
 """Frame (truss) optimization: profiles, the layout LP and member adding against hand solutions,
 the frame check against beam theory and Euler buckling, sizing, and a whole run on a box."""
 import math
+import re
 
 import numpy as np
 import pytest
@@ -341,10 +342,38 @@ def test_the_node_optimizes_on_request_and_previews_read_the_frame(block, tmp_pa
     assert any(e["type"] == "message" and "Frame Optimization done" in e["text"] for e in events)
     _, body = run("preview", 1)
     assert "bars" in body.note and " g " in body.note
+    # the body itself is checked: it reaches the safety factor (2), or the node says it does not
+    found = re.search(r"body \(medium Static Analysis\): safety factor (>?[\d.]+)", body.note)
+    assert found, body.note
+    warned = any(e["type"] == "message" and "the body reaches safety factor" in e["text"] for e in events)
+    assert found.group(1).startswith(">") or float(found.group(1)) >= 2.0 or warned
     assert F.sample(body, (0.5, 10.0, 15.0)) < 0        # the skin on the held face
     from engine.grid import Grid
     inside = F.Context(Grid((0.5, 0.5, 0.5), (59.5, 19.5, 29.5), 1.0)).eval_full(body) < 0
     assert 0.01 < inside.mean() < 0.45                   # a frame, not the block (curved bars: ~35%)
+
+
+def test_the_body_check_thickens_the_bars_at_the_most_stressed_spot(monkeypatch):
+    # the beam model passed, the body (joints, bosses) did not: the bars meeting at its most stressed
+    # spot get thicker until the body reaches the safety factor; the others stay as they were
+    import json
+    from engine.graph import nodes_frame as NF
+    built = []
+    monkeypatch.setattr(NF, "frame_body", lambda crop, nodes, bars, chains, sizes, *a, **k:
+                        built.append(np.array(sizes)) or object())
+
+    def analysis(body, conditions, material, detail):   # the bar at the spot: stress goes as 1 / size^3
+        sf = (built[-1][1] / 2.0) ** 3
+        return {"min_safety": sf, "max_away_at": (18.0, 0.0, 0.0), "max_displacement": 0.1}, f"safety factor {sf:.3g}", []
+    monkeypatch.setattr(NF, "check_result", analysis)
+    state = {"nodes": np.array([[0.0, 0, 0], [10, 0, 0], [20, 0, 0]]), "bars": np.array([[0, 1], [1, 2]]),
+             "chains": np.array([0, 1]), "beam_sizes": np.array([2.0, 2.0]),
+             "report": np.array(json.dumps({"bars": 2, "pieces": 2, "joints": 0, "utilisation": 0.9,
+                                            "deflection": 0.1, "buckling": 3.0}))}
+    out = NF._size_for_body(None, state, (), PRESETS["PLA"], Profile(), {"skin": 2.0, "joints": "fillet", "fillet": 0.0},
+                            "key", 2.0, 2.0, None, 0.5, 0)
+    assert out["sizes"].tolist() == [2.0, 3.0]           # 2 x 1.02 x 2^(1/3) = 2.57, up to the next 0.5 mm
+    assert len(built) == 2 and json.loads(str(out["check"]))["safety"] >= 2.0
 
 
 def test_the_skin_is_the_exact_distance_to_the_faces():

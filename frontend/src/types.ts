@@ -162,6 +162,8 @@ export interface Marker {
   dirs: [number, number, number][]
   /** the arrow pushes into the surface (its tip touches it); else it pulls away from it */
   push: boolean[]
+  /** how hard the load presses at each point, 0..1 of its most (arrow lengths; absent = all alike) */
+  sizes?: number[]
   /** loads: their kind, the centre of their faces and the direction of the force (a torque's axis) */
   load?: string
   centre?: [number, number, number]

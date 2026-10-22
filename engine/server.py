@@ -45,6 +45,8 @@ DIST = ROOT / "frontend" / "dist"
 # quality -> (multiplier for mesh-node voxel sizes, cells along the longest side for body previews)
 QUALITY = {"draft": (4.0, 128), "medium": (2.0, 256), "final": (1.0, 512)}
 DISPLAYABLE = ("mesh", "cad", "implicit")
+# simple shapes the editor draws itself (Viewport's guide shapes), so they follow a drag at once
+DRAWN_BY_VIEWPORT = ("implicit.ball", "implicit.bar", "implicit.box")
 # The 3D view gets a decimated copy above this. The browser draws ~12M triangles fine on this
 # PC; the careful decimation used for files reached only 10.6M of a 2.5M target on the lamp and
 # took 24 s, so display copies use the fast setting and only when really needed.
@@ -137,6 +139,9 @@ def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0):
             if spec is None or spec.get("type") not in REGISTRY:
                 continue
             ntype = REGISTRY[spec["type"]]
+            if spec["type"] in DRAWN_BY_VIEWPORT:  # (exactly, and live while dragged: only checked here)
+                targets.append(node_id)
+                continue
             outputs = [(p.name, p.type, node_id, p.name) for p in ntype.outputs]
             if ntype.paint:
                 own_paint = (node_id, ntype.paint)
@@ -283,6 +288,21 @@ class Session:
             event = dict(event, node=group, inner=inner)
         self.hub.publish(dict(event, run=self.run_id))
 
+    def _left_out(self, graph, targets, results):
+        """Nodes a preview left out (they failed, or need a node that did) as the editor knows them:
+        it stops showing their last results (an old part's shape and loads on a new STEP file)."""
+        out = set()
+        for n in graph.order(targets):
+            if n in results:
+                continue
+            if n.startswith("__view__"):
+                out.add(n[len("__view__"):])
+            elif n not in self._owners:
+                out.add(n)
+            elif n in self._group_out:
+                out.add(self._owners[n])
+        return sorted(out)
+
     def _problems(self, problems):
         """Problems of nodes inside groups are shown on the group node."""
         out = []
@@ -428,8 +448,8 @@ class Session:
             publish(type="run_done", ok=True, time=0.0, files={})
             return
         self.evaluator.graph = graph
-        try:
-            results = self.evaluator.run(targets)
+        try:  # previews show what still works when a node fails (exports and optimizations stop)
+            results = self.evaluator.run(targets, keep_going=mode == "preview")
         except Cancelled:
             publish(type="run_done", ok=False, cancelled=True, time=time.perf_counter() - t0)
             return
@@ -501,9 +521,16 @@ class Session:
         files = {}
         for node_id in targets:
             spec = graph.nodes.get(node_id, {})
-            if spec.get("type") in REGISTRY and REGISTRY[spec["type"]].side_effect:
+            if spec.get("type") in REGISTRY and REGISTRY[spec["type"]].side_effect and node_id in results:
                 files[node_id] = results[node_id].get("path")
-        publish(type="run_done", ok=True, time=time.perf_counter() - t0, files=files, label=job["label"])
+        failed = self.evaluator.failed if mode == "preview" else []
+        if failed:
+            publish(type="run_done", ok=False, error="\n".join(str(err) for err in failed),
+                    problems=self._problems([p for err in failed for p in err.problems]),
+                    left_out=self._left_out(graph, targets, results), time=time.perf_counter() - t0,
+                    label=job["label"])
+        else:
+            publish(type="run_done", ok=True, time=time.perf_counter() - t0, files=files, label=job["label"])
         # Replaced meshes hold reference cycles; free them now (after the result is out, so
         # nobody waits for it) instead of letting them pile up until Python gets round to it.
         results = None

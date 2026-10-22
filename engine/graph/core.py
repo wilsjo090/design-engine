@@ -506,6 +506,7 @@ class Evaluator:
         self._stop_reason = None  # set when the memory watchdog stops a run
         self._pool = None  # worker processes, kept alive so later runs start instantly
         self.computed = []  # node ids actually computed in the last run
+        self.failed = []    # run(keep_going=True): a GraphError per node that failed or has a problem
         self.memory_peak = 0
 
     def cancel(self):
@@ -627,7 +628,11 @@ class Evaluator:
             else:
                 over_since = None
 
-    def run(self, targets=None):
+    def run(self, targets=None, keep_going=False):
+        """Outputs of `targets` (default: all sinks) and what they need, by node id. A node that
+        fails stops the run with GraphError, unless `keep_going` (previews): then only the nodes
+        that need it are left out of the results, and `failed` says why (a support whose faces were
+        picked on the previous STEP file must not keep the new part from being shown)."""
         self._cancel = False
         self._stop_reason = None
         self.memory_peak = 0
@@ -635,20 +640,27 @@ class Evaluator:
         watchdog = threading.Thread(target=self._watch_memory, args=(stop,), daemon=True)
         watchdog.start()
         try:
-            return self._run(targets)
+            return self._run(targets, keep_going)
         finally:
             stop.set()
             watchdog.join()
 
-    def _run(self, targets):
+    def _run(self, targets, keep_going=False):
         order = self.graph.order(targets)
-        self.graph.validate(order)
+        self.failed = []
+        if keep_going:
+            self.failed = [GraphError(f"{n}: {m}", problems=[(n, m)]) for n, m in self.graph.problems(order)]
+        else:
+            self.graph.validate(order)
+        left_out = {n for err in self.failed for n, _ in err.problems}
         t0 = time.perf_counter()
         sigs, results = {}, {}
         self.computed = []
         for node_id in order:
             self._check_cancel()
             spec = self.graph.nodes[node_id]
+            if node_id in left_out or any(u not in results for u in self.graph.upstream(node_id)):
+                continue  # it has a problem, or needs a node that failed (keep_going)
             ntype = REGISTRY[spec["type"]]
             kwargs, sig_parts = {}, [spec["type"]]
             for port in ntype.inputs:
@@ -683,8 +695,11 @@ class Evaluator:
                 if self._stop_reason:  # the memory watchdog stopped it
                     err = GraphError(self._stop_reason)
                 self._emit(type="node_error", node=node_id, message=str(err))
-                raise GraphError(f"node '{node_id}' ({ntype.title}) failed: {err}",
-                                 problems=[(node_id, str(err))]) from err
+                failure = GraphError(f"node '{node_id}' ({ntype.title}) failed: {err}", problems=[(node_id, str(err))])
+                if not keep_going or self._stop_reason:
+                    raise failure from err
+                self.failed.append(failure)
+                continue
             finally:
                 _current.ctx = None
                 warnings, self._warnings, self._collect = self._warnings, None, None

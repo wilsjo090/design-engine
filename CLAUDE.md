@@ -152,7 +152,8 @@ the thickness for each density (`lattice._density_curve`, `_lookup`).
 static stress analysis on a voxel grid. `model.py` lays the grid from the part's lowest corner
 (element size from `detail` and the part's volume), fills elements from the part's signed distance
 (`phi`, stiffness `phi * E`), and turns Fixed Faces / Load (CAD triangles sampled h/3 apart, via
-`facemask` face numbers; `sample_triangles` puts loads' long thin triangles on stretched grids, while
+`facemask` face numbers; a load partly off the part keeps its total, put back by what each point
+carries, not by area; `sample_triangles` puts loads' long thin triangles on stretched grids, while
 supports and topology's skin keep `stretch=False`, since which nodes lie near a face depends on how
 densely it is covered) into fixed DOFs and nodal forces; `Condition.traction(normals, points)`
 gives force, pressure, bearing (contact side, cosine weighted) and torque, and a torque or a
@@ -168,16 +169,40 @@ report lines, displacements kept on the SSD for E = 1 (`FEA_VERSION`; keyed with
 strength and E). Static analysis allows a bigger coarsest level (`MAX_COARSE_STATIC`) than topology. Port types `material`, `conditions`, `part`; node
 options `paint` (Static Analysis colours its own body, `paint_ready` source "result") and `preview`
 (Fixed Faces / Load run in every preview once wired, their `markers` go out with `node_done`).
-`topology.py`: SIMP with density filter, Heaviside projection and optimality criteria on the same
-grid and solver (`prepare` -> `Problem`, `Optimizer.step/run/state`); Max thickness adds a local
-volume constraint (Gaussian neighbourhoods at most `LOCAL_SHARE` full, adaptively scaled p-mean)
-handled by a two-multiplier OC update (`_update_two`, Illinois root finding); `density_mesh` turns the
+`topology.py`: SIMP with density filter (cone, radius = the thinnest member; by FFT from
+`FFT_TAPS`), Heaviside projection and optimality criteria on the same grid and solver (`prepare` ->
+`Problem`, `Optimizer.step/run/state`); the stiffness is the eroded design's (`carrying`: projected at
+`ERODED`, plus `THIN_SHARE` of what erosion removes, so the loads keep a path), so members thinner
+than Min thickness cost mass and give nothing (the filter and a 0.5 projection alone made members of
+1-2 elements), and reports use the design's own stiffness (`design_compliance`, saved as
+`compliance`); Skin is never thinner than a set Min thickness; Max thickness adds a local
+volume constraint (Gaussian neighbourhoods, outside the design space counting as empty, at most
+`LOCAL_SHARE` full, adaptively scaled p-mean) handled by a two-multiplier OC update (`_update_two`, Illinois root finding;
+the volume's multiplier never under `PRICE_FLOOR`: when Keep % does not fit, material must not be free, or
+what carries nothing grows, e.g. loose pieces); `density_mesh` turns the
 densities into a smooth closed mesh (extended straight out past the design space, the state's `space`
 mask, not into Avoid or the gap, from the nearest element inside, which the design space then crops;
 Gap to faces keeps elements near the design space's faces empty except around supports, loads and
-Keep, `_gap_cells`; blurred by the node's Smoothing, the level chosen
-so the volume in the design space stays that of the densities; Smoothing is not part of the
-topology key, so changing it never optimizes again). Node
+Keep, `_gap_cells`; Smoothing blurs the signed distance to the densities' 0.5 surface
+(`_surface_distance`; members keep their thickness, thin ones get at most `LIGHT_BLUR`), the level
+chosen so the material in the design space stays that of the densities; Smoothing (default 2) is not
+part of the topology key, so changing it never optimizes again; `thicken` moves what is still thinner
+than Min thickness out smoothly; the eroded design's filter counts the faces as empty,
+`filter_empty`, so plates lying on them are not half as thick). Smoothness (off by default) minimizes
+compliance x outline^Smoothness, the projected design's outline (`Optimizer.outline`; the filtered
+densities' outline rewarded thin grey members and never shrank the real surface); Symmetry lays the
+grid symmetrically about planes through the design space's middle and averages the sensitivities with
+their mirror images (`Problem.mirror`, `symmetric`), so free densities stay exact mirror images; both
+are in the key only when set. Start coarse (default yes, fine detail only, in the key then): `T.levels`
+gives the coarser details whose elements can hold the Max thickness, `_optimize` runs each until the
+projection sharpness reaches `HAND_OVER[level]` (`Optimizer.run(hand_over=)`), then `handover()` /
+`take_over()` move the design variables (trilinear, `_transfer`), sharpness, iteration count and history
+to the next grid; states carry their `level`, so a Stop continues on that level. Prefer (a guide body,
+`Problem.prefer`: 0..1 per element, fading over `GUIDE_FADE` x the thinnest member) rewards the design's
+material there in the sensitivities (Prefer strength x the mean stiffness sensitivity; negative keeps
+material away softly); in the key only when set. The node analyses its
+shown body with Static Analysis (`nodes_fea.check_result`, kept in `_TOPO_RESULTS`): safety factor
+and deflection in the note, warnings below 1 or for large deflections. Node
 Topology Optimization only computes when its hidden `compute` input is set: `build_run_graph`
 sets it for the node of an "optimize" job (`/api/optimize`, queued like exports: `LONG_JOBS`) and
 in exports, and `stamp` (`Session.stamp`, bumped after such jobs) makes previews read the saved
@@ -202,7 +227,11 @@ member adding above 80k candidates; reweighted LPs so weak bars pay for the smal
 cost as extra length per bar), joins straight-through pieces into continuous bars, sizes them
 (`sizing.py`: stress, Euler/Johnson buckling over the unbraced length, optimal grouping into *max
 sizes*) and checks the frame with 12-dof beam elements (`beam.py`: clamped supports, von Mises at
-the bar ends, linear buckling factor), bumping sizes until it passes. *Mid-bar joints*:
+the bar ends, linear buckling factor), bumping sizes until it passes; then the node analyses the
+body (joints, fillets, bosses) with Static Analysis at medium and thickens the bars at its most
+stressed spot until it reaches the safety factor (`nodes_frame._size_for_body`; the state keeps
+`beam_sizes`, the body settings checked as `shape`, and the `check`, so a changed skin, joints or
+fillet sizes the bars again on Optimize without a new layout; the body's key includes the sizes). *Mid-bar joints*:
 `ground.refine` adds nodes along the used bars and the LP runs again; a bar runs on (straight or as
 one curve) through joints where others land (`layout.continuous_bars`). `layout._held_bars` drops
 solver leftovers that reach no support (a lone 0.1 N bar made the check singular). Joining: a list
@@ -268,7 +297,10 @@ library; a new `@node` function appears in the editor automatically. Heavy per-b
 **Server** (`engine/server.py`): the browser owns the graph and POSTs the whole recipe for every
 run. `build_run_graph` applies preview quality (Draft = voxel ×4, Medium ×2, no decimation except
 Final), adds hidden `mesh.view` nodes for visible implicit bodies and slice jobs for visible plain
-fields (also group nodes). Progress streams over `/ws` (events of nodes inside a group are sent as
+fields (also group nodes). A preview keeps going past a failing node (`Evaluator.run(keep_going=True)`,
+`Evaluator.failed`): only what needs it is left out, `run_done` lists those nodes (`left_out`) and the
+editor drops their old views and markers (supports picked on the previous STEP file once kept a new part
+from showing at all); exports and optimizations still stop at the first error. Progress streams over `/ws` (events of nodes inside a group are sent as
 the group node; it reports done once, when its output is); meshes, slices and surface colours are
 fetched as binary from `/api/view/{id}` (`slice:{id}`, `paint:{id}`: a field sampled on a grid and
 interpolated at the view's vertices, `engine/paint.py`; CAD views are not coloured). Exports queue
@@ -284,7 +316,11 @@ Flow (and a group ↔ its edit view with `groupIn`/`groupOut` nodes). Group spec
 browser (`groupSpec`). While a group is open, `nodes`/`edges` are its inner graph and the recipe's
 own are in `editing.outer`; `recipe()` composes both. Edits bump `graphVersion`, which triggers a
 debounced (450 ms) preview run. The viewport is three.js / react-three-fiber with Z up (section
-plane via `clippingPlanes`, variants drawn to the left of the result, check panel).
+plane via `clippingPlanes`, variants drawn to the left of the result, check panel). Ball, Bar and Box
+nodes (`fields.ball/bar/box`, exact distances) are drawn by the viewport itself (`Guides.tsx`; the server
+runs them but adds no view, `server.DRAWN_BY_VIEWPORT`), translucent and faintly through the bodies:
+Place (`store.placing`) puts a point in the middle of the wall under a click on a shown body (meshes
+marked `userData.placeable`), the selected one's yellow handles drag in the view's plane.
 
 **Recipes** (`recipes/*.json`): `{"version": 1, "nodes": {id: {"type", "inputs", "pos",
 "visible"}}}`; an input is a literal or `{"link": "node.port"}`. Unknown keys are preserved, so
@@ -343,4 +379,7 @@ UI data lives in the same file. `lamp_noise.json` is the user's current main des
   back after (never click Discard on the restore banner). The test tab reopens its own
   `lastRecipe` at start-up (once the user's hex_studs, whose autosave was then lost): back up the
   whole autosave folder before starting it, and open a test recipe by typing its full path in
-  Open… and pressing Enter (native confirm dialogs are auto-cancelled in the browser pane).
+  Open… and pressing Enter (native confirm dialogs are auto-cancelled in the browser pane: with
+  unsaved changes Open… does nothing until `window.confirm = () => true` in the test tab; the path
+  field is pre-filled with the last folder, so select all before typing). Copying the backup back
+  changes the autosaves' file dates: restore those too.

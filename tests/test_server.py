@@ -45,6 +45,14 @@ def test_build_run_graph_applies_quality_and_views():
     assert not any(g.nodes[t]["type"].startswith("output.") for t in targets)
 
 
+def test_guide_shapes_are_checked_but_not_meshed_for_the_view():
+    # the editor draws Ball, Bar and Box itself (live while dragged); the engine still runs them for errors
+    g = recipe()
+    g["nodes"]["guide"] = {"type": "implicit.ball", "inputs": {"centre": "1, 2, 3", "radius": 4}}
+    _, targets, views, _ = build_run_graph(g, "preview", "draft", ["guide"])
+    assert "guide" in targets and "guide" not in views and "__view__guide" not in targets
+
+
 def test_preview_run_streams_events_and_serves_mesh():
     with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
         cat = client.get("/api/catalog").json()
@@ -93,6 +101,29 @@ def test_errors_are_attached_to_nodes():
         done = run_and_collect(client, ws, {"graph": g, "mode": "preview", "quality": "final",
                                             "visible": ["mesh"]})[-1]
         assert not done["ok"] and done["problems"][0][0] == "mesh"
+
+
+def test_a_failing_node_does_not_hide_the_rest_of_the_preview():
+    # another STEP file under supports picked on the previous one (the wall bracket's back face and
+    # pin hole): the new part is still shown
+    link = lambda ref: {"link": ref}
+    g = {"version": 1, "nodes": {
+        "import": {"type": "input.import_step", "inputs": {"path": str(ROOT / "samples" / "bracket.step")}},
+        "space": {"type": "input.pick_body", "inputs": {"bodies": link("import.bodies"), "index": 0}},
+        "petg": {"type": "sim.material", "inputs": {"preset": "PETG"}},
+        "wall": {"type": "sim.fixed", "inputs": {"cad": link("space.body"), "faces": "0"}},
+        "hang": {"type": "sim.load", "inputs": {"cad": link("space.body"), "faces": "6", "kind": "bearing",
+                                                "amount": 200.0, "direction": "-Z", "add_to": link("wall.conditions")}},
+        "topology": {"type": "sim.topology", "inputs": {"space": link("space.body"), "material": link("petg.material"),
+                                                        "conditions": link("hang.conditions"), "keep": 25.0}}}}
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        events = run_and_collect(client, ws, {"graph": g, "mode": "preview", "quality": "draft",
+                                              "visible": ["import", "topology"]})
+    done = events[-1]
+    assert not done["ok"] and [n for n, _ in done["problems"]] == ["hang"]
+    assert any(e["type"] == "node_error" and e["node"] == "hang" for e in events)
+    assert [e["node"] for e in events if e["type"] == "view_ready"] == ["import"]
+    assert done["left_out"] == ["hang", "topology"]   # the editor stops showing their old results
 
 
 def test_gpu_setting_can_be_switched():

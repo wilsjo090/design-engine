@@ -22,7 +22,7 @@ from .model import (MAX_COARSE, MAX_COARSE_STATIC, ConditionError, active_nodes,
                     element_size, estimate_volume, make_grid)
 from .solver import Hierarchy, Level, _slabs, gather
 
-FEA_VERSION = 1      # bump when the numerics change: results kept on the SSD are then ignored
+FEA_VERSION = 2      # bump when the numerics change: results kept on the SSD are then ignored
 SAFETY_CAP = 10.0    # safety factors above this are shown as this
 SUPPORT_PEAK = 1.2   # a peak at a support this much above the stress elsewhere is called artificial
 _RESULTS = OrderedDict()  # analysis key -> Result, so switching what is shown is instant
@@ -275,9 +275,12 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
                               extent),
         "displacement": nodal_field(disp, grid, key + "-u", "displacement", "mm", (0.0, float(n_disp.max())), extent),
     }
-    if report["peak_at_support"]:  # colour scales that the peak at a support does not wash out
+    if report["peak_at_support"]:  # a colour scale that the peak at a support does not wash out
         fields["stress"].display_range = (0.0, max_away)
-        fields["safety"].display_range = (material.strength / max(max_away, 1e-9), SAFETY_CAP)
+    # the safety factor on a fixed scale, from 1 (or lower, where the part fails away from the supports)
+    # up to the cap: on its own range a part safe everywhere showed 10..10 in the "bad" colour, and a
+    # peak at a support turned the range backwards (17..10)
+    fields["safety"].display_range = (min(1.0, report["min_safety"]), SAFETY_CAP)
     result = Result(key, grid, report, fields)
     _RESULTS[key] = result
     while len(_RESULTS) > KEEP_RESULTS:

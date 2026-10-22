@@ -4,6 +4,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { api, startOptimize } from '../api'
 import { isFieldNode, useStore } from '../store'
 import { useBrowser } from './FileBrowser'
+import { PLACE_PORTS } from './Guides'
 import type { EngineNode, PortSpec } from '../types'
 import { CATEGORY_COLORS, DISPLAYABLE, GROUP_PREFIX, TYPE_COLORS, parseFaceKeys, resolveFaces } from '../types'
 
@@ -245,6 +246,31 @@ function OptimizeBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
   )
 }
 
+/** Ball, Bar and Box: click on a shown body to put the shape there (a Bar: its start, then its end). */
+function PlaceBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
+  const placing = useStore((s) => s.placing?.node === nodeId)
+  const setPlacing = useStore((s) => s.setPlacing)
+  const editing = useStore((s) => !!s.editing)
+  const bar = typeId === 'implicit.bar'
+  return (
+    <div className="enode-row optimize-row">
+      <button className={`nodrag optimize-btn ${placing ? 'stop' : ''}`} disabled={editing}
+        title={editing ? 'Place shapes outside the group'
+          : placing ? 'Stop placing (Esc)'
+          : `Click on a shown body in the 3D view to put the ${bar ? "bar's start, then its end" : 'shape'} there (in the ` +
+            'middle of the wall under the click). Select the node to drag it by its yellow handles.'}
+        onClick={() => {
+          if (placing) { setPlacing(null); return }
+          const s = useStore.getState()
+          if (!s.visible.includes(nodeId)) s.toggleVisible(nodeId)
+          setPlacing({ node: nodeId, port: PLACE_PORTS[typeId][0] })
+        }}>
+        {placing ? 'Done' : bar ? 'Place (2 clicks)' : 'Place'}
+      </button>
+    </div>
+  )
+}
+
 function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
   const spec = useStore((s) => s.specs[data.typeId])
   const links = useStore(useShallow((s) =>
@@ -328,6 +354,7 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
       })}
 
       {OPTIMIZERS[data.typeId] && <OptimizeBar nodeId={id} typeId={data.typeId} />}
+      {PLACE_PORTS[data.typeId] && <PlaceBar nodeId={id} typeId={data.typeId} />}
       {status?.note && status.state !== 'running' && <div className="enode-note">{status.note}</div>}
       {warnings.map(([text, level], i) => (
         <div className={`enode-warning ${level}`} key={`w${i}`} title={text}>{text}</div>

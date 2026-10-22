@@ -64,6 +64,9 @@ interface State {
   sceneBounds: Bounds
   /** face picking in the 3D view: the Face Mask node being edited and the node whose CAD body is picked on */
   picking: { node: string; source: string } | null
+  /** placing a guide shape (Ball, Bar, Box) by clicking on a shown body: its node and the point input
+   *  the next click sets (a Bar: start, then end) */
+  placing: { node: string; port: string } | null
 
   setCatalog: (c: Catalog) => void
   loadRecipe: (recipe: Recipe, path: string | null, dirty?: boolean) => void
@@ -94,6 +97,7 @@ interface State {
   pasteClip: (clip: Clip, at: { x: number; y: number } | null, keepExternal: boolean) => number
   /** start picking faces for a Face Mask node (shows its CAD body), or stop (null) */
   setPicking: (p: { node: string; source: string } | null) => void
+  setPlacing: (p: { node: string; port: string } | null) => void
   /** make a group from the selected nodes; returns an error message or null */
   createGroup: (name: string) => string | null
   ungroup: (id: string) => void
@@ -236,11 +240,13 @@ export const useStore = create<State>((set, get) => ({
   slice: { axis: 'z', position: null, cmap: 'bands', mode: 'plane' },
   sceneBounds: [[-50, -50, -50], [50, 50, 50]],
   picking: null,
+  placing: null,
 
   setPicking: (picking) => {
-    set({ picking })
+    set({ picking, placing: picking ? null : get().placing })
     if (picking && !get().visible.includes(picking.source)) get().toggleVisible(picking.source)
   },
+  setPlacing: (placing) => set({ placing, picking: placing ? null : get().picking }),
 
   setCatalog: (catalog) => set((s) => ({ catalog, specs: specsWith(catalog, s.groups) })),
 
@@ -257,7 +263,7 @@ export const useStore = create<State>((set, get) => ({
       recipePath: path, dirty,
       variants: path === s.recipePath ? s.variants : [],  // variants compare versions of one recipe
       status: {}, problems: {}, views: {}, slices: {}, paints: {}, markers: {}, frames: {}, graphVersion: s.graphVersion + 1,
-      fitRequest: s.fitRequest + 1, loadCount: s.loadCount + 1, past: [], future: [], picking: null,
+      fitRequest: s.fitRequest + 1, loadCount: s.loadCount + 1, past: [], future: [], picking: null, placing: null,
     }))
   },
 
@@ -471,7 +477,13 @@ export const useStore = create<State>((set, get) => ({
           for (const [node, msg] of (e.problems ?? []) as [string | null, string][]) {
             if (node && !problems[node]?.includes(msg)) (problems[node] ??= []).push(msg)
           }
-          return { run, log, problems }
+          // nodes the preview left out (they failed, or need one that did): their old results go, so an
+          // old part's shape and loads do not sit on a new STEP file
+          const gone = new Set((e.left_out ?? []) as string[])
+          if (!gone.size) return { run, log, problems }
+          const keep = <T,>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([id]) => !gone.has(id)))
+          return { run, log, problems, views: keep(s.views), slices: keep(s.slices), paints: keep(s.paints),
+                   markers: keep(s.markers), frames: keep(s.frames) }
         }
         default:
           return {}
@@ -762,7 +774,7 @@ export const useStore = create<State>((set, get) => ({
     set({
       editing: { name, outer: { nodes: s.nodes, edges: s.edges, past: [...s.past, { nodes: s.nodes, edges: s.edges,
         visible: s.visible, groups: s.groups, selections: s.selections, at: Date.now(), kind: 'edit group' }], future: [] } },
-      nodes, edges, past: [], future: [], picking: null, loadCount: s.loadCount + 1,
+      nodes, edges, past: [], future: [], picking: null, placing: null, loadCount: s.loadCount + 1,
     })
   },
 

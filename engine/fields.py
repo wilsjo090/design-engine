@@ -374,6 +374,44 @@ def wave3d(pattern="ridges", period=5.0, warp=0.0, warp_scale=8.0, seed=0, axis=
                  cache=True, range=(-1.0, 1.0))
 
 
+# --- simple shapes (guides for Topology Optimization, Keep / Avoid bodies) ------------------
+def ball(centre, radius):
+    """A ball, exact distance."""
+    c, r = tuple(float(v) for v in centre), float(radius)
+
+    def fn(ctx):
+        return ctx.xp.sqrt(sum((ctx.axis(k) - c[k]) ** 2 for k in range(3))) - r
+    return Field(fn, _digest("ball", c, r), "ball", (np.subtract(c, r), np.add(c, r)))
+
+
+def bar(start, end, radius):
+    """A rod with round ends from `start` to `end` (a capsule), exact distance."""
+    a, b, r = np.asarray(start, float), np.asarray(end, float), float(radius)
+    d = b - a
+    length2 = float(d @ d)
+
+    def fn(ctx):
+        xp = ctx.xp
+        p = [ctx.axis(k) - a[k] for k in range(3)]
+        t = xp.clip(sum(p[k] * d[k] for k in range(3)) / length2, 0.0, 1.0) if length2 > 0 else 0.0
+        return xp.sqrt(sum((p[k] - t * d[k]) ** 2 for k in range(3))) - r
+    return Field(fn, _digest("bar", tuple(a), tuple(b), r), "bar", (np.minimum(a, b) - r, np.maximum(a, b) + r))
+
+
+def box(centre, size, rounding=0.0):
+    """A box `size` across, its edges rounded by `rounding` mm; exact distance."""
+    c, half = np.asarray(centre, float), 0.5 * np.abs(np.asarray(size, float))
+    rr = min(max(float(rounding), 0.0), float(half.min()))
+
+    def fn(ctx):
+        xp = ctx.xp
+        q = [xp.abs(ctx.axis(k) - c[k]) - (half[k] - rr) for k in range(3)]
+        outside = xp.sqrt(sum(xp.maximum(v, 0.0) ** 2 for v in q))
+        inside = xp.minimum(xp.maximum(xp.maximum(q[0], q[1]), q[2]), 0.0)
+        return outside + inside - rr
+    return Field(fn, _digest("box", tuple(c), tuple(half), rr), "box", (c - half, c + half))
+
+
 # --- implicit bodies ---------------------------------------------------------------------
 def body_from_mesh(mesh, band):
     """Implicit body from a triangle mesh (e.g. a tessellated CAD body)."""

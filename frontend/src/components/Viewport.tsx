@@ -11,6 +11,7 @@ import { isLink, parseFaceKeys, resolveFaces } from '../types'
 import {
   SliceObject, SlicePanel, fieldPaintRange, fmt, gradientCss, lut, normalise, sliceBox, type HoverValue,
 } from './SliceView'
+import { GUIDE_TYPES, Guides, offsetStep, parseVec, vectorText } from './Guides'
 
 // CAD convention: Z is up.
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1)
@@ -109,6 +110,7 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
   return (
     <group>
       <mesh geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost ? () => null : undefined}
+        userData={{ placeable: kind !== 'variant' }}  // a guide shape's Place clicks on it (Guides.tsx)
         onPointerMove={colors ? hover : undefined} onPointerOut={colors && onHover ? () => onHover(null) : undefined}>
         <meshStandardMaterial key={colors ? 'painted' : 'plain'} color={colors ? '#ffffff' : style.color}
           vertexColors={!!colors} metalness={colors ? 0.05 : 0.3} roughness={colors ? 0.7 : 0.42}
@@ -514,25 +516,42 @@ function VariantsList({ variants }: { variants: Variant[] }) {
 const LOAD_COLOR = 0xff4d6d
 const FIXED_COLOR = 0x3fcf6e
 
-/** Arrows for the loads (tip on the face when pushing, tail when pulling) and small cones pointing
- *  into the held faces, sized to the scene. */
+/** The points of a marker far enough apart to draw (`gap` scene units), the most central first: a
+ *  small face (a 4 mm boss) gets one arrow instead of a bundle of 24 on top of each other. */
+function spreadOut(points: [number, number, number][], gap: number) {
+  const centre = points.reduce((a, p) => a.add(new THREE.Vector3(...p)), new THREE.Vector3())
+    .divideScalar(Math.max(points.length, 1))
+  const order = points.map((p, i) => [new THREE.Vector3(...p).distanceToSquared(centre), i] as [number, number])
+    .sort((a, b) => a[0] - b[0])
+  const kept: number[] = []
+  for (const [, i] of order) {
+    const p = new THREE.Vector3(...points[i])
+    if (kept.every((k) => p.distanceTo(new THREE.Vector3(...points[k])) >= gap)) kept.push(i)
+  }
+  return kept
+}
+
+/** Arrows for the loads (tip on the face when pushing, tail when pulling; shorter where the load
+ *  presses less, as on a bearing load's sides) and small cones pointing into the held faces, sized
+ *  to the scene. */
 function MarkerArrows({ markers, size }: { markers: Record<string, Marker[]>; size: number }) {
   const group = useMemo(() => {
     const g = new THREE.Group()
     const len = size * 0.06
     for (const list of Object.values(markers)) {
       for (const m of list) {
-        m.points.forEach((p, i) => {
+        for (const i of spreadOut(m.points, len * 0.4)) {
           const dir = new THREE.Vector3(...m.dirs[i]).normalize()
-          const at = new THREE.Vector3(...p)
+          const at = new THREE.Vector3(...m.points[i])
           if (m.kind === 'fixed') {
             const h = len * 0.4
             g.add(new THREE.ArrowHelper(dir, at.clone().addScaledVector(dir, -h), h, FIXED_COLOR, h, h * 0.6))
           } else {
-            const start = m.push[i] ? at.clone().addScaledVector(dir, -len) : at
-            g.add(new THREE.ArrowHelper(dir, start, len, LOAD_COLOR, len * 0.3, len * 0.16))
+            const l = len * (0.25 + 0.75 * (m.sizes?.[i] ?? 1))
+            const start = m.push[i] ? at.clone().addScaledVector(dir, -l) : at
+            g.add(new THREE.ArrowHelper(dir, start, l, LOAD_COLOR, l * 0.3, l * 0.16))
           }
-        })
+        }
       }
     }
     // drawn over the part: supports and loads often sit inside holes (bolt holes, a pin hole)
@@ -571,14 +590,6 @@ function snapDirection(v: THREE.Vector3) {
   return (best ?? v).clone()
 }
 
-const fmtComponent = (x: number) => String(Number(x.toFixed(3)))
-const vectorText = (v: THREE.Vector3) => `${fmtComponent(v.x)}, ${fmtComponent(v.y)}, ${fmtComponent(v.z)}`
-const parseVec = (value: unknown) => {
-  const v = String(value ?? '').split(/[\s,;]+/).filter(Boolean).map(Number)
-  return v.length === 3 && v.every(Number.isFinite) ? new THREE.Vector3(...v) : null
-}
-/** Offsets are dragged in whole steps: 0.5 mm in small scenes, 1 mm up to 300 mm, else 5 mm. */
-const offsetStep = (sceneSize: number) => (sceneSize <= 50 ? 0.5 : sceneSize <= 300 ? 1 : 5)
 const Y_UP = new THREE.Vector3(0, 1, 0)
 const Z_UP = new THREE.Vector3(0, 0, 1)
 
@@ -1053,6 +1064,20 @@ export function Viewport() {
     writeFaces(next)
   }
 
+  // --- placing a guide shape (a Ball, Bar or Box node's Place button) ---
+  const placing = useStore((s) => s.placing)
+  const setPlacing = useStore((s) => s.setPlacing)
+  const placeNodeExists = useStore((s) => !s.placing || s.nodes.some((n) => n.id === s.placing!.node))
+  const placingBar = useStore((s) => !!s.placing && s.nodes.find((n) => n.id === s.placing!.node)?.data.typeId === 'implicit.bar')
+  const guideIds = useStore((s) => s.nodes.filter((n) => GUIDE_TYPES.includes(n.data.typeId)).map((n) => n.id).join(' '))
+  useEffect(() => { if (!placeNodeExists) setPlacing(null) }, [placeNodeExists, setPlacing])
+  useEffect(() => {
+    if (!placing) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPlacing(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [placing, setPlacing])
+
   // Grid scaled to the part: ~10 cells across, snapped to 1/2/5 x 10^n mm.
   const size = bounds ? bounds.getSize(new THREE.Vector3()) : new THREE.Vector3(100, 100, 100)
   const span = Math.max(size.x, size.y, 1)
@@ -1100,6 +1125,7 @@ export function Viewport() {
               onHover={setHover} node={id} />))}
         {showMarkers && anyMarkers && <MarkerArrows markers={markers} size={Math.max(size.x, size.y, size.z, 1)} />}
         {showFrames && !picking && frames.map(([id, f], k) => <FrameBars key={`${id}-${k}`} id={id} frame={f} onHover={setBarHover} />)}
+        {!picking && <Guides sceneSize={Math.max(size.x, size.y, size.z, 1)} />}
         {aim && !picking && (
           <DirectionGizmo anchor={aim.anchor} dir={aim.dir} length={Math.max(size.x, size.y, size.z, 1) * 0.3}
             onCommit={commitAim} torque={aim.torque} centre={aim.centre}
@@ -1135,7 +1161,8 @@ export function Viewport() {
                 : viewsMap[id] ? `${(viewsMap[id].faces / 1000).toFixed(viewsMap[id].faces < 10000 ? 1 : 0)}k tris` +
                   (paints[id] ? ` · coloured by ${paints[id].label}${paints[id].unit ? ` (${paints[id].unit})` : ''}` : '')
                 : slices[id] ? `field slice, ${slices[id].axis} = ${slices[id].position.toFixed(1)}`
-                : status[id]?.state === 'error' ? 'error' : '…'}
+                : status[id]?.state === 'error' ? 'error'
+                : guideIds.split(' ').includes(id) ? 'shape (select its node to drag it)' : '…'}
             </span>
           </div>
         ))}
@@ -1164,6 +1191,17 @@ export function Viewport() {
               {faceData && !faceData.same ? ' · different bodies: faces are saved as body:face' : ''}</span>}
           <button disabled={!chosen.size} onClick={() => writeFaces(new Set())} title="Remove every chosen face">Clear</button>
           <button onClick={() => setPicking(null)} title="Esc">Done</button>
+        </div>
+      )}
+      {placing && (
+        <div className="pick-banner">
+          <span>Placing <b>{placing.node}</b>{placingBar ? (placing.port === 'start' ? ': its start' : ': its end') : ''}</span>
+          <span className="muted">
+            {views.length
+              ? 'click on a shown body: the point goes in the middle of the wall under the click · drag to turn the view'
+              : 'show a body to click on (its ○ eye on a node)'}
+          </span>
+          <button onClick={() => setPlacing(null)} title="Esc">Done</button>
         </div>
       )}
       <div className="viewport-tools">

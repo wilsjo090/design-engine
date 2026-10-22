@@ -80,11 +80,11 @@ def test_gpu_out_of_memory_falls_back_to_cpu(gpu, cad_part, monkeypatch):
     real = nodes._mesh_on
     used = []
 
-    def flaky(body, grid, xp):
+    def flaky(body, grid, xp, cut_hint):
         used.append(xp.__name__)
         if xp is not np:
             raise gpu.cuda.memory.OutOfMemoryError(1 << 30, 0)   # as if another program took it
-        return real(body, grid, xp)
+        return real(body, grid, xp, cut_hint)
     monkeypatch.setattr(nodes, "_mesh_on", flaky)
     mesh = nodes._mesh(F.body_from_mesh(cad_part, 1.5), cad_part.bounds, 0.3, 1.5, 1.0)  # 2M voxels: GPU
     assert used == ["cupy", "numpy"] and mesh.is_watertight
@@ -202,6 +202,49 @@ def test_gpu_static_analysis_matches_cpu(gpu):
     for k in ("max_displacement", "max_stress"):
         assert on_gpu.report[k] == pytest.approx(cpu.report[k], rel=1e-4), k
     assert on_gpu.report["imbalance"] < 1e-5
+
+
+@pytest.mark.parametrize("radius", [3, 10])   # direct and by FFT (topology's big struts-only filters)
+def test_gpu_topology_filter_matches_cpu(gpu, radius):
+    from engine.fea import topology as T
+    rng = np.random.default_rng(2)
+    a = rng.random((60, 24, 40)).astype(np.float32)
+    o = np.arange(-radius, radius + 1)
+    kernel = np.maximum(radius + 0.25 - np.sqrt(o[:, None, None] ** 2 + o[None, :, None] ** 2 + o[None, None, :] ** 2),
+                        0).astype(np.float32)
+    cpu = T._convolve(np, 0)(a.astype(np.float64), kernel.astype(np.float64))
+    on_gpu = backend.to_host(T._convolve(gpu, kernel.size)(gpu.asarray(a), gpu.asarray(kernel)))
+    assert np.allclose(on_gpu, cpu, atol=1e-5 * np.abs(cpu).max())
+
+
+def test_gpu_topology_outline_and_symmetry_match_cpu(gpu):
+    # Smoothness's outline and its gradient, and Symmetry's mirror average, in float32 on the GPU
+    from engine.fea import topology as T
+    rng = np.random.default_rng(3)
+    shape = (30, 20, 16)
+    x = rng.random(shape)
+    domain = np.ones(shape)
+    domain[:, :, 12:] = 0.0        # a design space face inside the grid
+    free = rng.random(shape) > 0.1
+    solid = np.zeros(shape, dtype=bool)
+    solid[:2] = True
+    o = np.arange(-2, 3)
+    kernel = np.maximum(2.5 - np.sqrt(o[:, None, None] ** 2 + o[None, :, None] ** 2 + o[None, None, :] ** 2), 0)
+    found = []
+    for xp, dtype in ((np, np.float64), (gpu, np.float32)):
+        D, K = xp.asarray(domain, dtype=dtype), xp.asarray(kernel, dtype=dtype)
+        N = T._convolve(xp, K.size)(D, K)
+        norm = xp.where(N > 0, 1.0 / xp.where(N > 0, N, 1.0), 0.0).astype(dtype)
+        p = T.Problem(None, D, xp.asarray(solid), xp.asarray(free & ~solid), None, None, K, norm, D, 1.0, 0.3, 2.5,
+                      None, xp, dtype, mirror=((0, 30), (1, 19)))
+        opt = object.__new__(T.Optimizer)   # (no solve: only the outline)
+        opt.p, opt.beta = p, 4.0
+        area, grad = opt.outline(xp.asarray(x, dtype=dtype))
+        found.append((area, backend.to_host(grad), backend.to_host(p.symmetric(xp.asarray(x, dtype=dtype)))))
+    (area, grad, mirrored), (area_gpu, grad_gpu, mirrored_gpu) = found
+    assert area_gpu == pytest.approx(area, rel=1e-4)
+    assert np.allclose(grad_gpu, grad, atol=1e-4 * np.abs(grad).max())
+    assert np.allclose(mirrored_gpu, mirrored, atol=1e-6)
 
 
 @pytest.mark.parametrize("kind, joints", [("round", "fillet"), ("square tube", "fillet"), ("I", "ball"),

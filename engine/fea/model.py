@@ -414,16 +414,19 @@ def sample_triangles(triangles, spacing, stretch=True):
 
 
 def markers(condition, count=24):
-    """A few well-spread points on the condition's faces and the direction to draw there (the load's
-    direction; into the part for supports), for the 3D view."""
+    """A few well-spread points on the condition's faces, the direction to draw there (the load's
+    direction; into the part for supports) and how hard the load presses there (0..1 of its most,
+    so a bearing load's sides and a torque's middle get short arrows; 1 for supports), for the 3D view."""
     area = condition.area
     if area <= 0:
-        return np.zeros((0, 3)), np.zeros((0, 3))
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0)
     cell = math.sqrt(area / count)
     pts, _, normals = sample_triangles(condition.triangles, cell / 3)
+    peak = 0.0
     if condition.kind == "load":  # only where the load acts (a bearing load: the contact side)
         size = np.linalg.norm(condition.traction(normals, pts), axis=1)
-        on = size > 0.05 * size.max() if size.max() > 0 else np.ones(len(size), dtype=bool)
+        peak = float(size.max())
+        on = size > 0.05 * peak if peak > 0 else np.ones(len(size), dtype=bool)
         pts, normals = pts[on], normals[on]
         cell = math.sqrt(area * on.mean() / count) if on.any() else cell
     keys = np.floor(pts / cell).astype(np.int64)
@@ -432,12 +435,11 @@ def markers(condition, count=24):
         first = np.sort(np.random.default_rng(0).choice(first, count, replace=False))
     pts, normals = pts[first], normals[first]
     if condition.kind == "fixed":
-        dirs = -normals
-    else:
-        dirs = condition.traction(normals, pts)
-        norm = np.linalg.norm(dirs, axis=1, keepdims=True)
-        dirs = np.where(norm > 0, dirs / np.maximum(norm, 1e-300), -normals)
-    return pts, dirs
+        return pts, -normals, np.ones(len(pts))
+    dirs = condition.traction(normals, pts)
+    norm = np.linalg.norm(dirs, axis=1, keepdims=True)
+    sizes = norm[:, 0] / peak if peak > 0 else np.ones(len(pts))
+    return pts, np.where(norm > 0, dirs / np.maximum(norm, 1e-300), -normals), sizes
 
 
 def apply_conditions(grid, phi, conditions):
@@ -470,12 +472,12 @@ def apply_conditions(grid, phi, conditions):
         on = act[flat]
         on &= np.all((rel >= -0.5) & (rel <= np.asarray(grid.shape) + 0.5), axis=1)[:, None]  # off the grid
         hit = on.any(axis=1)
-        share = float(areas[hit].sum() / areas.sum())
         if not hit.any():
             raise ConditionError(f"{cond.label or cond.kind}: its faces are not on the part (no material there)")
-        if share < 0.9:
-            notes.append(f"{cond.label or cond.kind}: {100 * (1 - share):.0f}% of its faces lie off the part")
         if cond.kind == "fixed":
+            share = float(areas[hit].sum() / areas.sum())
+            if share < 0.9:
+                notes.append(f"{cond.label or cond.kind}: {100 * (1 - share):.0f}% of its faces lie off the part")
             close = ends >= FIXED_NEAR
             near = close[:, cx, 0] & close[:, cy, 1] & close[:, cz, 2]
             fixed.reshape(-1, 3)[flat[on & near]] = True
@@ -486,8 +488,16 @@ def apply_conditions(grid, phi, conditions):
         ok = total > 0
         ws, total, flat = ws[ok], total[ok], flat[ok]
         ws /= total[:, None]
-        keep_full = areas.sum() / areas[ok].sum()   # the share off the part is put on the rest
-        f = cond.traction(normals[ok], pts[ok]) * areas[ok, None] * keep_full
+        # the share of the load off the part is put on the rest, counted by what each point carries: by
+        # area, a topology result without the unloaded side of a pin hole (27% of a bearing load's faces,
+        # carrying nothing) got 276 N instead of 200
+        f = cond.traction(normals, pts) * areas[:, None]
+        size = np.linalg.norm(f, axis=1)
+        share = float(size[ok].sum() / size.sum()) if size.sum() > 0 else 1.0
+        if share < 0.9:
+            notes.append(f"{cond.label or cond.kind}: {100 * (1 - share):.0f}% of it would act off the part, so the "
+                         f"rest carries it")
+        f = f[ok] / max(share, 1e-300)
         moment = cond.offset_moment()
         if moment is not None:
             notes.append(f"{cond.label or 'load'}: acts {np.linalg.norm(cond.offset):.3g} mm from the centre of its "

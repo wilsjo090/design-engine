@@ -706,6 +706,313 @@ where ~31k would cover it evenly, and `apply_conditions` took 1.3 s at medium, 2
   prepare 5.1 -> 3.75 s at medium; the medium design identical (0 elements flipped), draft 4 of 8,279
   (compliance -0.025%). FEA_VERSION and TOPO_VERSION not bumped.
 
+## Min thickness, skin and load arrows (2026-10-20)
+
+The user's key box (`nyckellada.STEP`: a 157 x 28 x 217 mm tray with ~5-6 mm walls; Min thickness 3,
+Max thickness 15, struts only, medium; four 4 mm boss faces carry the support and three forces, a
+200 N bearing load in -Y sits on the whole front rim, 9,670 mm2): "Min thickness is not honoured,
+some parts look too thin", and the arrows looked wrong.
+
+- Measure on the body the node shows (the density mesh cut by the design space, meshed as the
+  Final preview), never on the density mesh: that is extended past the design space, so every
+  member touching a face looked thick there (0.6% under 3 mm) while the shown body had 66%. Voxel
+  medial-axis measures were no better: every stair-step bump counts as a thin ridge.
+- Why: a cone filter of radius r and a projection at 0.5 do not stop members thinner than 2r (a
+  ridge of the filtered density just over 0.5 is a member). With 1.5 elements (Min thickness 3 at
+  0.96 mm) the key box got members of 1-2 elements. Now the stiffness is that of the eroded design
+  (projected at ERODED 0.8): a plate needs a filtered core of 0.8 to carry, which with the cone filter
+  needs a plate at least the radius thick (struts 1.3 x; checked on the voxel kernel), so the radius
+  is now the min member, not half of it. Members too thin for that cost volume and give nothing.
+- The eroded design alone broke apart when Keep % left no room for members that thick (30 x 10 x
+  10 box at 20%: compliance 167,351). What erosion removes still carries THIN_SHARE 0.15 of its
+  density (0.3% of its stiffness): connected again (compliance 70), and thin members still do not pay.
+- The stiffness shown is the design's own (one extra solve at the end, every 10 iterations for the
+  log): the eroded design is much softer (key box struts only: 59% vs 76%).
+- The eroded objective creeps for long: runs often reach the 125-iteration cap; 200 iterations gave
+  the same design (compliance 34.64 vs 34.67), so the cap stays.
+- Skin: the bearing load's 2 mm skin over the rim was nearly all that stayed thin. The skin is now
+  never thinner than a Min thickness that is set.
+- Max thickness counted a neighbourhood as a share of the design space, so a solid 6 mm wall read as
+  100% full whatever the max thickness and every wall got holes. Outside the design space now counts
+  as empty (as it is in the part).
+- Struts only now really asks for members of 0.65 x Max thickness (at 15 mm: a 21^3 kernel). Direct
+  convolution made an iteration 3x slower; filters of 1000 taps or more go through an FFT (14.6 -> 0.9 ms
+  a filter on the GPU, ~100 filters an iteration in the root finding).
+- Medium, GPU, shown body (`under` = share of its surface thinner than the min member, `away` = of
+  that, away from the support / load skins):
+
+  | case | method | iterations | time | stiffness | under | away |
+  |---|---|---|---|---|---|---|
+  | key box, user's settings | old | 125 | 127 s | 81% | 66% | ~32% |
+  | | new | 110 | 80 s | 76% | 6.4% | 0.8% |
+  | key box, Min 3 only | old | 54 | 30 s | 93.5% | 78% | 42% |
+  | | new | 88 | 47 s | 86.8% | 26% | 15% |
+  | wall bracket, 25% | old | 68 | 23 s | 27.3% | 13.7% | 1.1% |
+  | | new | 116 | 30 s | 26.4% | 11.4% | 0% |
+  | bolted bracket, 20% | old | 80 | 26 s | 26.4% | 16.9% | 1.1% |
+  | | new | 123 | 33 s | 25.2% | 17.0% | 0% |
+
+  What is left under 3 mm with Min 3 only is 2.2-3 mm (old: down to 1 mm): the blur of Smoothing,
+  and feather edges where members meet the design space's faces at a slant. A radius of 1.2 x the
+  min member halved it but cost 3.6 points of stiffness: not done. On the brackets the rest is the
+  2 mm skins (Min thickness automatic, 2.1 mm).
+- Load arrows: every arrow was as long as every other, so a bearing load's sides (a few % of its
+  pressure) looked as loaded as its middle, and a 4 mm boss face got 24 arrows of 13 mm (a bundle;
+  72 with three loads). Markers now carry `sizes` (0..1 of the load's most), arrows are 0.25-1 of the
+  length by them, and points closer than 0.4 of an arrow are left out (the most central kept).
+- A bearing load presses square to the surface, so on a rounded rim its arrows lean with the
+  surface (sideways parts cancel; the total is the force). For "push the front in -Y" use a force.
+- TOPO_VERSION 2: saved results are optimized again.
+
+### Do the optimizers keep their promises on the shown body? (2026-10-21)
+
+Each optimizer node run as Optimize does, its shown body meshed as the Final preview, then
+measured and put through Static Analysis on the optimizer's own grid (medium, GPU):
+
+- Topology stiffness: the wall bracket's note said 26%, Static Analysis of its body 14.5%. On the
+  optimizer's grid and solver the body matched the densities (IoU 0.97, 25.9% vs 26.4%; solver
+  tolerance made no difference). The cause was Static Analysis: the bearing load on the pin hole,
+  whose unloaded side the optimizer had removed (27% of the faces), was put back by area: 276 N
+  instead of 200. Now put back by what each point carries (`apply_conditions`, FEA_VERSION 2):
+  27.5%. Bolted bracket 19.2% / 18% in the note, key box 78% / 76%.
+- Keep % (25.0%, 30.2% of the design space), Gap 3 mm (no material within it away from supports and
+  loads), Max thickness 4 mm (largest inscribed ball 99% <= 5.1 mm, joints) and Frame Min size (2.0
+  mm) hold on the body. Ray thickness overstates plates and joints (rays from an edge cross the
+  width), so maxima were measured with the distance transform.
+- Frame Optimization's Safety factor 2 does not hold on the body: beam model utilisation 0.92 (2.17),
+  Static Analysis of the body 1.57 at medium and 1.42 at fine, at the junctions of bars with the
+  bosses at the pin and the bolt holes (the beam model cannot see them; the peak grows with detail).
+  Deflection 0.53 mm against 0.88 in the beam model. Not fixed (NODE_AUDIT 19).
+- The key box as set up (one 4 mm boss held, 500 N of loads) came out at safety factor 0.16 and 189 mm
+  deflection, while its note said "stiffness 76% of the full design space": relative numbers only
+  (NODE_AUDIT 20).
+- Safety factor colours: a fixed scale from 1 (or the smallest value, below 1) to 10, so a part safe
+  everywhere is no longer painted in the "bad" colour and the range is never backwards.
+- The topology key takes only E and Poisson's ratio of the material.
+
+### The optimizers check their own results; Min thickness after Smoothing (2026-10-21)
+
+The user expected the optimizers to check what they make; they only judged it with their own models
+(Topology: compliance of the densities, no stress; Frame: beams without joints or bosses).
+
+- `nodes_fea.check_result`: Static Analysis of the body an optimizer shows, at its detail (Frame:
+  medium). Topology's note gets "safety factor X, max deflection Y mm", kept with the shape
+  (`_TOPO_RESULTS`, keyed by the material too, since strength is no longer in the topology key);
+  warnings below safety factor 1 and above 2% of the part's size in deflection. The key box: 0.165-
+  0.18 and 141-165 mm, warned. A load whose faces lost their material (see below) is a warning.
+- Frame Optimization (`nodes_frame._size_for_body`, FRAME_VERSION 3): after the beam sizing the body
+  is analysed at medium, and the bars within (their size + skin + 2 mm) of its most stressed spot are
+  made thicker by (safety / reached)^(1/3) x 1.02, rounded up to the size step, until the body
+  reaches the safety factor (6 rounds at most; stops when thicker bars stop helping). The state keeps
+  the beam sizes, the body settings checked (skin, joints, fillet) and the check, so previews show it
+  without analysing again; if skin, joints or fillet change, the preview analyses the body and asks
+  for Optimize, which sizes the bars again without a new layout. Bracket: 1.57 -> 1.91 -> 2.38 in 2
+  rounds (23 s instead of 10), 3.94 -> 5.38 g of bars, body 8.8 -> 11.0 g. At fine the same body
+  had 1.90 (the fillet peaks grow with detail); sizing at fine reached 2.07 but one fine analysis of
+  the sparse frame took 87 s on the CPU (its box did not fit the GPU next to the reserve), so it stays
+  at medium, as Static Analysis's default. The body's key now includes the bar sizes (it was keyed by
+  frame, profile, joints and fillet only).
+- Min thickness on the final shape, in three parts:
+  1. The optimizer: 40% of the key box's material was plates lying on a wall face under 3 mm, because
+     the density filter only averages over the design space (a plate on a face looked twice as thick
+     to the eroded design). The eroded design now uses `filter_empty` (the faces counted as empty, as
+     in the part); the design itself keeps the normalized filter, so the CAD faces are still
+     reproduced. Medium, shown body (A: faces empty, B: as before):
+
+     | case | stiffness A / B | surface under the min member A / B |
+     |---|---|---|
+     | wall bracket 25% | 27.0% / 26.4% | 3.5% / 11.4% |
+     | bolted bracket 20% | 25.6% / 25.2% | 17.5% / 17.0% (the 2 mm skins) |
+     | key box, four bosses, Min 3 | 38.8% / 39.8% | 6.7% / 11.6% (0.5% / 4.0% away from skins) |
+
+     The 30 x 10 x 10 mm test box suffers (R = 3 mm against a 10 mm box: its flanges lose a layer in the
+     eroded design): tests moved from the eroded compliance to the design's own.
+  2. Smoothing: see "Lumpy surfaces" below (the distance to the surface is blurred now).
+  3. `thicken`: what is still thin moves its surface out smoothly: half thickness = the deepest point
+     within a whole Min thickness (faces counted as empty), lack = Min/2 - that, blurred, added to the
+     values along their gradient, half a step a pass (a full step overshot: 2 mm became 4).
+  First tried and dropped (they made the part look bad, user: "not a very good looking part"): balls
+  on the middle of thin members and filling in from the faces, on the samples (steps of a sample,
+  knobs, ladders along the rim, ragged edges), then the same as smooth fields (rows of bubbles), and
+  rebuilding erased members from their middle line (beaded rails). The middle line needed opposite
+  nearest faces (> 120 degrees) or it took every corner (+36% material), a sample's distance runs half a
+  sample past the surface (t/2 + voxel/2, or 2.5 mm struts passed for 3 mm) and even members need both
+  middle layers.
+- Key box results (the user's settings: Min 3, Max 15, struts only, one boss held): no material added,
+  1.8% of the surface away from the skins under 3 mm before `thicken`, smooth surfaces; reported
+  stiffness 66% (76% before the faces counted as empty), the body 73%. Held at all four bosses the same
+  settings give a symmetric rim with four gussets: safety factor 4.75, 0.89 mm (one boss: 0.18, 197 mm).
+  Fine detail looked the same (struts must be 0.65 x 15 mm). Renders: plain shading of the Final
+  preview mesh (`scratchpad/render_topo.py`, matplotlib): thickness colours hid how rough it looked.
+
+### Lumpy surfaces (2026-10-22)
+
+"It still looks a bit lumpy." Close-ups at full resolution, flat against smooth shading: the
+corners were smooth (the mottling in the overall pictures was the render: half the triangles, drawn
+small), but where a band of material ends inside a wall its edge was wavy at the elements' scale
+(1-2 mm), with a few bumps on the rim.
+
+- The cause: Smoothing blurred the densities. A blur wide enough to iron out element-scale waves also
+  thinned members and took thin ones away, so thin members were held to a light blur, which is where
+  the waves stayed (on a thin-walled part, everywhere).
+- Now `density_mesh` blurs the signed distance to the densities' 0.5 surface (`_surface_distance`:
+  distance transforms, within a sample of the surface from the densities, so not stepped). Across a
+  member the distance runs straight, so the blur hardly moves the surface. Members under half the
+  blur's sigma still get only LIGHT_BLUR, blended up to the full blur at a sigma (a member goes once its
+  half thickness is under ~0.8 sigma; with the light blur up to twice the sigma, as first, the edges
+  stayed as wavy as at Smoothing 1). The surface is then shifted, within half an element, so the
+  material in the design space stays what the densities give (the bolted bracket lost 10% at
+  Smoothing 3 without it). `thicken` gets a field with slope 1, so its push is exact.
+- Bolted bracket, 3 mm gap, body stiffness: Smoothing 1 27.2%, 3 27.0% (blurring the densities: 25%
+  weaker at 2). Key box, four bosses, Min 3, plates and struts: 40.3 / 40.5 / 40.1% at 1 / 2 / 3, 1.1-1.4%
+  of the surface away from the skins under 3 mm. The band edges are straight from Smoothing 2: the
+  default is now 2.
+- Pieces under SPECK of the largest were dropped by size: an Avoid pocket's inner surface (a cavity,
+  negative volume) fell just under it and the pocket filled. Only pieces of positive volume can be
+  specks now.
+
+### Smoothness while optimizing, and Symmetry (2026-10-22)
+
+The user wanted the shape smoothed by the optimizer itself. The commercial tools (OptiStruct /
+Inspire, Ansys, SOLIDWORKS, Fusion) offer member size and symmetry during the optimization and
+smooth afterwards (volume-preserving) with a re-check; none has a user-facing perimeter penalty. Both
+are node inputs now, off by default (results and keys without them unchanged).
+
+- Smoothness: the optimizer minimizes compliance x outline^Smoothness (`Optimizer.outline`: sum of
+  |grad| of the projected design at every element corner, forward differences on a zero-padded grid,
+  so the whole surface counts; gradient through the projection and the filter, checked against finite
+  differences). Scale-free: relative changes of both are weighed, Smoothness 1 = 1% of surface is worth
+  1% of compliance. Where the penalty outweighs the stiffness the OC update gets `OUTLINE_FLOOR` of the
+  mean sensitivity, not 0: with 0 those densities only shrank and a cantilever ended at 9% instead of
+  30%.
+- The outline of the filtered densities (the first prototype, weighted by mean |dc| / mean |ds|)
+  looked good by its own measure (12% less) but did not shrink the real surface: key box, struts only,
+  261 -> 260 / 264 / 280 cm2 at 0.5 / 1 / 2. A thin member's filtered peak stays under 1, so its |grad|
+  is small: it rewards thin, grey members. Always measure the mesh (`shown.area`), not the proxy.
+- Key box, four bosses, Min 3, medium, Smoothing 2 (stiffness of the full design space, surface of the
+  shown body, safety factor):
+
+  | Smoothness | plates and struts | struts only, Max 15 |
+  |---|---|---|
+  | 0 | 38.8%, 309 cm2, >10 | 18.8%, 261 cm2, 5.5 |
+  | 0.25 | 38.6%, 293 cm2 | |
+  | 0.5 | 38.1%, 281 cm2 | 19.5%, 257 cm2, 6.5 |
+  | 1 | 36.2%, 266 cm2 | 21.2%, 247 cm2, 9.0 |
+  | 2 | | 20.0%, 243 cm2, 9.1 |
+
+  Webs end in cleaner edges, ridges along the sides go, and with struts only the gussets wrap round
+  the bosses instead of standing apart (a better optimum: stiffer and safer). Renders:
+  `scratchpad/smoothness_compare.png`, `smoothness_struts_compare.png` (session of 2026-10-22).
+- A 40 x 4 x 20 mm plate (only a little thicker than the 3 mm thinnest member, so its eroded design
+  carries almost nothing and the stiffness signal is weak) broke its top chord at 1 (10x the
+  compliance); at 0.5: 6 -> 3 openings, 5% less outline, same stiffness (the test).
+- Symmetry (x, y, z or combinations): planes through the design space's bounding-box middle. The grid
+  is laid symmetrically about each plane (n = ceil(L / h) elements centred on it, so the low faces are
+  no longer exactly on element faces), and dc, dv and dg are averaged with their mirror images where
+  both elements are free (`Problem.symmetric`): from the uniform start the free densities stay exact
+  mirror images (bit for bit; averaging x after the update instead would shift the volume). A note
+  gives each plane and warns when 5% or more of the design space or of the skin and Keep has no mirror
+  image. Four-boss key box, x and z, plates and struts: 38.7%, 310 cm2 (as without: it is nearly
+  symmetric anyway, now the four corners match); with Smoothness 0.5 38.0%, 282 cm2.
+- Brackets, medium (kept, stiffness, surface, safety factor):
+
+  | Smoothness | wall bracket, Keep 25% | bolted bracket, Keep 20%, Max thickness 4 |
+  |---|---|---|
+  | 0 | 25%, 27.0%, 97 cm2, 9.4 | 15.8%, 17.7%, 108 cm2, 7.0 |
+  | 0.5 | 25%, 27.2%, 88 cm2, >10 | 14.3%, 15.9%, 94 cm2, 5.2 |
+  | 1 | 25%, 26.8%, 85 cm2, >10 | 10.3%, 10.3%, 73 cm2, 4.9 |
+
+  The wall bracket's diagonal and top arm become one smooth web, in fewer iterations (114 -> 68).
+  Smoothness works against a tight Max thickness (it wants fewer, thicker members), so less of Keep %
+  fits (the note says so); stiffness per material kept stays about the same at 0.5.
+- Two faults the brackets showed, both fixed:
+  1. Loose pieces (bolted bracket, 10 at Smoothness 1): Max thickness had squeezed the volume under
+     Keep %, so `_update_two`'s volume multiplier sat at its lower bound 1e-9 and material was free;
+     elements carrying nothing (1e-7 of the mean sensitivity) then grew wherever no neighbourhood was
+     full, and pieces the penalty had cut off stayed and grew. A floor on the multiplier relative to the
+     unlimited one did nothing (that one was at the bound too, the move limit keeps Keep % out of reach);
+     `PRICE_FLOOR` = 1e-3 in the normalized units does: none, and without Smoothness the same result.
+     A floor of the mean sensitivity for penalty-dominated elements (first version of `OUTLINE_FLOOR`)
+     had the same effect from the other side: +73% surface, +28% thickening; now a share of their own.
+  2. Flakes on the wall bracket's pin eye (0.3-1.8 mm3, 0.5 mm thin, by the side faces): bits of the
+     smoothed surface that joined the part only outside the design space, so the crop cut them off.
+     `density_mesh` empties pieces under SPECK that stand alone inside it (phi >= 0.5) before meshing.
+     What is left are zero-volume slivers of the crop (also without Smoothness).
+- Min 1 / Max 2 mm on the bolted bracket (Keep 20%): members need 3 elements and Max 1.5 x the min
+  member, so they are raised (notes): draft 3.9 / 5.9, medium 2.13 / 3.19, fine 1.35 / 2.03 mm (the note
+  said "using 2 mm" for 2.03: three digits now). Medium: 14.0% kept, stiffness 14.3%, safety 6.0, 126 s,
+  a branchier version of Max 4. Fine (942k elements, 406 s): a bone-like web of many thin branches,
+  11.9% kept, stiffness 9.9%, safety 1.9, 0.31 mm, no loose pieces. A true 1 mm needs 0.33 mm elements
+  (~2.5M on this part), finer than the finest detail.
+
+### Soft guides: "prefer material here" (prototype, 2026-10-22)
+
+The user wants to nudge where the optimizer puts material and keep it organic (Keep forces an exact
+solid, Avoid an exact hole). Prototype (`scratchpad/prefer.py`, not in the engine): a ball with a 5 mm
+fade; the design's material in it is rewarded in the sensitivities (strength x the mean stiffness
+sensitivity, through projection and filter), the optimizer's shape is kept as it is (no union). Wall
+bracket, medium, ball r 5 mm in the middle of the open triangle (empty without it):
+
+| strength | stiffness | safety | ball filled | look |
+|---|---|---|---|---|
+| 0 | 27.0% | 9.4 | 2% | triangle open |
+| 0.5 | 27.2% | 9.3 | 99% | a web with holes across the triangle |
+| 1 | 26.4% | 9.0 | 100% | a hub with branches to the arm, the diagonal and the plate |
+| 2 | 25.1% | 8.5 | 100% | the hub bulges round the ball |
+
+Organic throughout: members grow to the region and merge the optimizer's way.
+
+Built in: Topology Optimization's Prefer (a body) and Prefer strength (default 0.5, -3..3; negative =
+keep away softly), the fade 2 x the thinnest member; nodes Ball, Bar (a capsule between two points) and
+Box (rounded edges), usable anywhere an implicit body is. The user: "It needs to be very easy to place
+the bodies in the view": the viewport draws them itself (live while dragged, the engine no longer meshes
+them for the view), Place on the card + a click on a shown body, the selected one's handles to drag.
+In the test editor: Place first put the ball half way along the view ray, which on a slanted view ran
+out through the bottom (z 6 where the click was ~21); now half way through the wall under the click
+along the surface's normal (21, 15, 13 on the 30 mm thick space: y = 15). The ball inside the opaque
+design space was hidden: guides are drawn a second time faintly through the bodies. Optimize with the
+ball in the open triangle (medium): a web grew to it, 27%, safety 9.3.
+
+### Coarse-to-fine: Start coarse (2026-10-22)
+
+The user asked for preliminary results early in one run. Prototype first (`scratchpad/progressive.py`):
+draft until the projection sharpness reaches 4, the design variables moved trilinearly to the medium grid
+(element centres), on until sharpness 8, then fine to the end; the sharpness, iteration count and history
+carry over, `full_compliance` is the new level's. Fine, GPU, editor stopped:
+
+| | first shape | done | kept | stiffness | safety |
+|---|---|---|---|---|---|
+| wall bracket, direct | ~30 s (fine setup) | 110 s | 25% | 28.3% | 9.2 |
+| wall bracket, coarse-to-fine | 9 s (draft done) | 58 s | 25% | 29.0% | >10 |
+| bolted bracket (Max 4), direct | ~30 s | 180 s | 17.4% | 21.2% | 8.8 |
+| bolted, from draft | 12 s | 120 s | 11.8% | 12.7% | |
+| bolted, from medium | ~12-20 s | 118 s | 16.7% | 20.2% | 7.6 |
+
+- The draft shape already has the final layout; the wall bracket's final is cleaner than the direct one
+  (no thin diagonal strut, 88 against 108 cm2).
+- Max thickness must hold at the first level: draft raised Max 4 to 5.9 mm, the draft design got a few
+  thick members, and when 4 mm applied at medium they were thinned rather than split (19.8 -> 11.6%
+  kept). Levels too coarse for the Max thickness are skipped (bolted: starts at medium).
+- Setting up the fine level (element fill, conditions, the full design space's solve) takes ~30 s
+  either way; the fine iterations drop from ~110 to 24-50.
+- In the node (input Start coarse, default yes; `T.levels`, `Optimizer.run(hand_over=)`, `handover` /
+  `take_over`, states carry `level`), Optimize as the editor runs it: wall bracket fine: first shape
+  2.8 s, 66 s optimizing (direct 110), 29%, safety >10; bolted bracket fine: starts at medium, first
+  shape 6.8 s, 139 s (direct 180), 20%, 7.6. Key box medium (draft -> medium): first shape 4.7 s, 52 s,
+  19%, 5.57: the same as without (medium iterations are as quick as draft's on the GPU), so Start coarse
+  applies to fine only and medium results keep their keys.
+- First bug: with no saved state the run started at the last level (a resume rule took "no level" for
+  the chosen detail); the node test stops on draft and continues there.
+- In the editor (test editor on 8766, wall bracket at fine): the card shows Start coarse; Optimize
+  showed a shape after ~4 s, the log "draft done at iteration 50 (10 s, stiffness 23%): moving on to
+  medium elements", "medium done at iteration 71 (19 s, 27%)", done in 66 s, 29%, safety >10. Cancel at
+  iteration 60 (on medium): card "stopped at iteration 60 on medium elements (Optimize continues)" with
+  the shape so far; Optimize continued at 60 and finished (95 iterations, 28%). No console or server
+  errors.
+- The 30 x 10 x 10 mm test box handed over from 2 mm to 1 mm elements ends 1.25 x the compliance of a
+  direct run: 5 elements across its 10 mm, the coarse layout is cruder. Parts 20+ elements across at
+  draft (the brackets, the key box) came out as stiff.
+
 ## Frame optimization F1 (2026-10-15)
 
 Plan: docs/FRAME_PLAN.md ("F1 as built" lists what differs from it). Engine only, no node yet.

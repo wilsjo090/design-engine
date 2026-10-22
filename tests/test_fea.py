@@ -212,10 +212,29 @@ def test_a_bearing_load_presses_only_on_the_contact_side():
     assert np.all(np.linalg.norm(t[pts[:, 2] > 40.01], axis=1) == 0)                # nothing on the top half
     bottom = np.argmin(pts[:, 2])
     assert t[bottom] @ [0, 0, -1] > 0.95 * np.linalg.norm(t, axis=1).max()        # most at the very bottom
-    marker_points, _ = markers(hole)
+    marker_points, _, sizes = markers(hole)
     assert len(marker_points) and np.all(marker_points[:, 2] <= 40.0 + 1e-6)
+    low = np.argmax(marker_points[:, 2])                                          # nearest the hole's middle:
+    assert sizes[low] < 0.5 < sizes.max() <= 1.0                                  # a short arrow
     with pytest.raises(ConditionError, match="needs a direction"):
         Condition("load", hole.triangles, load="bearing", amount=1.0, direction="into the face").traction(normals)
+
+
+def test_a_load_partly_off_the_part_keeps_its_total():
+    # a topology result often lacks the unloaded side of a pin hole: put back by area, the 200 N
+    # bearing load became 276 N there; by what each point carries it stays 200 N
+    from engine.graph.nodes import import_step
+    from pathlib import Path
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
+                       0.01, 1, 0.5)[0]
+    ids = mesh.face_attributes["cad_face"]
+    conds = Conditions((Condition("fixed", mesh.triangles[ids == 0]),
+                        Condition("load", mesh.triangles[ids == 6], load="bearing", amount=200.0, direction="-Z")))
+    lower = F.intersect(F.body_from_mesh(mesh, 2.0), F.Z - 40.0)   # nothing above the pin's axis
+    model = build_model(lower, conds, "draft")
+    assert np.allclose(model.force.reshape(-1, 3).sum(axis=0), [0, 0, -200], atol=2.0)
+    load_notes = [n for n in model.notes if n.startswith("load")]
+    assert not load_notes, load_notes                               # the half that is gone carried nothing
 
 
 def test_long_thin_triangles_get_points_by_area():
@@ -349,6 +368,20 @@ def test_kept_displacements_serve_another_density_strength_and_stiffness(beam, t
     assert other["mass"] == pytest.approx(first["mass"] * 7.8 / pla.density)
     softer = static_analysis(part, conds, Material("softer", pla.E, 0.25, 1.0, 50.0), h=2.0, store=store).report
     assert not softer["cached"]
+
+
+def test_the_safety_factor_colours_on_a_fixed_scale(beam):
+    # safe everywhere (steel, 1 N): the field is 10 everywhere, and on its own range (10..10) it was
+    # painted in the "bad" colour; a failing part's scale reaches down to its smallest safety factor
+    part = F.body_from_mesh(beam, 2.0)
+    conds = lambda amount: Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                                       Condition("load", _face_triangles(beam, 0, 100.0), amount=amount,
+                                                 direction="-Z")))
+    safe = static_analysis(part, conds(1.0), PRESETS["Steel S355"], h=2.0)
+    assert safe.report["min_safety"] > 10 and safe.fields["safety"].display_range == (1.0, 10.0)
+    failing = static_analysis(part, conds(2000.0), PRESETS["PLA"], h=2.0)
+    lo, hi = failing.fields["safety"].display_range
+    assert lo == pytest.approx(failing.report["min_safety"]) and lo < 1.0 and hi == 10.0
 
 
 def test_a_part_without_support_is_refused(beam):

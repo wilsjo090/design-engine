@@ -12,13 +12,22 @@ from ..cache import load_frame, save_frame
 from ..fea.model import ConditionError, Conditions
 from ..fields import _digest
 from ..frame import optimize as FO
+from ..frame import sizing as SZ
 from ..frame.geometry import JOINTS, frame_body, join_body, seamless
 from ..frame.profiles import KINDS, Profile
 from .core import GraphError, Port, node, report_message
 from .nodes import ARRAY_CACHE
-from .nodes_fea import SIM, _part, _validate
+from .nodes_fea import SIM, _part, _validate, check_result, safety_text
 
-FRAME_VERSION = 2     # bump when the method changes: saved frames are then ignored
+FRAME_VERSION = 3     # bump when the method changes: saved frames are then ignored
+# The beam model sees neither the joints' fillets nor the bosses at holes, where the body is most
+# stressed: the bracket's body reached safety factor 1.42-1.57 of 2. So the body is analysed (at
+# CHECK_DETAIL) and the bars at its most stressed spot made thicker, for up to CHECK_ROUNDS rounds.
+# Medium, as Static Analysis by default (3-4 s a round on the GPU). The peak at a fillet still grows
+# with the detail: sized at medium to 2.38, the bracket's body had 1.90 at fine, where its sparse grid
+# box no longer fitted the GPU and one analysis took 87 s on the CPU.
+CHECK_DETAIL = "medium"
+CHECK_ROUNDS = 6
 SUPPORTS = ("connect all", "only needed")
 MID_BAR = ("on", "off")
 
@@ -65,7 +74,9 @@ def _sizes(text):
             doc="0 = no limit; else the bars are grouped into at most this many sizes (a calmer look, a little "
                 "heavier)."),
        Port("safety", "number", 2.0, label="Safety factor",
-            doc="On the material's strength, for stress and for buckling of the bars in compression."),
+            doc="On the material's strength, for stress and for buckling of the bars in compression. The "
+                "body itself (joints, fillets, bosses) is then checked with Static Analysis at medium detail "
+                "and the bars at its most stressed spot made thicker until it reaches this too."),
        Port("joint_cost", "number", FO.JOINT_COST, label="Joint cost",
             doc="Each bar costs as if it were this share of the design space's diagonal longer: higher gives "
                 "fewer, longer bars (more hand made), 0 the lightest frame."),
@@ -139,6 +150,8 @@ def frame(space, material, conditions, min_size, sizes, size_step, max_sizes, sa
                   float(size_step), int(max_sizes), float(safety), float(joint_cost), float(spacing), supports,
                   prof, float(curving), mid_bar, tuple(_item_key(a) for a in attach))
     state = load_frame(key)
+    crop = seamless(body) if count > 1 else body    # several design spaces: their shared faces are inside
+    shape = {"skin": float(skin), "joints": joints, "fillet": float(fillet)}   # the body's own settings
     if compute and state is None:
         try:
             result = FO.optimize_frame(body, conditions, material, prof, listed, size_step, int(max_sizes),
@@ -147,14 +160,18 @@ def frame(space, material, conditions, min_size, sizes, size_step, max_sizes, sa
                                        mid_bar=mid_bar == MID_BAR[0], attach=attach, cache=ARRAY_CACHE)
         except ConditionError as err:
             raise GraphError(str(err)) from err
-        line = result.summary()
         for n in result.notes:
             report_message(f"note: {n}")
         r = result.report
-        report_message(f"Frame Optimization done in {r['seconds']:.0f} s: {line}")
+        report_message(f"Frame Optimization done in {r['seconds']:.0f} s: {result.summary()}")
         state = {"nodes": result.nodes, "bars": result.bars, "chains": result.chains, "sizes": result.sizes,
-                 "utilisation": result.utilisation, "axial": result.check.axial,
-                 "summary": np.array(line), "report": np.array(json.dumps(r))}
+                 "beam_sizes": result.sizes, "utilisation": result.utilisation, "axial": result.check.axial,
+                 "report": np.array(json.dumps(r))}
+    if compute and state is not None and json.loads(str(state.get("shape", "null"))) != shape:
+        # (also when only skin, joints or fillet changed: the bars are sized again for this body)
+        state = dict(state)
+        state.update(_size_for_body(crop, state, conditions, material, prof, shape, key, safety, min_size, listed,
+                                    size_step, int(max_sizes)))
         save_frame(key, **state)
     if state is None:
         same = F.Field(lambda ctx: ctx.eval(body), F._digest("not-optimized", body.key), body.name, body.bounds,
@@ -162,14 +179,96 @@ def frame(space, material, conditions, min_size, sizes, size_step, max_sizes, sa
         same.note = "not optimized for these settings yet: press Optimize"
         return {"body": same, "frame": NotOptimized()}
     chains, sizes_ = np.asarray(state["chains"]), np.asarray(state["sizes"])
-    crop = seamless(body) if count > 1 else body    # several design spaces: their shared faces are inside
-    out = frame_body(crop, state["nodes"], state["bars"], chains, sizes_, key, conditions, float(skin), prof, joints,
-                     float(fillet))
-    out.note = str(state["summary"])
+    out = frame_body(crop, state["nodes"], state["bars"], chains, sizes_, _digest(key, tuple(sizes_.tolist())),
+                     conditions, float(skin), prof, joints, float(fillet))
+    note = str(state["summary"])
+    if json.loads(str(state.get("shape", "null"))) == shape:   # checked as it is
+        check = json.loads(str(state["check"]))
+    else:   # skin, joints or fillet changed since: check this body (kept by Static Analysis)
+        r, text, warnings = check_result(out, conditions, material, CHECK_DETAIL)
+        check = {"text": text, "warnings": warnings, "safety": r["min_safety"] if r else None}
+        if r is not None and r["min_safety"] < safety:
+            check["warnings"] = check["warnings"] + [
+                f"the bars were sized for another skin, joints or fillet: press Optimize to size them for these "
+                f"(the body now reaches safety factor {safety_text(r['min_safety'])} of {safety:g})"]
+    if check["text"]:
+        note += f" · body ({CHECK_DETAIL} Static Analysis): {check['text']}"
+    for text in check["warnings"]:
+        report_message(text, "warning")
+    out.note = note
     ref = FO.FrameRef(np.asarray(state["nodes"]), np.asarray(state["bars"]), chains, sizes_, prof, body,
                       tuple(conditions), float(skin), key, np.asarray(state["utilisation"]), np.asarray(state["axial"]))
     out.frame_view = frame_view(ref)
     return {"body": out, "frame": ref}
+
+
+def _segment_distance(p, a, b):
+    """Distance from point p to each segment a[i]-b[i]."""
+    d = b - a
+    t = np.clip(np.einsum("ij,ij->i", p - a, d) / np.maximum(np.einsum("ij,ij->i", d, d), 1e-12), 0.0, 1.0)
+    return np.linalg.norm(a + t[:, None] * d - p, axis=1)
+
+
+def _size_for_body(crop, state, conditions, material, prof, shape, key, safety, min_size, listed, size_step,
+                   max_sizes):
+    """Bar sizes with which the frame's body (with `shape`: skin, joints, fillet) reaches the safety
+    factor in Static Analysis: the beam model's sizes, then round by round the bars at the body's most
+    stressed spot made thicker (bending stress goes as 1 / size^3). Returns the state's new entries:
+    sizes, summary, the body settings checked (shape) and the check."""
+    nodes, bars, chains = (np.asarray(state[k]) for k in ("nodes", "bars", "chains"))
+    beam = np.asarray(state["beam_sizes"], dtype=float)
+    sizes = beam.copy()
+    a, b = nodes[bars[:, 0]], nodes[bars[:, 1]]
+    lengths = np.bincount(chains, weights=np.linalg.norm(b - a, axis=1), minlength=len(sizes))
+    rounds, previous, stuck = 0, 0.0, None
+    while True:
+        body = frame_body(crop, nodes, bars, chains, sizes, _digest(key, tuple(sizes.tolist())), conditions,
+                          shape["skin"], prof, shape["joints"], shape["fillet"])
+        r, text, warnings = check_result(body, conditions, material, CHECK_DETAIL)
+        if r is None or r["min_safety"] >= safety or rounds == CHECK_ROUNDS:
+            break
+        if rounds and r["min_safety"] < 1.01 * previous:
+            stuck = "thicker bars there did not raise it"
+            break
+        previous = r["min_safety"]
+        hot = np.asarray(r["max_away_at"])
+        near_chain = np.full(len(sizes), np.inf)
+        np.minimum.at(near_chain, chains, _segment_distance(hot, a, b))
+        near = near_chain <= sizes + shape["skin"] + 2.0       # the bars meeting at that spot
+        if not near.any():
+            near = near_chain == near_chain.min()
+        grow = 1.02 * (safety / r["min_safety"]) ** (1 / 3)
+        before = sizes.copy()
+        try:
+            for c in np.flatnonzero(near):
+                sizes[c] = max(SZ.round_up(sizes[c] * grow, min_size, size_step, listed),
+                               SZ.next_size(sizes[c], size_step, listed))
+        except ConditionError as err:
+            sizes, stuck = before, str(err)
+            break
+        if max_sizes > 0:
+            sizes = SZ.group(sizes, lengths, prof, max_sizes)
+        changed = ", ".join(f"{before[c]:g} -> {sizes[c]:g}" for c in np.flatnonzero(sizes != before))
+        report_message(f"body check: safety factor {safety_text(r['min_safety'])} at ({hot[0]:.0f}, {hot[1]:.0f}, "
+                       f"{hot[2]:.0f}); bars there made thicker ({changed} mm)")
+        rounds += 1
+    if r is not None and r["min_safety"] < safety:
+        warnings = warnings + [f"the body reaches safety factor {safety_text(r['min_safety'])} of {safety:g} "
+                               f"({stuck or f'after {rounds} rounds of thicker bars'}); a larger Skin or Fillet, or "
+                               f"another layout, may help"]
+    rep = json.loads(str(state["report"]))
+    mass = sum(prof.section(s).A * L for s, L in zip(sizes, lengths)) * material.density / 1000.0
+    curved = f", {rep['curved']} curved" if rep.get("curved") else ""
+    summary = (f"{rep['bars']} bars ({rep['pieces']} pieces, {rep['joints']} joints{curved}), "
+               f"{len(np.unique(sizes))} sizes ({', '.join(f'{s:g}' for s in np.unique(sizes))} mm {prof.kind}), "
+               f"{mass:.3g} g of bars · beam model: max utilisation {rep['utilisation']:.2f}, max deflection "
+               f"{rep['deflection']:.3g} mm, buckling factor {rep['buckling']:.3g}")
+    if rounds:
+        report_message(f"body check: bars thickened in {rounds} {'round' if rounds == 1 else 'rounds'} for safety factor "
+                       f"{safety:g}: {summary}")
+    check = {"text": text, "warnings": warnings, "safety": r["min_safety"] if r is not None else None}
+    return {"sizes": sizes, "summary": np.array(summary), "shape": np.array(json.dumps(shape)),
+            "check": np.array(json.dumps(check))}
 
 
 def frame_view(ref):

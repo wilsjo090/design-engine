@@ -228,6 +228,21 @@ def test_equal_remap_values_are_an_error_not_nan():
         Evaluator(g, log=None).run(["flat"])
 
 
+def test_keep_going_leaves_out_only_what_needs_a_failed_node():
+    g = Graph()
+    g.add("x", "field.coordinate", axis="x")
+    g.add("flat", "math.remap", x=link("x.out"), from_low=1, from_high=1)   # fails
+    g.add("after", "math.multiply", a=link("flat.out"), b=2.0)             # needs it
+    g.add("other", "math.multiply", a=link("x.out"), b=2.0)                # does not
+    g.add("half_wired", "implicit.offset")                                  # a problem: body not connected
+    ev = Evaluator(g, log=None)
+    with pytest.raises(GraphError, match="no range to stretch"):
+        ev.run(["after", "other"])
+    results = ev.run(["after", "other", "half_wired"], keep_going=True)
+    assert set(results) == {"x", "other"}
+    assert [n for err in ev.failed for n, _ in err.problems] == ["half_wired", "flat"]
+
+
 def test_node_errors_name_the_node(tmp_path):
     g = wave_graph(tmp_path)
     g.set("mesh", "voxel", 0.0001)                  # absurd grid

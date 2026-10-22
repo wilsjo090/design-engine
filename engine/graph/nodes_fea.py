@@ -90,10 +90,11 @@ def _with(add_to, condition):
         raise GraphError("Add to takes supports and loads (from Fixed Faces or Load)")
     out = (add_to or Conditions()).add(condition)
     if len(condition.triangles):
-        pts, dirs = markers(condition)
+        pts, dirs, sizes = markers(condition)
         push = (np.einsum("ij,ij->i", dirs, _normals_at(condition, pts)) < 0).tolist()
         out.markers = {"kind": condition.kind, "label": condition.label,
-                       "points": np.round(pts, 4).tolist(), "dirs": np.round(dirs, 4).tolist(), "push": push}
+                       "points": np.round(pts, 4).tolist(), "dirs": np.round(dirs, 4).tolist(), "push": push,
+                       "sizes": np.round(sizes, 3).tolist()}
         if condition.kind == "load":  # for the big arrow: the faces' centre and the force (torque axis)
             arrow = condition.arrow()
             out.markers.update(load=condition.load, centre=np.round(condition.geometry[1], 4).tolist(),
@@ -294,13 +295,50 @@ def static_analysis(part, material, conditions, detail, show):
             "displacement": f["displacement"]}
 
 
+# --- checking an optimizer's result ------------------------------------------------------------
+# Deflections above this share of the part's size are too large for the linear (small-deformation)
+# analysis to be exact.
+LARGE_DEFLECTION = 0.02
+
+
+def safety_text(sf):
+    return f">{FA.SAFETY_CAP:g}" if sf >= FA.SAFETY_CAP else f"{sf:.3g}"
+
+
+def check_result(part, conditions, material, detail):
+    """Static Analysis of an optimizer's result, the body it shows: (report or None, note text,
+    warnings). The optimizers judge their designs with their own models (densities, beams), which
+    see neither the smoothed surface nor joints and bosses, and only relative stiffness."""
+    warnings = []
+    try:
+        r = FA.static_analysis(part, conditions, material, detail, xp=_array_module, cache=ARRAY_CACHE,
+                               store=ARRAY_CACHE.disk).report
+    except Cancelled:
+        raise
+    except (ConditionError, NotConverged, GraphError) as err:
+        return None, "", [f"the result could not be checked with Static Analysis: {err}"]
+    finally:
+        backend.release_gpu_memory()
+    lo, hi = part.bounds
+    size = float(np.max(np.asarray(hi) - np.asarray(lo)))
+    if r["min_safety"] < 1:
+        warnings.append(f"safety factor {safety_text(r['min_safety'])}: the part would yield or break under these "
+                        f"loads ({r['max_away']:.3g} MPa away from the supports, strength {r['strength']:g} MPa). "
+                        f"More material, a stronger material or more supports help.")
+    if r["max_displacement"] > LARGE_DEFLECTION * size:
+        warnings.append(f"max deflection {r['max_displacement']:.3g} mm on a {size:.0f} mm part: too large for this "
+                        f"(small-deformation) analysis to be exact")
+    text = f"safety factor {safety_text(r['min_safety'])}, max deflection {r['max_displacement']:.3g} mm"
+    return r, text, warnings
+
+
 # --- topology optimization ---------------------------------------------------------------------
 LIVE_EVERY = 3          # iterations between shapes shown in the 3D view while optimizing
 # An optimization is ~70 solves: the GPU pays off sooner than for one analysis (3D cantilever,
 # 47k elements: 0.3 s per iteration on the GPU, 1.0 s on the CPU)
 TOPOLOGY_GPU_MIN = 10_000
 CHECKPOINT_EVERY = 5    # iterations between saved states (Stop, a crash or a restart lose at most this)
-_TOPO_RESULTS = OrderedDict()  # (key, iteration, done) -> (body, density): building the body takes a while
+_TOPO_RESULTS = OrderedDict()  # (key, iteration, done, ...) -> (body, density, check): building them takes a while
 
 
 def _validate(material, conditions):
@@ -314,74 +352,118 @@ def _validate(material, conditions):
 
 
 def _optimize(key, body, volume, conditions, material, keep, min_thickness, skin, keep_body, avoid_body, detail,
-              state, max_thickness=0.0, members="plates and struts", gap=0.0):
-    """Run (or continue) the optimization, saving its state as it goes. Returns the final state."""
-    try:
-        problem = T.prepare(body, conditions, material, keep, min_thickness, skin, keep_body, avoid_body, detail,
-                            xp=lambda n: _array_module(n, TOPOLOGY_GPU_MIN), cache=ARRAY_CACHE, volume=volume,
-                            max_thickness=max_thickness, members=members, gap=gap)
-    except ConditionError as err:
-        raise GraphError(str(err)) from err
-    resume = state is not None and tuple(state["x"].shape) == tuple(problem.grid.shape)
-    opt = T.Optimizer(problem, state if resume else None)
-    device = "GPU" if problem.xp is not np else "CPU"
-    free = int(problem.xp.sum(problem.free))
-    report_message(f"Topology Optimization ({detail}, {problem.grid.describe()}, {free:,} design elements, "
-                   f"{device}): " + (f"continuing at iteration {opt.iteration}" if resume else "starting"))
-    for n in problem.notes:
-        report_message(f"note: {n}")
-    live = T.LiveSurface(backend.to_host(problem.phi), problem.grid.origin, problem.grid.h, problem.space)
+              state, max_thickness=0.0, members="plates and struts", gap=0.0, smoothness=0.0, symmetry="none",
+              coarse=False, prefer_body=None, prefer_strength=0.0):
+    """Run (or continue) the optimization, saving its state as it goes; with `coarse`, on the coarser
+    details first (`T.levels`), each handing its design over to the next. Returns the final state."""
+    levels = T.levels(body, detail, coarse, volume, min_thickness, max_thickness)
+    if state is None:
+        first = 0
+    else:   # where it stopped (a state without a level is on the chosen detail)
+        saved = str(state["level"]) if "level" in state else detail
+        first = levels.index(saved) if saved in levels else len(levels) - 1
+    if len(levels) > 1 and state is None:
+        report_message(f"Topology Optimization starts coarse: {', then '.join(levels)} elements (Start coarse)")
     t0 = time.perf_counter()
+    handover = None
+    for i in range(first, len(levels)):
+        level, last = levels[i], i == len(levels) - 1
+        try:
+            problem = T.prepare(body, conditions, material, keep, min_thickness, skin, keep_body, avoid_body, level,
+                                xp=lambda n: _array_module(n, TOPOLOGY_GPU_MIN), cache=ARRAY_CACHE, volume=volume,
+                                max_thickness=max_thickness, members=members, gap=gap, smoothness=smoothness,
+                                symmetry=symmetry, prefer_body=prefer_body, prefer_strength=prefer_strength)
+        except ConditionError as err:
+            raise GraphError(str(err)) from err
+        if handover is None:
+            resume = state is not None and tuple(state["x"].shape) == tuple(problem.grid.shape)
+            opt = T.Optimizer(problem, state if resume else None)
+            how = f"continuing at iteration {opt.iteration}" if resume else "starting"
+        else:
+            opt = T.Optimizer(problem).take_over(handover)
+            how = f"continuing at iteration {opt.iteration} on finer elements"
+        if len(levels) > 1:
+            opt.level = level
+        device = "GPU" if problem.xp is not np else "CPU"
+        free = int(problem.xp.sum(problem.free))
+        report_message(f"Topology Optimization ({level}{'' if last else f' on the way to {detail}'}, "
+                       f"{problem.grid.describe()}, {free:,} design elements, {device}): {how}")
+        if last:   # (a coarser level's notes are mostly about thicknesses its elements cannot hold)
+            for n in problem.notes:
+                report_message(f"note: {n}")
+        live = T.LiveSurface(backend.to_host(problem.phi), problem.grid.origin, problem.grid.h, problem.space)
 
-    def on_iteration(o, compliance, kept, change, seconds):
-        report_progress(o.iteration, T.MAX_ITERATIONS)  # also where Stop takes effect
-        if o.iteration % LIVE_EVERY == 0:
-            try:
-                report_view(live(o.density()))
-            except (ConditionError, ValueError):
-                pass  # no surface yet (all densities on one side of 0.5)
-        if o.iteration % CHECKPOINT_EVERY == 0:
-            save_topology(key, **o.state(stopped=True))
-        if o.iteration % 10 == 0:
-            local = (f", fullest neighbourhood {100 * o.local_max:.0f}% (max {100 * T.LOCAL_SHARE:.0f}%)"
-                     if o.local_max is not None else "")
-            report_message(f"iteration {o.iteration}: {100 * kept:.1f}% kept, stiffness "
-                           f"{100 * o.full_compliance / compliance:.0f}% of the full design space{local} "
-                           f"({seconds:.1f} s per iteration)")
+        def on_iteration(o, compliance, kept, change, seconds):
+            report_progress(o.iteration, T.MAX_ITERATIONS)  # also where Stop takes effect
+            if o.iteration % LIVE_EVERY == 0:
+                try:
+                    report_view(live(o.density()))
+                except (ConditionError, ValueError):
+                    pass  # no surface yet (all densities on one side of 0.5)
+            if o.iteration % CHECKPOINT_EVERY == 0:
+                save_topology(key, **o.state(stopped=True))
+            if o.iteration % 10 == 0:
+                local = (f", fullest neighbourhood {100 * o.local_max:.0f}% (max {100 * T.LOCAL_SHARE:.0f}%)"
+                         if o.local_max is not None else "")
+                report_message(f"iteration {o.iteration}: {100 * kept:.1f}% kept, stiffness "
+                               f"{100 * o.full_compliance / o.design_compliance():.0f}% of the full design space"
+                               f"{local} ({seconds:.1f} s per iteration)")
 
-    try:
-        opt.run(on_iteration, solver_callback=lambda it, r: check_cancel())
-    except (Cancelled, GraphError):  # Stop, or the memory watchdog: keep what is done
-        save_topology(key, **opt.state(stopped=True))
-        report_message(f"Topology Optimization stopped at iteration {opt.iteration}: the shape so far is "
-                       f"shown; Optimize continues from there")
-        raise
-    finally:
-        backend.release_gpu_memory()
+        try:
+            opt.run(on_iteration, solver_callback=lambda it, r: check_cancel(),
+                    hand_over=None if last else T.HAND_OVER[level])
+            if not last:
+                save_topology(key, **opt.state(stopped=True))   # (a Stop now continues on the next level)
+                report_message(f"{level} done at iteration {opt.iteration} ({time.perf_counter() - t0:.0f} s, "
+                               f"stiffness {100 * opt.full_compliance / opt.design_compliance():.0f}%): moving on "
+                               f"to {levels[i + 1]} elements")
+                handover = opt.handover()
+                del opt, problem, live
+        except (Cancelled, GraphError) as err:  # Stop, or the memory watchdog: keep what is done
+            if type(err) is Cancelled:  # (the stiffness for the card; not when memory is short)
+                opt.design_compliance()
+            save_topology(key, **opt.state(stopped=True))
+            on = "" if last else f" on {level} elements"
+            report_message(f"Topology Optimization stopped at iteration {opt.iteration}{on}: the shape so far is "
+                           f"shown; Optimize continues from there")
+            raise
+        finally:
+            backend.release_gpu_memory()
+    opt.design_compliance()
     final = opt.state()
     save_topology(key, **final)
     report_message(f"Topology Optimization done in {time.perf_counter() - t0:.0f} s: {opt.summary()}")
     if opt.history and opt.history[-1][1] < keep / 100 - 0.01:
         report_message(f"note: {100 * opt.history[-1][1]:.1f}% kept instead of {keep:g}%: no more material fits "
                        f"without a member thicker than Max thickness ({max_thickness:g} mm). A larger Max "
-                       f"thickness or a lower Keep % avoids this.")
+                       f"thickness or a lower Keep % avoids this."
+                       + (" Smoothness works against Max thickness (it wants fewer, thicker members): a lower "
+                          "Smoothness lets more fit." if smoothness else ""))
     return final
 
 
-def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None):
-    """(body, density field) of a saved state, kept for a few states."""
-    memo_key = (key, int(state["iteration"]), bool(state["done"]), smoothing)
+def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None, min_thickness=0.0, check=None):
+    """(body, density field, (note text, warnings) of its Static Analysis) of a saved state, kept for
+    a few states. Members are at least the min thickness (automatic: MIN_MEMBER elements) after the
+    smoothing, whatever it is. `check`: (conditions, material, detail) to analyse the body with."""
+    # (the material's strength is not in the topology key, but the safety factor needs it)
+    memo_key = (key, int(state["iteration"]), bool(state["done"]), str(state.get("level", "")), smoothing,
+                check[1].key if check else None)
     if memo_key in _TOPO_RESULTS:
         _TOPO_RESULTS.move_to_end(memo_key)
         return _TOPO_RESULTS[memo_key]
     g = state["grid"]
     origin, h = g[:3], float(g[3])
     density = state["density"]
+    thinnest = max(float(min_thickness), T.MIN_MEMBER * h)
     try:
         mesh = T.density_mesh(density, state["phi"], origin, h, blur=smoothing,
-                              space=state["space"] if "space" in state else None)  # (older states have none)
+                              space=state["space"] if "space" in state else None,  # (older states have none)
+                              min_thickness=thinnest)
     except ConditionError as err:
         raise GraphError(str(err)) from err
+    added = float(mesh.metadata.get("thickened", 0.0))
+    grown = f"members thickened to {thinnest:.2g} mm (+{100 * added:.0f}% material)" if added >= 0.005 else ""
     out = F.intersect(body, F.body_from_mesh(mesh, 2.0))
     if avoid_body is not None:  # exactly its faces (smoothing may round a little into it)
         out = F.subtract(out, avoid_body)
@@ -389,10 +471,12 @@ def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None)
         out = F.union(out, keep_body)
     centres = SimpleNamespace(origin=origin + h / 2, h=h)
     rho = FA.nodal_field(density, centres, f"{key}-{memo_key[1]}-rho", "density", "", (0.0, 1.0), body.bounds)
-    _TOPO_RESULTS[memo_key] = (out, rho)
+    text, warnings = check_result(out, *check)[1:] if check is not None else ("", [])
+    checked = (" · ".join(t for t in (grown, text) if t), warnings)
+    _TOPO_RESULTS[memo_key] = (out, rho, checked)
     while len(_TOPO_RESULTS) > 4:
         _TOPO_RESULTS.popitem(last=False)
-    return out, rho
+    return out, rho, checked
 
 
 @node("sim.topology", "Topology Optimization", SIM,
@@ -405,7 +489,9 @@ def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None)
        Port("keep", "number", 30.0, label="Keep %",
             doc="How much of the design space's mass to keep, %. Less = lighter but bendier."),
        Port("min_thickness", "number", 0.0, label="Min thickness",
-            doc="Thinnest member, mm (thicker members print better). 0 = automatic: 3 elements."),
+            doc="Thinnest member, mm (thicker members print better). 0 = automatic: 3 elements. It holds on "
+                "the final shape, after Smoothing: members that come out thinner are thickened (the note says "
+                "how much material that adds)."),
        Port("max_thickness", "number", 0.0, label="Max thickness",
             doc="Thickest member, mm; 0 = no limit. Thick parts then split into more, thinner members: a "
                 "branchier, more organic look (a little less stiff for its mass). Use a finer detail for "
@@ -416,8 +502,8 @@ def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None)
                 "at least 0.65 of it), so a big flat flange turns into a web of branches."),
        Port("skin", "number", 2.0,
             doc="Material kept solid at the fixed and loaded faces, mm, so bolt holes and contact faces stay "
-                "(0 = none). A bearing load only keeps the side the pin presses on; for a closed ring around "
-                "the hole, add it as a Keep body."),
+                "(0 = none; never thinner than a Min thickness you set). A bearing load only keeps the side "
+                "the pin presses on; for a closed ring around the hole, add it as a Keep body."),
        Port("gap", "number", 0.0, label="Gap to faces",
             doc="mm: keeps the shape this far inside the design space's faces, e.g. for clearance to what is "
                 "around it. Around the faces of supports and loads (and Keep) material still reaches the faces. "
@@ -425,20 +511,47 @@ def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None)
                 "outermost place is the stiffest for it); to break plates up use Max thickness with Members: "
                 "struts only, or model a rounded design space. 0 = off. Keep % stays a share of the whole "
                 "design space."),
+       Port("smoothness", "number", 0.0,
+            doc="While optimizing: weighs the part's surface area against its stiffness, so it makes fewer, "
+                "rounder members and cleaner webs (it minimizes compliance x surface^Smoothness). 0 = off, "
+                "0.5 = a good start, 1 = strong, at most 2. Key box: 0.5 = 9% less surface for 2% less "
+                "stiffness, 1 = 14% for 7%; with Members: struts only it even came out stiffer. It works against "
+                "a tight Max thickness (it wants fewer, thicker members): then less of Keep % fits. Too much on a "
+                "thin part can break a member: compare the stiffness in the note with Smoothness 0. Smoothing "
+                "(below) smooths the finished surface instead."),
+       Port("symmetry", "text", "none", choices=list(T.SYMMETRY),
+            doc="Mirror planes through the design space's middle: x = the two halves on either side of the "
+                "plane square to X are mirror images (y, z alike; several = symmetric across each). Use it "
+                "for a symmetric part whose supports and loads are symmetric too; the log says where the "
+                "planes are."),
        Port("keep_body", "implicit", optional=True, label="Keep",
             doc="Optional: a body that is always solid (a boss, a mounting tab)."),
        Port("avoid_body", "implicit", optional=True, label="Avoid",
             doc="Optional: a body that must stay empty (room for a screw head, a cable, another part)."),
+       Port("prefer_body", "implicit", optional=True, label="Prefer",
+            doc="Optional: a guide body (e.g. a Ball, a Bar along the path a member should take, or a body from "
+                "your STEP file). The optimizer prefers to put material there, softly: members grow to it and "
+                "merge as it shapes them, so it stays organic, not a copy of the guide."),
+       Port("prefer_strength", "number", 0.5, label="Prefer strength",
+            doc="How strongly to follow Prefer: 0.5 = a nudge (wall bracket: a ball filled at no stiffness cost), "
+                "1 = firm, 2 = very firm (it bulges round the guide, 7% less stiff). Negative = keep material "
+                "away from it, softly (unlike Avoid, which keeps it exactly empty)."),
        Port("detail", "text", "draft", choices=list(DETAIL),
             doc="How fine the optimization grid is: draft ~40,000 elements (about half a minute on the GPU), "
                 "medium ~250,000 (a few minutes), fine ~1 million. Start with draft. Finer = thinner members "
                 "possible and a smoother surface."),
+       Port("coarse_start", "text", "yes", choices=["yes", "no"], label="Start coarse",
+            doc="Fine detail: yes = the optimization starts on draft's and medium's bigger elements (a first shape "
+                "in the 3D view within seconds) and moves on to finer ones as the shape settles. Usually as good "
+                "and 25-40% faster (wall bracket: 66 s instead of 110). A level too coarse for the Max thickness "
+                "is skipped. no = every iteration on fine elements (the shape can come out a little different: "
+                "bolted bracket 5% stiffer). Draft and medium always run on their own elements (quick anyway)."),
        Port("smoothing", "number", T.SMOOTHING,
             doc="How much the optimized shape's surface is smoothed, in elements (the grid's cubes; their size "
-                "is in the log). 1 = true to the optimized shape (small steps can show on gently sloped faces). "
-                "Above 1 it gets rounder, but thin members get thinner and can vanish, leaving stubs: a slender "
-                "bracket came out 25% less stiff at 2. The mass stays the same. For a smoother surface that "
-                "keeps its strength use a finer Detail. Changing it does not optimize again."),
+                "is in the log). 1 = closest to the optimized shape (small steps and waves at the elements' "
+                "scale can show); 2 = smooth; 3 and up = smoother still. Members keep their thickness and the "
+                "part its mass (members never get thinner than Min thickness or vanish). Changing it does not "
+                "optimize again."),
        Port("compute", "int", 0, hidden=True), Port("stamp", "int", 0, hidden=True)],
       [Port("body", "implicit",
             doc="The optimized part, cropped to the design space (until you press Optimize: the design space). "
@@ -446,7 +559,8 @@ def _result(key, state, body, keep_body, smoothing=T.SMOOTHING, avoid_body=None)
        Port("density", S, doc="0..1: how much material the optimizer put at each point (e.g. Remap -> a lattice's "
                               "thickness).")])
 def topology(space, material, conditions, keep, min_thickness, skin, keep_body, avoid_body, detail, compute=0,
-             stamp=0, max_thickness=0.0, members="plates and struts", smoothing=T.SMOOTHING, gap=0.0):
+             stamp=0, max_thickness=0.0, members="plates and struts", smoothing=T.SMOOTHING, gap=0.0,
+             smoothness=0.0, symmetry="none", coarse_start="yes", prefer_body=None, prefer_strength=0.5):
     """The stiffest shape for a given mass: keeps Keep % of the design space where the loads need it.
     Press Optimize on the node (it takes a while; the shape grows in the 3D view, Stop keeps the
     shape so far). Previews show the last result for these settings."""
@@ -462,24 +576,44 @@ def topology(space, material, conditions, keep, min_thickness, skin, keep_body, 
         raise GraphError("the gap must be 0 or more")
     if members not in T.MEMBERS:
         raise GraphError(f"members must be one of: {', '.join(T.MEMBERS)}")
+    if not 0 <= smoothness <= 2:
+        raise GraphError("smoothness must be between 0 and 2")
+    if symmetry not in T.SYMMETRY:
+        raise GraphError(f"symmetry must be one of: {', '.join(T.SYMMETRY)}")
+    if coarse_start not in ("yes", "no"):
+        raise GraphError("start coarse must be yes or no")
+    coarse = coarse_start == "yes"
+    if not -3 <= prefer_strength <= 3:
+        raise GraphError("prefer strength must be between -3 and 3")
     key = T.topology_key(body, conditions, material, keep, min_thickness, skin, keep_body, avoid_body, detail,
-                         max_thickness=max_thickness, members=members, gap=gap)
+                         max_thickness=max_thickness, members=members, gap=gap, smoothness=smoothness,
+                         symmetry=symmetry, coarse=coarse, prefer_body=prefer_body, prefer_strength=prefer_strength)
     state = load_topology(key)
     if compute and not (state is not None and bool(state["done"])):
         state = _optimize(key, body, volume, conditions, material, keep, min_thickness, skin, keep_body,
-                          avoid_body, detail, state, max_thickness, members, gap)
+                          avoid_body, detail, state, max_thickness, members, gap, smoothness, symmetry, coarse,
+                          prefer_body, prefer_strength)
     if state is None:
         same = F.Field(lambda ctx: ctx.eval(body), F._digest("not-optimized", body.key), body.name, body.bounds,
                        children=(body,))
         same.note = "not optimized for these settings yet: press Optimize"
         return {"body": same, "density": F._lift(0.0)}
-    out, rho = _result(key, state, body, keep_body, float(smoothing), avoid_body)
+    out, rho, (checked, warnings) = _result(key, state, body, keep_body, float(smoothing), avoid_body, min_thickness,
+                                            check=(conditions, material, detail))
     history = np.asarray(state["history"]).reshape(-1, 4)
-    line = T.summary([tuple(r) for r in history], float(state["full_compliance"]), int(state["iteration"]))
+    line = T.summary([tuple(r) for r in history], float(state["full_compliance"]), int(state["iteration"]),
+                     float(state["compliance"]) if "compliance" in state else None)
     if len(history) and max_thickness > 0 and history[-1][1] < keep / 100 - 0.01:
-        line += f" (Keep {keep:g}%: the max thickness leaves room for no more)"
+        line += (f" (Keep {keep:g}%: the max thickness{' with Smoothness' if smoothness else ''} leaves room for "
+                 f"no more)")
+    if checked:
+        line += f" · {checked}"
+    for text in warnings:  # (again on every run: the analysis is kept with the shape)
+        report_message(text, "warning")
     if bool(state["done"]):
         out.note = line
     else:
-        out.note = f"stopped at iteration {int(state['iteration'])} (Optimize continues): {line}"
+        level = str(state["level"]) if "level" in state else detail
+        on = "" if level == detail else f" on {level} elements"
+        out.note = f"stopped at iteration {int(state['iteration'])}{on} (Optimize continues): {line}"
     return {"body": out, "density": rho}

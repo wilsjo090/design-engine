@@ -414,6 +414,57 @@ def smoothen(body, iterations, grid_size):
     return F.smoothen(body, int(iterations), float(grid_size))
 
 
+def _point(text, name):
+    from ..fea.model import ConditionError, parse_vector
+    try:
+        return parse_vector(text)
+    except ConditionError:
+        raise GraphError(f"{name} must be three numbers x, y, z in mm, like 10, 0, 25 (got '{text}')") from None
+
+
+def _size(value, name):
+    if not float(value) > 0:
+        raise GraphError(f"{name} must be more than 0 mm")
+    return float(value)
+
+
+_SHAPE_USE = (" Coordinates in mm, as in the CAD part (the 3D view's axes). Use it as Topology Optimization's "
+              "Prefer (a guide), Keep or Avoid body, or with the Booleans.")
+
+
+@node("implicit.ball", "Ball", "Implicit",
+      [Port("centre", "text", "0, 0, 0", doc="Where the middle is: x, y, z in mm."),
+       Port("radius", "number", 5.0, doc="mm.")],
+      [Port("out", "implicit", doc="The ball.")],
+      doc="A ball at a point." + _SHAPE_USE)
+def ball(centre, radius):
+    return F.ball(_point(centre, "centre"), _size(radius, "radius"))
+
+
+@node("implicit.bar", "Bar", "Implicit",
+      [Port("start", "text", "0, 0, 0", doc="One end: x, y, z in mm (the middle of its round end)."),
+       Port("end", "text", "20, 0, 0", doc="The other end: x, y, z in mm."),
+       Port("radius", "number", 3.0, doc="mm: half the bar's thickness.")],
+      [Port("out", "implicit", doc="The bar.")],
+      doc="A round bar between two points, with round ends: e.g. a guide along the path a member should "
+          "take." + _SHAPE_USE)
+def bar(start, end, radius):
+    return F.bar(_point(start, "start"), _point(end, "end"), _size(radius, "radius"))
+
+
+@node("implicit.box", "Box", "Implicit",
+      [Port("centre", "text", "0, 0, 0", doc="Where the middle is: x, y, z in mm."),
+       Port("size", "text", "20, 20, 20", doc="Size along x, y, z in mm."),
+       Port("rounding", "number", 0.0, doc="mm: the edges rounded by this much (0 = sharp).")],
+      [Port("out", "implicit", doc="The box.")],
+      doc="A box, its edges optionally rounded." + _SHAPE_USE)
+def box(centre, size, rounding):
+    dims = _point(size, "size")
+    if min(dims) <= 0:
+        raise GraphError("size must be more than 0 mm along x, y and z")
+    return F.box(_point(centre, "centre"), dims, float(rounding))
+
+
 # --- lattices ------------------------------------------------------------------------------
 _DOMAIN_DOC = ("Optional: a body whose box the lattice fills, so it can be previewed on its own. To put the "
                "lattice into a part, use Fill Body with Lattice.")
