@@ -9,6 +9,7 @@ import { isClip, useStore, type Clip } from '../store'
 import { GROUP_IN_ID, GROUP_OUT_ID } from '../graphConvert'
 import { EngineNodeComponent, GroupIONode } from './EngineNode'
 import { HelpPanel } from './HelpPanel'
+import { NODE_DRAG_TYPE, addFromLibrary } from './NodeLibrary'
 import { NodePalette, compatibleInput, compatibleOutput, type PaletteFilter } from './NodePalette'
 import { CATEGORY_COLORS, GROUP_PREFIX } from '../types'
 
@@ -115,6 +116,16 @@ export function NodeEditor({ paletteSignal }: { paletteSignal: number }) {
     return () => clearTimeout(t)
   }, [loadCount, rf])
 
+  // Pan to a node the 3D view points at (keeps the zoom).
+  const focus = useStore((s) => s.focus)
+  useEffect(() => {
+    if (!focus) return
+    const node = useStore.getState().nodes.find((n) => n.id === focus.id)
+    if (!node) return
+    const w = node.measured?.width ?? 260, h = node.measured?.height ?? 200
+    rf.setCenter(node.position.x + w / 2, node.position.y + h / 2, { zoom: rf.getZoom(), duration: 300 })
+  }, [focus, rf])
+
   // Copy / cut / paste / duplicate nodes. Native clipboard events, so text in input fields still
   // copies normally, and nodes can go between recipes and browser tabs.
   const mouseInside = useRef(false)
@@ -204,12 +215,13 @@ export function NodeEditor({ paletteSignal }: { paletteSignal: number }) {
     }
   }, [rf])
 
-  // Toolbar "+ Node": open the palette in the middle of the canvas.
+  // Toolbar "+ Node" (or the 3D view's menu): open the palette in the middle of the canvas.
+  const paletteRequest = useStore((s) => s.paletteRequest)
   useEffect(() => {
-    if (!paletteSignal || !container.current) return
+    if (!(paletteSignal || paletteRequest) || !container.current) return
     const r = container.current.getBoundingClientRect()
     setPalette({ x: r.left + r.width / 2 - 140, y: r.top + r.height / 3 })
-  }, [paletteSignal])
+  }, [paletteSignal, paletteRequest])
 
   const isValidConnection: IsValidConnection = useCallback((c) => {
     const s = useStore.getState()
@@ -271,6 +283,17 @@ export function NodeEditor({ paletteSignal }: { paletteSignal: number }) {
     <div className="editor" ref={container}
       onMouseMove={(e) => { mouse.current = { x: e.clientX, y: e.clientY }; mouseInside.current = true }}
       onMouseLeave={() => { mouseInside.current = false }}
+      onDragOver={(e) => {  // a tile of the node library: drop it where it should go
+        if (!e.dataTransfer.types.includes(NODE_DRAG_TYPE)) return
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'copy'
+      }}
+      onDrop={(e) => {
+        const payload = e.dataTransfer.getData(NODE_DRAG_TYPE)
+        if (!payload) return
+        e.preventDefault()
+        void addFromLibrary(payload, rf.screenToFlowPosition({ x: e.clientX, y: e.clientY }))
+      }}
       onKeyDown={(e) => {
         const target = e.target as HTMLElement
         if (e.key === 'Tab' && !['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName)) {

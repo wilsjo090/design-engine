@@ -17,7 +17,7 @@ from ..fea import analysis as FA
 from ..fea import topology as T
 from ..fea.materials import PRESETS, custom
 from ..fea.model import (DETAIL, DIRECTIONS, LOAD_KINDS, OFFSET_KINDS, Condition, ConditionError, Conditions,
-                         markers, parse_vector)
+                         marker_samples, parse_vector)
 from ..fea.solver import SLAB_BYTES_GPU, NotConverged
 from .core import (FREE_TIGHT, Cancelled, GraphError, Port, check_cancel, node, report_message, report_progress,
                    report_view)
@@ -66,13 +66,14 @@ def custom_material(stiffness, poisson, density, strength):
 
 
 # --- supports and loads ------------------------------------------------------------------------
-def _chosen_triangles(cad, faces):
-    """Corner positions (k, 3, 3) of the triangles of the chosen CAD faces on one body or a list."""
+def _chosen_faces(cad, faces):
+    """(corner positions (k, 3, 3), CAD face number (k,), body number (k,)) of the triangles of the
+    chosen CAD faces on one body or a list. The body numbers are those the face view reports."""
     unknown = re.findall(r"[A-Za-z_][\w-]*", str(faces or ""))
     if unknown:
         raise GraphError(f"no face selection named '{unknown[0]}' in this recipe")
-    out = []
-    for body in (list(cad) if isinstance(cad, list) else [cad]):
+    out, face_ids, body_ids = [], [], []
+    for k, body in enumerate(list(cad) if isinstance(cad, list) else [cad]):
         ids = facemask.cad_faces(body)
         if ids is None:
             raise GraphError("this body has no CAD faces: connect a body from Import STEP")
@@ -80,8 +81,20 @@ def _chosen_triangles(cad, faces):
         wrong = [f for f in chosen if f > ids.max()]
         if wrong:
             raise GraphError(f"face {wrong[0]} does not exist (the body has faces 0-{ids.max()})")
-        out.append(np.asarray(body.triangles)[np.isin(ids, chosen)])
-    return np.concatenate(out) if out else np.zeros((0, 3, 3))
+        on = np.isin(ids, chosen)
+        out.append(np.asarray(body.triangles)[on])
+        face_ids.append(ids[on].astype(np.int32))
+        body_ids.append(np.full(int(on.sum()), facemask.cad_body(body, k), dtype=np.int32))
+    if not out:
+        return np.zeros((0, 3, 3)), np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+    return np.concatenate(out), np.concatenate(face_ids), np.concatenate(body_ids)
+
+
+def _condition(kind, cad, faces, **settings):
+    """A support or load on the chosen faces of `cad`, remembering which CAD face and body each
+    triangle belongs to."""
+    triangles, face_ids, body_ids = _chosen_faces(cad, faces)
+    return Condition(kind, triangles, faces=face_ids, bodies=body_ids, **settings)
 
 
 def _with(add_to, condition):
@@ -90,17 +103,20 @@ def _with(add_to, condition):
         raise GraphError("Add to takes supports and loads (from Fixed Faces or Load)")
     out = (add_to or Conditions()).add(condition)
     if len(condition.triangles):
-        pts, dirs, sizes = markers(condition)
+        pts, dirs, sizes, tri = marker_samples(condition)
         push = (np.einsum("ij,ij->i", dirs, _normals_at(condition, pts)) < 0).tolist()
         out.markers = {"kind": condition.kind, "label": condition.label,
                        "points": np.round(pts, 4).tolist(), "dirs": np.round(dirs, 4).tolist(), "push": push,
                        "sizes": np.round(sizes, 3).tolist()}
+        if condition.faces is not None and condition.bodies is not None:   # the CAD face under each point
+            out.markers.update(faces=condition.faces[tri].tolist(), bodies=condition.bodies[tri].tolist())
         if condition.kind == "load":  # for the big arrow: the faces' centre and the force (torque axis)
             arrow = condition.arrow()
             out.markers.update(load=condition.load, centre=np.round(condition.geometry[1], 4).tolist(),
                                arrow=None if arrow is None else np.round(arrow, 4).tolist())
     else:
-        out.markers = {"kind": condition.kind, "label": condition.label, "points": [], "dirs": [], "push": []}
+        out.markers = {"kind": condition.kind, "label": condition.label, "points": [], "dirs": [], "push": [],
+                       "faces": [], "bodies": []}
     return out
 
 
@@ -132,7 +148,7 @@ def _faces_label(faces):
       preview=True)
 def fixed_faces(cad, faces, add_to):
     """Faces that are held still (bolted, glued, clamped): they do not move at all."""
-    return _with(add_to, Condition("fixed", _chosen_triangles(cad, faces), label=f"Fixed faces {_faces_label(faces)}"))
+    return _with(add_to, _condition("fixed", cad, faces, label=f"Fixed faces {_faces_label(faces)}"))
 
 
 @node("sim.load", "Load", SIM,
@@ -184,10 +200,10 @@ def load(cad, faces, kind, amount, direction, vector, add_to, offset="0, 0, 0"):
         if directed and direction == "custom" and np.linalg.norm(vec) == 0:
             raise ConditionError("the vector must not be 0, 0, 0")
         shift = parse_vector(offset or "0, 0, 0") if kind in OFFSET_KINDS else (0.0, 0.0, 0.0)
-        condition = Condition("load", _chosen_triangles(cad, faces), load=kind, amount=float(amount),
-                              direction=direction, vector=vec, offset=shift,
-                              label=f"{float(amount):g} {unit} {kind + ' ' if kind in ('bearing', 'torque') else ''}"
-                                    f"on {_faces_label(faces) or 'no faces'}")
+        condition = _condition("load", cad, faces, load=kind, amount=float(amount),
+                               direction=direction, vector=vec, offset=shift,
+                               label=f"{float(amount):g} {unit} {kind + ' ' if kind in ('bearing', 'torque') else ''}"
+                                     f"on {_faces_label(faces) or 'no faces'}")
         condition.check()  # the direction (a bearing load: that something faces it), now
     except ConditionError as err:
         raise GraphError(str(err)) from err
@@ -394,7 +410,7 @@ def _optimize(key, body, volume, conditions, material, keep, min_thickness, skin
         live = T.LiveSurface(backend.to_host(problem.phi), problem.grid.origin, problem.grid.h, problem.space)
 
         def on_iteration(o, compliance, kept, change, seconds):
-            report_progress(o.iteration, T.MAX_ITERATIONS)  # also where Stop takes effect
+            report_progress(o.iteration, T.MAX_ITERATIONS, "iteration")  # also where Stop takes effect
             if o.iteration % LIVE_EVERY == 0:
                 try:
                     report_view(live(o.density()))

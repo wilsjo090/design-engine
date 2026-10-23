@@ -58,7 +58,7 @@ def field_to_mesh(values, grid):
     mesh = trimesh.Trimesh(verts, faces, process=False)
     if mesh.volume < 0:
         mesh.invert()
-    mesh.metadata.update(nonfinite=nonfinite, clipped=clipped)
+    mesh.metadata.update(nonfinite=nonfinite, clipped=clipped, voxel=grid.voxel)
     return mesh
 
 

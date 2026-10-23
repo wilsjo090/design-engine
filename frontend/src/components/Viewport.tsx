@@ -4,10 +4,16 @@ import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber'
 import { GizmoHelper, GizmoViewport, Grid, Html, OrbitControls } from '@react-three/drei'
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh'
-import { api, fetchPaint, type CheckReport } from '../api'
+import { api, fetchPaint, loadFaceAt, loadFaceInfo, loadFaces, loadNodeAt, requestDetail, type CheckReport } from '../api'
 import { useStore, type Variant } from '../store'
-import type { Axis, ColorMap, FaceData, FrameView, Marker, Paint, Recipe, ViewMesh } from '../types'
-import { isLink, parseFaceKeys, resolveFaces } from '../types'
+import type { Axis, ColorMap, FaceData, FrameView, Marker, MenuEntry, Paint, Recipe, ViewMesh } from '../types'
+import { QUALITY_LABEL, isLink, parseFaceKeys, resolveFaces } from '../types'
+import {
+  barMenu, bodyMenu, faceHitOf, faceKey, faceMenu, importItem, markerMenu, pickingMenu, sliceMenu, type FaceHit, type MarkerHit,
+  type MenuContext,
+} from '../viewActions'
+import { QuickEdit } from './QuickEdit'
+import { ViewportMenu, ViewportToast } from './ViewportMenu'
 import {
   SliceObject, SlicePanel, fieldPaintRange, fmt, gradientCss, lut, normalise, sliceBox, type HoverValue,
 } from './SliceView'
@@ -15,7 +21,8 @@ import { GUIDE_TYPES, Guides, offsetStep, parseVec, vectorText } from './Guides'
 
 // CAD convention: Z is up.
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1)
-// Picking faces on bodies with a million triangles needs a search tree (built only for picking).
+// Picking faces on bodies with a million triangles needs a search tree (built for picking, and on
+// the first right-click on a body).
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree
 THREE.Mesh.prototype.raycast = acceleratedRaycast
@@ -24,12 +31,21 @@ const PICK_SELECTED = '#4ea3f5'
 const PICK_LEFT_OUT = '#e5534b'   // Face Mask "Apply to: all other faces": the picked faces stay plain
 const PICK_HOVER = '#ffd166'
 const CAP_COLOR = '#c8643f'   // inside of a part cut by the section plane
+const GIZMO_MARGIN = 64       // the axis gizmo's centre from the view's bottom-right corner, px
 
 const KIND_STYLE: Record<string, { color: string; opacity: number }> = {
   mesh: { color: '#c9ced6', opacity: 1 },
   implicit: { color: '#86d6c9', opacity: 1 },
   cad: { color: '#e2b64a', opacity: 0.35 },
   variant: { color: '#b4bfd6', opacity: 1 },
+}
+
+/** Builds the geometry's search tree for raycasts once. indirect: the default build re-sorts the
+ *  index buffer in place, so triangle numbers (and the CAD face of each) no longer matched: clicking a
+ *  side face selected scattered patches. (The option exists in three-mesh-bvh 0.7.8 but is missing
+ *  from its type definitions.) */
+function ensureBoundsTree(g: THREE.BufferGeometry) {
+  if (!g.boundsTree) g.computeBoundsTree({ indirect: true } as unknown as Parameters<THREE.BufferGeometry['computeBoundsTree']>[0])
 }
 
 const read = <T,>(key: string, fallback: T): T => {
@@ -75,10 +91,45 @@ export function thicknessRange(paint: Paint): [number, number] {
   return [0, finite[Math.floor(finite.length * 0.95)] || paint.max]
 }
 
-function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover, kind, node }: {
+/** A box a view is cut at, in world coordinates: 'outside' keeps what is outside it (a view whose
+ *  part on screen has a finer detail), 'inside' what is inside (that detail). Cut per pixel, so the
+ *  two meet exactly on the box's faces. */
+interface CutBox { lo: [number, number, number]; hi: [number, number, number]; keep: 'outside' | 'inside' }
+
+const NO_BOX = { lo: new THREE.Vector3(1e9, 1e9, 1e9), hi: new THREE.Vector3(-1e9, -1e9, -1e9) }
+
+/** Uniforms and shader patch for cutting a material at a box (see CutBox); the uniforms are shared, so
+ *  a new box needs no new shader. */
+function useBoxCut(box: CutBox | null | undefined) {
+  const keep = box?.keep ?? 'outside'
+  const uniforms = useMemo(() => ({ uBoxLo: { value: NO_BOX.lo.clone() }, uBoxHi: { value: NO_BOX.hi.clone() } }), [])
+  useEffect(() => {
+    uniforms.uBoxLo.value.copy(box ? new THREE.Vector3(...box.lo) : NO_BOX.lo)
+    uniforms.uBoxHi.value.copy(box ? new THREE.Vector3(...box.hi) : NO_BOX.hi)
+  }, [box, uniforms])
+  return useMemo(() => ({
+    onBeforeCompile: (shader: THREE.WebGLProgramParametersWithUniforms) => {
+      shader.uniforms.uBoxLo = uniforms.uBoxLo
+      shader.uniforms.uBoxHi = uniforms.uBoxHi
+      shader.vertexShader = 'varying vec3 vBoxWorld;\n' + shader.vertexShader.replace('#include <begin_vertex>',
+        '#include <begin_vertex>\nvBoxWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;')
+      shader.fragmentShader = 'uniform vec3 uBoxLo;\nuniform vec3 uBoxHi;\nvarying vec3 vBoxWorld;\n' +
+        shader.fragmentShader.replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\n' +
+          `if (${keep === 'inside' ? '!' : ''}(all(greaterThanEqual(vBoxWorld, uBoxLo)) && all(lessThanEqual(vBoxWorld, uBoxHi)))) discard;`)
+    },
+    customProgramCacheKey: () => `box-${keep}`,
+  }), [keep, uniforms])
+}
+
+function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover, kind, node, box, patch }: {
   view: ViewMesh; wireframe: boolean; ghost?: boolean; clip: THREE.Plane[]; paint?: Paint; cmap: ColorMap
   range: [number, number] | null; onHover?: (h: HoverValue | null) => void; kind?: string; node?: string
+  /** cut at this box (a detail in it, or this is the detail) */
+  box?: CutBox | null
+  /** a detail: not picked, placed on or right-clicked (its view is) */
+  patch?: boolean
 }) {
+  const cut = useBoxCut(box)
   const geometry = useMemo(() => {
     const g = new THREE.BufferGeometry()
     g.setAttribute('position', new THREE.BufferAttribute(view.positions, 3))
@@ -87,7 +138,7 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
     g.computeBoundingSphere()
     return g
   }, [view])
-  useEffect(() => () => geometry.dispose(), [geometry])
+  useEffect(() => () => { geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
   const colors = useMemo(() => paintColors(view, paint, cmap, range), [view, paint, cmap, range])
   useEffect(() => {
     if (colors) geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
@@ -96,7 +147,7 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
   const style = KIND_STYLE[kind ?? view.kind] ?? KIND_STYLE.mesh
   const opacity = ghost ? Math.min(style.opacity, 0.25) : style.opacity // see-through while picking faces
   const transparent = opacity < 1
-  const cut = clip.length > 0 && !transparent
+  const sectioned = clip.length > 0 && !transparent
   const hover = (e: ThreeEvent<PointerEvent>) => {
     if (!onHover || !colors || !paint || !e.face) return
     e.stopPropagation()
@@ -109,18 +160,19 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
   }
   return (
     <group>
-      <mesh geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost ? () => null : undefined}
-        userData={{ placeable: kind !== 'variant' }}  // a guide shape's Place clicks on it (Guides.tsx)
+      <mesh geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost || patch ? () => null : undefined}
+        // a guide shape's Place clicks on it (Guides.tsx); right-clicks open its node's menu
+        userData={patch ? {} : { placeable: kind !== 'variant', menu: node && !ghost ? { view: node } : undefined }}
         onPointerMove={colors ? hover : undefined} onPointerOut={colors && onHover ? () => onHover(null) : undefined}>
         <meshStandardMaterial key={colors ? 'painted' : 'plain'} color={colors ? '#ffffff' : style.color}
           vertexColors={!!colors} metalness={colors ? 0.05 : 0.3} roughness={colors ? 0.7 : 0.42}
           wireframe={wireframe} transparent={transparent} opacity={opacity} depthWrite={!transparent}
-          side={cut ? THREE.FrontSide : THREE.DoubleSide} clippingPlanes={clip} />
+          side={sectioned ? THREE.FrontSide : THREE.DoubleSide} clippingPlanes={clip} {...cut} />
       </mesh>
-      {cut && !wireframe && (
+      {sectioned && !wireframe && (
         // the inside seen through the cut: back faces in one flat colour read as a solid cut face
         <mesh geometry={geometry} raycast={() => null}>
-          <meshBasicMaterial color={CAP_COLOR} side={THREE.BackSide} clippingPlanes={clip} />
+          <meshBasicMaterial color={CAP_COLOR} side={THREE.BackSide} clippingPlanes={clip} {...cut} />
         </mesh>
       )}
     </group>
@@ -128,14 +180,14 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
 }
 
 /** The triangles passing `keep`, as their own small mesh (positions and smooth normals copied from
- *  the full body), or null if there are none. */
-function faceSubset(view: ViewMesh, normals: THREE.BufferAttribute, count: number, keep: (triangle: number) => boolean) {
+ *  the full body; flat normals without them), or null if there are none. */
+function faceSubset(view: ViewMesh, normals: THREE.BufferAttribute | null, count: number, keep: (triangle: number) => boolean) {
   let n = 0
   for (let t = 0; t < count; t++) if (keep(t)) n++
   if (!n) return null
   const pos = new Float32Array(n * 9)
   const nor = new Float32Array(n * 9)
-  const src = normals.array as Float32Array
+  const src = normals?.array as Float32Array | undefined
   let k = 0
   for (let t = 0; t < count; t++) {
     if (!keep(t)) continue
@@ -143,13 +195,14 @@ function faceSubset(view: ViewMesh, normals: THREE.BufferAttribute, count: numbe
       const v = view.indices[t * 3 + c] * 3
       for (let a = 0; a < 3; a++) {
         pos[k] = view.positions[v + a]
-        nor[k++] = src[v + a]
+        nor[k++] = src ? src[v + a] : 0
       }
     }
   }
   const g = new THREE.BufferGeometry()
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3))
+  if (src) g.setAttribute('normal', new THREE.BufferAttribute(nor, 3))
+  else g.computeVertexNormals()
   return g
 }
 
@@ -164,18 +217,78 @@ function Overlay({ geometry, color, order, clip }: { geometry: THREE.BufferGeome
   )
 }
 
-/** Face keys: on copies of one part a plain face number ("5": face 5 on every copy, like the
- *  petals), on different parts "body:face" ("2:5"). A plain number always means all bodies. */
-function faceKey(faces: FaceData, t: number) {
-  return faces.same ? String(faces.ids[t]) : `${faces.bodies[t]}:${faces.ids[t]}`
+// --- right-click menus ---------------------------------------------------------------------------
+/** What objects carry in `userData.menu`: a shown node's view (`picking`: the body faces are being
+ *  picked on), a support or load marker, a field slice's node, or a frame's bars. */
+interface MenuTag { view?: string; picking?: boolean; marker?: MarkerHit; slice?: string; bar?: { node: string; frame: number } }
+/** What a right-click hit: its tag, the point, and the triangle, texture position and instance there. */
+interface MenuHit { tag: MenuTag; point: [number, number, number]; triangle: number | null; uv: [number, number] | null; instance: number | null }
+/** The tagged object under a point of the canvas (`click`: none when something there takes clicks itself). */
+type Probe = (x: number, y: number, click?: boolean) => MenuHit | null
+
+/** The longest edge of triangle `t` of a view (the view's resolution there). */
+function longestEdge(view: ViewMesh, t: number) {
+  const p = (c: number) => new THREE.Vector3().fromArray(view.positions, view.indices[t * 3 + c] * 3)
+  const a = p(0), b = p(1), c = p(2)
+  return Math.max(a.distanceTo(b), b.distanceTo(c), c.distanceTo(a))
 }
+/** The face a menu is open for. */
+interface MenuFace { view: string; faces: FaceData; face: number; body: number }
+
+/** Lets the right-click handler (outside the canvas) raycast the scene: the nearest object tagged
+ *  `userData.menu` under a point, not cut away by the section plane. Raycasting ignores R3F's
+ *  pointer events, so a left-drag that turns the view never raycasts the bodies. */
+function MenuProbe({ probe, clip }: { probe: { current: Probe | null }; clip: THREE.Plane[] }) {
+  const camera = useThree((s) => s.camera)
+  const scene = useThree((s) => s.scene)
+  const gl = useThree((s) => s.gl)
+  useEffect(() => {
+    const raycaster = new THREE.Raycaster()
+    probe.current = (x, y, click = false) => {
+      const r = gl.domElement.getBoundingClientRect()
+      raycaster.setFromCamera(new THREE.Vector2(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1), camera)
+      if (click) {
+        // something that takes clicks itself (the load arrow's handles, a guide shape) keeps them
+        const own: THREE.Object3D[] = []
+        scene.traverse((o) => {
+          const h = (o as { __r3f?: { handlers?: Record<string, unknown> } }).__r3f?.handlers
+          if (h && (h.onClick || h.onPointerDown)) own.push(o)
+        })
+        if (own.length && raycaster.intersectObjects(own, false).length) return null
+      }
+      const targets: THREE.Object3D[] = []
+      scene.traverse((o) => { if (o.userData.menu) targets.push(o) })
+      // a body's first right-click builds its search tree (~0.3 s for a million triangles)
+      for (const o of targets) if ((o as THREE.Mesh).isMesh && o.userData.menu.view) ensureBoundsTree((o as THREE.Mesh).geometry)
+      const hits = raycaster.intersectObjects(targets, false).filter((h) => clip.every((p) => p.distanceToPoint(h.point) >= 0))
+      // markers are drawn over the part (supports and loads sit in holes): they win wherever they are
+      const hit = hits.find((h) => h.object.userData.menu.marker) ?? hits[0]
+      if (!hit) return null
+      return { tag: hit.object.userData.menu as MenuTag, point: hit.point.toArray() as [number, number, number],
+        triangle: hit.faceIndex ?? null, uv: hit.uv ? [hit.uv.x, hit.uv.y] : null, instance: hit.instanceId ?? null }
+    }
+    return () => { probe.current = null }
+  }, [camera, scene, gl, probe, clip])
+  return null
+}
+
+/** The face a menu is open for, highlighted on its body. */
+function MenuHighlight({ view, faces, face, body, clip }: {
+  view: ViewMesh; faces: FaceData; face: number; body: number; clip: THREE.Plane[]
+}) {
+  const geometry = useMemo(() => faceSubset(view, null, view.faces, (t) => faces.ids[t] === face && faces.bodies[t] === body),
+    [view, faces, face, body])
+  return <Overlay geometry={geometry} color={PICK_HOVER} order={4} clip={clip} />
+}
+
 const isChosen = (faces: FaceData, chosen: Set<string>, t: number) =>
   chosen.has(String(faces.ids[t])) || chosen.has(`${faces.bodies[t]}:${faces.ids[t]}`)
 
 /** A CAD body you can pick faces on: click toggles a face, Shift+click the face and every face
  *  smoothly joined to it, Ctrl+drag paints. */
-function PickableView({ view, faces, chosen, onPick, onPaint, wireframe, clip, chosenColor }: {
-  view: ViewMesh; faces: FaceData | null; chosen: Set<string>; wireframe: boolean; clip: THREE.Plane[]; chosenColor: string
+function PickableView({ node, view, faces, chosen, onPick, onPaint, wireframe, clip, chosenColor }: {
+  node: string; view: ViewMesh; faces: FaceData | null; chosen: Set<string>; wireframe: boolean; clip: THREE.Plane[]
+  chosenColor: string
   onPick: (triangle: number, withGroup: boolean) => void
   onPaint: (triangle: number, add: boolean) => void
 }) {
@@ -198,10 +311,7 @@ function PickableView({ view, faces, chosen, onPick, onPaint, wireframe, clip, c
     g.setIndex(new THREE.BufferAttribute(view.indices, 1))
     g.computeVertexNormals()
     g.computeBoundingSphere()
-    // indirect: the default build re-sorts the index buffer in place, so triangle numbers (and the
-    // CAD face of each) no longer matched: clicking a side face selected scattered patches.
-    // (the option exists in three-mesh-bvh 0.7.8 but is missing from its type definitions)
-    g.computeBoundsTree({ indirect: true } as unknown as Parameters<THREE.BufferGeometry['computeBoundsTree']>[0])
+    ensureBoundsTree(g)
     return g
   }, [view])
   useEffect(() => () => { geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
@@ -220,7 +330,7 @@ function PickableView({ view, faces, chosen, onPick, onPaint, wireframe, clip, c
     data && e.faceIndex !== undefined && e.faceIndex !== null ? e.faceIndex : null
   return (
     <group>
-      <mesh geometry={geometry}
+      <mesh geometry={geometry} userData={{ menu: { view: node, picking: true } }}
         onPointerDown={(e) => {
           const t = triangleAt(e)
           if (t === null || !(e.ctrlKey || e.metaKey) || e.button !== 0) return
@@ -268,26 +378,6 @@ function faceGroup(faces: FaceData, t: number, withGroup: boolean): string[] {
   return members
 }
 
-async function fetchFaces(node: string): Promise<FaceData | string> {
-  const res = await fetch(`/api/faces/${encodeURIComponent(node)}`)
-  if (!res.ok) {
-    try { return (await res.json()).detail ?? res.statusText } catch { return res.statusText }
-  }
-  const buf = new Uint32Array(await res.arrayBuffer())
-  const n = buf[0]
-  const ids = buf.subarray(1, 1 + n)
-  const bodies = buf.subarray(1 + n, 1 + 2 * n)
-  const same = buf[1 + 2 * n] === 1
-  const lists = buf[2 + 2 * n]
-  const groups: Uint32Array[] = []
-  let pos = 3 + 2 * n
-  for (let i = 0; i < lists; i++) {
-    groups.push(buf.subarray(pos + 1, pos + 1 + buf[pos]))
-    pos += 1 + buf[pos]
-  }
-  return { version: Number(res.headers.get('X-View-Version') ?? 0), ids, bodies, same, groups }
-}
-
 function unionBox(views: ViewMesh[]) {
   const box = new THREE.Box3()
   for (const v of views) {
@@ -331,6 +421,101 @@ function CameraFit({ views, extra, onBounds }: {
   return null
 }
 
+const DETAIL_DELAY = 600       // ms the view must rest (camera still, nothing running) before a detail is asked for
+const DETAIL_SAMPLES = 40000   // triangles per view looked at to find what is on screen
+const PX_PER_VOXEL = 1.25      // a detail's voxel spans about this many screen pixels where it is nearest
+const DETAIL_GAIN = 1.5        // ...and is at least this much finer than the view's, or it is not worth it
+
+/** The part of each shown body on screen and how fine it needs to be there: its front-facing triangles
+ *  inside the view, a box around them and the voxel that spans PX_PER_VOXEL pixels at the nearest
+ *  fifth of them. Null when the body is too small on screen to need more than its view. */
+function onScreen(view: ViewMesh, camera: THREE.PerspectiveCamera, height: number) {
+  const step = Math.max(1, Math.ceil(view.faces / DETAIL_SAMPLES))
+  const P = view.positions, I = view.indices
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), n = new THREE.Vector3()
+  const centre = new THREE.Vector3(), seen = new THREE.Vector3(), eye = camera.position
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity]
+  const depths: number[] = []
+  const toView = camera.matrixWorldInverse
+  for (let t = 0; t < view.faces; t += step) {
+    a.fromArray(P, I[t * 3] * 3); b.fromArray(P, I[t * 3 + 1] * 3); c.fromArray(P, I[t * 3 + 2] * 3)
+    centre.copy(a).add(b).add(c).divideScalar(3)
+    n.subVectors(b, a).cross(c.sub(a))
+    if (n.dot(seen.subVectors(centre, eye)) >= 0) continue  // facing away
+    seen.copy(centre).applyMatrix4(toView)
+    const depth = -seen.z
+    if (depth <= camera.near) continue
+    seen.applyMatrix4(camera.projectionMatrix)
+    if (Math.abs(seen.x) > 1 || Math.abs(seen.y) > 1) continue
+    depths.push(depth)
+    for (let k = 0; k < 3; k++) {
+      const v = centre.getComponent(k)
+      if (v < lo[k]) lo[k] = v
+      if (v > hi[k]) hi[k] = v
+    }
+  }
+  if (depths.length < 30) return null
+  depths.sort((x, y) => x - y)
+  const pixel = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / height  // mm per pixel at depth 1
+  const voxel = Math.max(PX_PER_VOXEL * pixel * depths[Math.floor(depths.length * 0.2)], view.floor ?? Infinity)
+  // a margin of a few of the view's voxels: what lies between the samples, and the box's own edge
+  const pad = 3 * (view.voxel ?? voxel)
+  return { lo: lo.map((v) => v - pad) as [number, number, number], hi: hi.map((v) => v + pad) as [number, number, number], voxel }
+}
+
+/** "0.05 mm" with two significant digits */
+export const fmtVoxel = (v: number) => `${Number(v.toPrecision(2))} mm`
+
+const inside = (lo: number[], hi: number[], outerLo: number[], outerHi: number[]) =>
+  lo.every((v, k) => v >= outerLo[k]) && hi.every((v, k) => v <= outerHi[k])
+
+/** Refine (zoomed in): when the view has rested for a moment and nothing runs, asks the engine for the
+ *  part of the shown body on screen meshed finer than its view, one body at a time, the one that gains
+ *  most first. Bodies coloured by a field or result, CAD bodies and picking get none. */
+function DetailProbe() {
+  const camera = useThree((s) => s.camera) as THREE.PerspectiveCamera
+  const height = useThree((s) => s.size.height)
+  const controls = useThree((s) => s.controls) as unknown as OrbitControlsImpl | null
+  const asked = useRef<Record<string, { key: string; lo: number[]; hi: number[]; voxel: number }>>({})
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const check = async () => {
+      const s = useStore.getState()
+      const run = s.run
+      const busy = !s.refine || !s.connected || s.picking || s.placing || s.editing || s.requested ||
+        (run && (run.running || run.next || (run.tag && run.tag.version !== s.graphVersion)))
+      if (busy) return
+      camera.updateMatrixWorld()
+      let best: { id: string; view: ViewMesh; lo: number[]; hi: number[]; voxel: number; gain: number } | null = null
+      for (const id of s.visible) {
+        const view = s.views[id]
+        if (!view?.key || view.exact || !view.voxel || !view.floor || s.paints[id]) continue
+        const want = onScreen(view, camera, height)
+        if (!want || want.voxel * DETAIL_GAIN > view.voxel) continue
+        // already shown that fine there, or asked for (the engine may have had to make it coarser)
+        const d = s.details[id]
+        if (d && d.key === view.key && d.voxel <= want.voxel * 1.3 && inside(want.lo, want.hi, d.lo, d.hi)) continue
+        const a = asked.current[id]
+        if (a && a.key === view.key && a.voxel <= want.voxel * 1.3 && inside(want.lo, want.hi, a.lo, a.hi)) continue
+        const gain = view.voxel / want.voxel
+        if (!best || gain > best.gain) best = { id, view, ...want, gain }
+      }
+      if (!best) return
+      asked.current[best.id] = { key: best.view.key!, lo: best.lo, hi: best.hi, voxel: best.voxel }
+      if (!(await requestDetail(best.id, best.view, best.lo, best.hi, best.voxel))) delete asked.current[best.id]
+    }
+    const schedule = () => { clearTimeout(timer); timer = setTimeout(check, DETAIL_DELAY) }
+    controls?.addEventListener('change', schedule)
+    const unsubscribe = useStore.subscribe((s, prev) => {
+      if (s.run !== prev.run || s.views !== prev.views || s.details !== prev.details || s.refine !== prev.refine ||
+          s.paints !== prev.paints || s.picking !== prev.picking) schedule()
+    })
+    schedule()
+    return () => { clearTimeout(timer); controls?.removeEventListener('change', schedule); unsubscribe() }
+  }, [camera, controls, height])
+  return null
+}
+
 function ClippingOn() {
   const gl = useThree((s) => s.gl)
   useEffect(() => { gl.localClippingEnabled = true }, [gl])
@@ -367,11 +552,12 @@ function SectionPanel({ section, setSection, lo, hi }: {
 }
 
 // --- print check ----------------------------------------------------------------------------
-function CheckPanel({ candidates, onClose }: { candidates: string[]; onClose: () => void }) {
+function CheckPanel({ candidates, initial, onClose }: { candidates: string[]; initial?: string; onClose: () => void }) {
   const quality = useStore((s) => s.quality)
   const views = useStore((s) => s.views)
   const paints = useStore((s) => s.paints)
-  const [node, setNode] = useState(candidates[0] ?? '')
+  const [node, setNode] = useState(initial ?? candidates[0] ?? '')
+  useEffect(() => { if (initial) setNode(initial) }, [initial])  // a body's menu chose it
   const [density, setDensity] = useState(() => read('check.density', 1.24))
   const [minWall, setMinWall] = useState(() => read('check.minWall', 0.8))
   const [busy, setBusy] = useState(false)
@@ -531,26 +717,39 @@ function spreadOut(points: [number, number, number][], gap: number) {
   return kept
 }
 
+const HIT_GEOMETRY = new THREE.SphereGeometry(1, 8, 6)
+const HIT_MATERIAL = new THREE.MeshBasicMaterial({ visible: false })  // not drawn, but raycast
+
 /** Arrows for the loads (tip on the face when pushing, tail when pulling; shorter where the load
  *  presses less, as on a bearing load's sides) and small cones pointing into the held faces, sized
- *  to the scene. */
+ *  to the scene. Each drawn point has an invisible ball around it for right-clicks (the arrows' thin
+ *  lines are hard to hit), tagged with its node, marker and point. */
 function MarkerArrows({ markers, size }: { markers: Record<string, Marker[]>; size: number }) {
   const group = useMemo(() => {
     const g = new THREE.Group()
+    const hits: THREE.Mesh[] = []
     const len = size * 0.06
-    for (const list of Object.values(markers)) {
-      for (const m of list) {
+    for (const [node, list] of Object.entries(markers)) {
+      for (const [index, m] of list.entries()) {
         for (const i of spreadOut(m.points, len * 0.4)) {
           const dir = new THREE.Vector3(...m.dirs[i]).normalize()
           const at = new THREE.Vector3(...m.points[i])
+          let start: THREE.Vector3, l: number
           if (m.kind === 'fixed') {
-            const h = len * 0.4
-            g.add(new THREE.ArrowHelper(dir, at.clone().addScaledVector(dir, -h), h, FIXED_COLOR, h, h * 0.6))
+            l = len * 0.4
+            start = at.clone().addScaledVector(dir, -l)
+            g.add(new THREE.ArrowHelper(dir, start, l, FIXED_COLOR, l, l * 0.6))
           } else {
-            const l = len * (0.25 + 0.75 * (m.sizes?.[i] ?? 1))
-            const start = m.push[i] ? at.clone().addScaledVector(dir, -l) : at
+            l = len * (0.25 + 0.75 * (m.sizes?.[i] ?? 1))
+            start = m.push[i] ? at.clone().addScaledVector(dir, -l) : at
             g.add(new THREE.ArrowHelper(dir, start, l, LOAD_COLOR, l * 0.3, l * 0.16))
           }
+          // the ball covers the arrow (half the gap between points, at least)
+          const hit = new THREE.Mesh(HIT_GEOMETRY, HIT_MATERIAL)
+          hit.position.copy(start).addScaledVector(dir, l / 2)
+          hit.scale.setScalar(Math.max(l / 2, len * 0.2))
+          hit.userData.menu = { marker: { node, index, point: i } }
+          hits.push(hit)
         }
       }
     }
@@ -563,9 +762,10 @@ function MarkerArrows({ markers, size }: { markers: Record<string, Marker[]>; si
       mat.opacity = 0.9
       o.renderOrder = 10
     })
+    if (hits.length) g.add(...hits)
     return g
   }, [markers, size])
-  useEffect(() => () => group.children.forEach((c) => (c as THREE.ArrowHelper).dispose()), [group])
+  useEffect(() => () => group.children.forEach((c) => { if (c instanceof THREE.ArrowHelper) c.dispose() }), [group])
   return <primitive object={group} />
 }
 
@@ -803,8 +1003,11 @@ function sizeColours(sizes: number[]) {
 interface BarHover { node: string; bar: number; size: number; length: number; force: number; utilisation: number; profile: string }
 
 /** A frame's bars as tubes at their size (drawn round whatever the profile), with a ball at each
- *  node; hovering one reports its bar. Much cheaper than meshing the frame's body. */
-function FrameBars({ id, frame, onHover }: { id: string; frame: FrameView; onHover: (h: BarHover | null) => void }) {
+ *  node; hovering one reports its bar, right-clicking one opens its menu (frame `index` of node
+ *  `id`). Much cheaper than meshing the frame's body. */
+function FrameBars({ id, index, frame, onHover }: {
+  id: string; index: number; frame: FrameView; onHover: (h: BarHover | null) => void
+}) {
   const group = useMemo(() => {
     const colours = sizeColours(frame.sizes)
     const up = new THREE.Vector3(0, 1, 0)
@@ -832,10 +1035,11 @@ function FrameBars({ id, frame, onHover }: { id: string; frame: FrameView; onHov
       balls.setMatrixAt(i, m)
     })
     balls.raycast = () => null
+    tubes.userData.menu = { bar: { node: id, frame: index } }
     const g = new THREE.Group()
     g.add(tubes, balls)
     return { g, tubes, balls }
-  }, [frame])
+  }, [frame, id, index])
   useEffect(() => () => {
     for (const o of [group.tubes, group.balls]) {
       o.geometry.dispose()
@@ -857,7 +1061,7 @@ function FrameBars({ id, frame, onHover }: { id: string; frame: FrameView; onHov
 }
 
 /** The sizes of the shown frames with their colours, and the bar under the mouse. */
-function FramePanel({ frames, hover }: { frames: [string, FrameView][]; hover: BarHover | null }) {
+function FramePanel({ frames, hover }: { frames: [string, FrameView, number][]; hover: BarHover | null }) {
   return (
     <div className="tool-panel">
       {frames.map(([id, f]) => {
@@ -938,8 +1142,19 @@ export function Viewport() {
   const [hover, setHover] = useState<HoverValue | null>(null)
   const [section, setSectionState] = useState<Section>(() => ({ ...read('section', { on: false, axis: 'z', flip: false, position: null }), on: false }))
   const setSection = (s: Section) => { setSectionState(s); write('section', { ...s, position: null }) }
-  const [checking, setChecking] = useState(false)
+  /** the print check is open (with this node chosen, when a body's menu opened it) */
+  const [checking, setChecking] = useState<boolean | string>(false)
   const views = useMemo(() => visible.filter((id) => viewsMap[id]).map((id) => viewsMap[id]), [visible, viewsMap])
+  // finer parts of views (Refine, zoomed in): shown while their view shows the same, uncoloured and coarser
+  const details = useStore((s) => s.details)
+  const pickingNow = useStore((s) => !!s.picking)
+  const shownDetails = useMemo(() => Object.fromEntries(visible.flatMap((id) => {
+    const d = details[id], v = viewsMap[id]
+    return d && v && !pickingNow && !paints[id] && d.key === v.key && d.voxel < (v.voxel ?? Infinity) ? [[id, d]] : []
+  })), [visible, details, viewsMap, paints, pickingNow])
+  const detailCuts = useMemo(() => Object.fromEntries(Object.entries(shownDetails).map(([id, d]) =>
+    [id, { outside: { lo: d.lo, hi: d.hi, keep: 'outside' } as CutBox, inside: { lo: d.lo, hi: d.hi, keep: 'inside' } as CutBox }])),
+  [shownDetails])
   const sliceBoxes = useMemo(() => Object.values(slices).map(sliceBox), [slices])
   const fieldRange = useMemo(() => fieldPaintRange(paints), [paints])
   const ownRanges = useMemo(() => Object.fromEntries(Object.entries(paints)
@@ -950,7 +1165,8 @@ export function Viewport() {
   const anyMarkers = Object.values(markers).some((list) => list.some((m) => m.points.length))
   const results = visible.filter((id) => paints[id]?.source === 'result')
   const frameMap = useStore((s) => s.frames)
-  const frames = useMemo(() => Object.entries(frameMap).flatMap(([id, list]) => list.map((f) => [id, f] as [string, FrameView])),
+  const frames = useMemo(() => Object.entries(frameMap)
+    .flatMap(([id, list]) => list.map((f, k) => [id, f, k] as [string, FrameView, number])),
     [frameMap])
   const [showFrames, setShowFramesState] = useState(() => read('frames.shown', true))
   const setShowFrames = (on: boolean) => { setShowFramesState(on); write('frames.shown', on) }
@@ -1009,25 +1225,26 @@ export function Viewport() {
   const pickNodeExists = useStore((s) => !s.picking || s.nodes.some((n) => n.id === s.picking!.node))
   const chosen = useMemo(() => new Set(parseFaceKeys(resolveFaces(facesValue, selections))), [facesValue, selections])
   const pickView = picking ? viewsMap[picking.source] : undefined
-  const [faceData, setFaceData] = useState<FaceData | null>(null)
+  const faceData = useStore((s) => {
+    const data = s.picking ? s.faceData[s.picking.source] : undefined
+    return data && data.version === s.views[s.picking!.source]?.version ? data : null
+  })
   const [faceError, setFaceError] = useState<string | null>(null)
 
   useEffect(() => { if (!pickNodeExists) setPicking(null) }, [pickNodeExists, setPicking])
   useEffect(() => {
-    setFaceData(null)
     setFaceError(null)
     if (!picking || !pickView) return
     let alive = true
-    fetchFaces(picking.source).then((r) => {
-      if (!alive) return
-      if (typeof r === 'string') setFaceError(r)
-      else setFaceData(r)
-    }).catch((err) => alive && setFaceError(String(err)))
+    loadFaces(picking.source).then((r) => { if (alive && typeof r === 'string') setFaceError(r) })
+      .catch((err) => alive && setFaceError(String(err)))
     return () => { alive = false }
   }, [picking, pickView])
+  const menuOpen = useRef(false)
   useEffect(() => {
     if (!picking) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPicking(null) }
+    // Esc closes an open right-click menu first
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !menuOpen.current) setPicking(null) }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [picking, setPicking])
@@ -1044,11 +1261,11 @@ export function Viewport() {
     if (useStore.getState().selections[raw] !== undefined) saveSelection(raw, text)
     else setInput(picking.node, 'faces', text)
   }
-  const onPick = (t: number, withGroup: boolean) => {
-    if (!faceData) return
+  const onPick = (t: number, withGroup: boolean) => { if (faceData) onPickWith(faceData, t, withGroup) }
+  const onPickWith = (data: FaceData, t: number, withGroup: boolean) => {
     const next = currentKeys()
-    const members = faceGroup(faceData, t, withGroup)
-    const remove = isChosen(faceData, next, t)
+    const members = faceGroup(data, t, withGroup)
+    const remove = isChosen(data, next, t)
     for (const key of members) {
       if (remove) { next.delete(key); next.delete(key.split(':').pop()!) } else next.add(key)
     }
@@ -1107,9 +1324,151 @@ export function Viewport() {
   const extraBoxes = useMemo(() => [...sliceBoxes, ...variantBoxes], [sliceBoxes, variantBoxes])
   const checkCandidates = visible.filter((id) => viewsMap[id] && viewsMap[id].kind !== 'cad')
 
+  // --- right-click menus ---
+  const [menu, setMenu] = useState<{ x: number; y: number; entries: MenuEntry[]; highlight?: MenuFace } | null>(null)
+  menuOpen.current = menu !== null
+  const probe = useRef<Probe | null>(null)
+  const leftDown = useRef<{ x: number; y: number; menu: boolean } | null>(null)
+  const quickEdit = useStore((s) => s.quickEdit)
+  const setQuickEdit = useStore((s) => s.setQuickEdit)
+  const rightDown = useRef<{ x: number; y: number } | null>(null)
+  const menuRequest = useRef(0)
+
+  const toggle = (label: string, checked: boolean, run: () => void): MenuEntry => ({ kind: 'item', label, checked, run })
+  const viewEntries = (): MenuEntry[] => [
+    { kind: 'item', label: 'Fit view', hint: 'F', run: requestFit },
+    toggle('Wireframe', wireframe, () => setWireframe((w) => !w)),
+    { kind: 'item', label: 'Section', checked: section.on, items: [
+      ...(['x', 'y', 'z'] as Axis[]).map((ax) => toggle(`Across ${ax.toUpperCase()}`, section.on && section.axis === ax,
+        () => setSection({ on: true, axis: ax, flip: false, position: null }))),
+      ...(section.on ? [toggle('Off', false, () => setSection({ ...section, on: false }))] : []),
+    ] },
+    ...(anyMarkers ? [toggle('Show loads', showMarkers, () => setShowMarkers(!showMarkers))] : []),
+    ...(frames.length ? [toggle('Show bars', showFrames, () => setShowFrames(!showFrames))] : []),
+    { kind: 'separator' },
+    { kind: 'item', label: 'Add node…', hint: 'Tab', run: () => useStore.getState().requestPalette(),
+      disabled: picking ? 'Finish picking first' : undefined },
+    ...[importItem()].filter((i): i is NonNullable<typeof i> => i !== null),
+  ]
+
+  /** The menu for what is under (x, y): a marker, a face and its body, a body, a slice, a bar, or the
+   *  view itself. */
+  const openMenu = async (x: number, y: number) => {
+    const request = ++menuRequest.current
+    const hit = probe.current?.(x, y) ?? null
+    const st = useStore.getState()
+    const ctx: MenuContext = { at: { x, y }, point: hit?.point, check: (node) => setChecking(node),
+      hideBars: () => setShowFrames(false) }
+    const show = (entries: MenuEntry[], highlight?: MenuFace) =>
+      setMenu({ x, y, entries: entries.length ? [...entries, { kind: 'separator' }, { kind: 'item', label: 'View', items: viewEntries() }]
+        : viewEntries(), highlight })
+    const tag = hit?.tag
+    // while a group is open its nodes are not the ones shown; while picking, only the picked body acts
+    if (!hit || !tag || st.editing || (picking && !tag.picking)) return show([])
+    if (tag.marker) return show(markerMenu(tag.marker, ctx))
+    if (tag.bar && hit.instance !== null) return show(barMenu({ ...tag.bar, piece: hit.instance }, ctx))
+    if (tag.slice) {
+      const s = st.slices[tag.slice]
+      const value = s && hit.uv ? s.values[Math.round(hit.uv[1] * (s.height - 1)) * s.width + Math.round(hit.uv[0] * (s.width - 1))] : NaN
+      return show(sliceMenu({ node: tag.slice, value: Number.isFinite(value) ? value : null, point: hit.point }))
+    }
+    const view = tag.view ? st.views[tag.view] : undefined
+    if (!tag.view || !view) return show([])
+    let entries: MenuEntry[] = []
+    let highlight: MenuFace | undefined
+    let faceHit: FaceHit | null = null
+    if (view.kind === 'cad' && hit.triangle !== null) {
+      const faces = await loadFaces(tag.view)
+      if (request !== menuRequest.current) return  // another right-click came meanwhile
+      const t = hit.triangle
+      if (typeof faces === 'string') {
+        entries = [{ kind: 'item', label: 'Face actions', disabled: faces }]
+      } else if (faces.ids.length !== view.faces || t >= faces.ids.length) {
+        entries = [{ kind: 'item', label: 'Face actions', disabled: 'The view is updating: try again in a moment' }]
+      } else {
+        highlight = { view: tag.view, faces, face: faces.ids[t], body: faces.bodies[t] }
+        if (tag.picking && picking) {
+          const keys = currentKeys()
+          entries = pickingMenu({ node: picking.node, face: faceKey(faces, t), chosen: isChosen(faces, keys, t),
+            count: keys.size, toggle: (group) => onPickWith(faces, t, group), clear: () => writeFaces(new Set()),
+            done: () => setPicking(null) })
+        } else {
+          const info = await loadFaceInfo(tag.view, view.version, faces.bodies[t], faces.ids[t])
+          if (request !== menuRequest.current) return
+          faceHit = faceHitOf(tag.view, faces, t)
+          entries = faceMenu(faceHit, info, ctx)
+        }
+      }
+    } else if (view.kind !== 'cad') {
+      // an implicit body or mesh: the faces of the CAD body it is built from, nearest to the click
+      const at = await loadFaceAt(tag.view, hit.point)
+      if (request !== menuRequest.current) return
+      if (at) {
+        entries = faceMenu({ view: tag.view, source: at.source, port: at.port, face: at.face, body: at.body, same: at.same,
+          bodyCount: at.bodies, distance: at.distance }, at.info, ctx)
+      }
+    }
+    if (!tag.picking) entries.push(...(entries.length ? [{ kind: 'separator' } as MenuEntry] : []), ...bodyMenu(tag.view, faceHit, ctx))
+    show(entries, highlight)
+  }
+
+  /** A left click: selects (and flashes, and pans the graph to) the node that made what is under the
+   *  cursor: for a body, the node that made its surface at that spot (an Offset Body's bump, a Hole
+   *  Pattern's hole, the CAD body's face); a support or load, a slice, a frame's bars: their node. */
+  const selectAt = async (x: number, y: number) => {
+    const request = ++menuRequest.current
+    const hit = probe.current?.(x, y, true) ?? null
+    const st = useStore.getState()
+    const tag = hit?.tag
+    if (!hit || !tag || st.editing) return
+    const title = (id: string) => st.specs[st.nodes.find((n) => n.id === id)?.data.typeId ?? '']?.title ?? ''
+    const select = (node: string, detail: string[] = [], under = '') => {
+      st.focusNode(node)
+      st.showToast(`${node} · ${title(node)}${under}`, detail)
+    }
+    if (tag.marker) return select(tag.marker.node)
+    if (tag.bar) return select(tag.bar.node)
+    if (tag.slice) return select(tag.slice)
+    const view = tag.view ? st.views[tag.view] : undefined
+    if (!tag.view || !view) return
+    // A marching-cubes surface lies much closer to the true one than its edges are long (a Draft edge
+    // is as long as a 1 mm bump is high): a quarter of it, and the engine adds how far the shown
+    // body's own surface is from the point (larger at the corners the mesh cuts).
+    const tol = hit.triangle !== null && hit.triangle < view.faces ? Math.max(longestEdge(view, hit.triangle) / 4, 0.02) : 0.05
+    const at = await loadNodeAt(tag.view, hit.point, tol)
+    if (request !== menuRequest.current) return
+    if (!at) return select(tag.view)
+    select(at.node, at.path.map((p) => `${p.node}${p.value === null ? '' : `: ${p.value.toFixed(2)} mm here`}`),
+      at.node !== tag.view ? `: made this surface of ${tag.view}` : '')
+  }
+
   return (
     <div className="viewport"
-      onKeyDown={(e) => { if (e.key === 'f' || e.key === 'F') requestFit() }} tabIndex={0}>
+      onKeyDown={(e) => { if (e.key === 'f' || e.key === 'F') requestFit() }} tabIndex={0}
+      onPointerDown={(e) => {
+        if (e.button === 2) rightDown.current = { x: e.clientX, y: e.clientY }
+        // a click that closes the menu only closes it
+        if (e.button === 0) leftDown.current = { x: e.clientX, y: e.clientY, menu: menuOpen.current }
+      }}
+      onClick={(e) => {
+        const down = leftDown.current
+        leftDown.current = null
+        if ((e.target as HTMLElement).tagName !== 'CANVAS' || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
+        // a drag turned the view; picking faces and placing a guide use clicks themselves
+        if (!down || down.menu || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4 || picking || placing) return
+        // the axis gizmo in the corner (its own scene) turns the view
+        const r = (e.target as HTMLElement).getBoundingClientRect()
+        if (Math.hypot(e.clientX - (r.right - GIZMO_MARGIN), e.clientY - (r.bottom - GIZMO_MARGIN)) < GIZMO_MARGIN) return
+        selectAt(e.clientX, e.clientY)
+      }}
+      onContextMenu={(e) => {
+        if ((e.target as HTMLElement).tagName !== 'CANVAS') return
+        e.preventDefault()
+        // right-drag pans the view (and Windows fires contextmenu on release): only a still click opens the menu
+        const down = rightDown.current
+        rightDown.current = null
+        if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) <= 5) openMenu(e.clientX, e.clientY)
+      }}>
       <Canvas camera={{ position: [150, -180, 130], fov: 35, near: 0.1, far: 20000 }} dpr={[1, 2]}
         gl={{ antialias: true }}>
         <ClippingOn />
@@ -1118,13 +1477,18 @@ export function Viewport() {
         <directionalLight position={[2, -3, 4]} intensity={1.8} />
         <directionalLight position={[-3, 2, -1]} intensity={0.6} />
         {visible.map((id) => viewsMap[id] && (picking?.source === id
-          ? <PickableView key={id} view={viewsMap[id]} faces={faceData} chosen={chosen} onPick={onPick} onPaint={onPaint}
+          ? <PickableView key={id} node={id} view={viewsMap[id]} faces={faceData} chosen={chosen} onPick={onPick} onPaint={onPaint}
               wireframe={wireframe} clip={clip} chosenColor={leaveOut ? PICK_LEFT_OUT : PICK_SELECTED} />
           : <ViewObject key={id} view={viewsMap[id]} wireframe={wireframe} ghost={!!picking} clip={clip}
               paint={paints[id]} cmap={cmap} range={paints[id] && paints[id].source !== 'field' ? ownRanges[id] : fieldRange}
-              onHover={setHover} node={id} />))}
+              onHover={setHover} node={id} box={detailCuts[id]?.outside} />))}
+        {Object.entries(shownDetails).map(([id, d]) => (
+          <ViewObject key={`detail-${id}`} view={d.mesh} kind={viewsMap[id].kind} wireframe={wireframe} clip={clip}
+            cmap={cmap} range={null} box={detailCuts[id].inside} patch />
+        ))}
+        <DetailProbe />
         {showMarkers && anyMarkers && <MarkerArrows markers={markers} size={Math.max(size.x, size.y, size.z, 1)} />}
-        {showFrames && !picking && frames.map(([id, f], k) => <FrameBars key={`${id}-${k}`} id={id} frame={f} onHover={setBarHover} />)}
+        {showFrames && !picking && frames.map(([id, f, k]) => <FrameBars key={`${id}-${k}`} id={id} index={k} frame={f} onHover={setBarHover} />)}
         {!picking && <Guides sceneSize={Math.max(size.x, size.y, size.z, 1)} />}
         {aim && !picking && (
           <DirectionGizmo anchor={aim.anchor} dir={aim.dir} length={Math.max(size.x, size.y, size.z, 1) * 0.3}
@@ -1137,13 +1501,18 @@ export function Viewport() {
               range={null} kind="variant" />)}
           </group>
         ))}
-        {Object.entries(slices).map(([id, s]) => <SliceObject key={id} slice={s} cmap={cmap} onHover={setHover} />)}
+        {Object.entries(slices).map(([id, s]) => <SliceObject key={id} node={id} slice={s} cmap={cmap} onHover={setHover} />)}
+        <MenuProbe probe={probe} clip={clip} />
+        {menu?.highlight && viewsMap[menu.highlight.view] && (
+          <MenuHighlight view={viewsMap[menu.highlight.view]} faces={menu.highlight.faces} face={menu.highlight.face}
+            body={menu.highlight.body} clip={clip} />
+        )}
         <Grid position={[center.x, center.y, floorZ]} rotation={[Math.PI / 2, 0, 0]}
           cellSize={cell / 5} sectionSize={cell} cellColor="#34373d" sectionColor="#454951"
           cellThickness={0.6} sectionThickness={1} fadeDistance={span * 6} fadeStrength={1.5} infiniteGrid />
         <OrbitControls makeDefault enableDamping dampingFactor={0.12} />
         <CameraFit views={views} extra={extraBoxes} onBounds={setBounds} />
-        <GizmoHelper alignment="bottom-right" margin={[64, 64]}>
+        <GizmoHelper alignment="bottom-right" margin={[GIZMO_MARGIN, GIZMO_MARGIN]}>
           <GizmoViewport axisColors={['#e5534b', '#57ab5a', '#539bf5']} labelColor="#111" />
         </GizmoHelper>
       </Canvas>
@@ -1158,7 +1527,9 @@ export function Viewport() {
             <span className="legend-name">{id}</span>
             <span className="legend-info">
               {status[id]?.state === 'running' ? 'updating…'
-                : viewsMap[id] ? `${(viewsMap[id].faces / 1000).toFixed(viewsMap[id].faces < 10000 ? 1 : 0)}k tris` +
+                : viewsMap[id] ? (viewsMap[id].level && !viewsMap[id].exact ? `${QUALITY_LABEL[viewsMap[id].level!]} · ` : '') +
+                  `${(viewsMap[id].faces / 1000).toFixed(viewsMap[id].faces < 10000 ? 1 : 0)}k tris` +
+                  (shownDetails[id] ? ` · on screen ${fmtVoxel(shownDetails[id].voxel)}` : '') +
                   (paints[id] ? ` · coloured by ${paints[id].label}${paints[id].unit ? ` (${paints[id].unit})` : ''}` : '')
                 : slices[id] ? `field slice, ${slices[id].axis} = ${slices[id].position.toFixed(1)}`
                 : status[id]?.state === 'error' ? 'error'
@@ -1168,16 +1539,19 @@ export function Viewport() {
         ))}
         <VariantsList variants={variants} />
       </div>
-      {aim && !picking && (
-        <div className="gizmo-hint">
-          {aim.torque
-            ? <>Drag the yellow arrowhead to set the axis <b>{aim.id}</b> turns about (right-hand rule: thumb along
-              the arrow, fingers show the turn)</>
-            : <>Drag the yellow arrowhead to aim the force of <b>{aim.id}</b>, the ball at its tail to move where it
-              acts (in the view's plane)</>}
-          {' '}· snaps to the axes and 45° · Esc cancels
-        </div>
-      )}
+      <div className="viewport-bottom">
+        {aim && !picking && (
+          <div className="gizmo-hint">
+            {aim.torque
+              ? <>Drag the yellow arrowhead to set the axis <b>{aim.id}</b> turns about (right-hand rule: thumb along
+                the arrow, fingers show the turn)</>
+              : <>Drag the yellow arrowhead to aim the force of <b>{aim.id}</b>, the ball at its tail to move where it
+                acts (in the view's plane)</>}
+            {' '}· snaps to the axes and 45° · Esc cancels
+          </div>
+        )}
+        <ViewportToast />
+      </div>
       {picking && (
         <div className="pick-banner">
           <span>{leaveOut ? 'Faces to leave out' : 'Picking faces'} for <b className={leaveOut ? 'left-out' : ''}>{picking.node}</b></span>
@@ -1228,9 +1602,13 @@ export function Viewport() {
         ))}
         {showFrames && frames.length > 0 && !picking && <FramePanel frames={frames} hover={barHover} />}
         {section.on && <SectionPanel section={section} setSection={setSection} lo={lo} hi={hi} />}
-        {checking && <CheckPanel candidates={checkCandidates} onClose={() => { clearPaints('thickness'); setChecking(false) }} />}
+        {checking && <CheckPanel candidates={checkCandidates} initial={typeof checking === 'string' ? checking : undefined}
+          onClose={() => { clearPaints('thickness'); setChecking(false) }} />}
       </div>
       <SlicePanel hover={hover} />
+      {menu && <ViewportMenu x={menu.x} y={menu.y} entries={menu.entries} onClose={() => setMenu(null)} />}
+      {quickEdit && <QuickEdit key={quickEdit.node} node={quickEdit.node} x={quickEdit.x} y={quickEdit.y}
+        onClose={() => setQuickEdit(null)} />}
     </div>
   )
 }

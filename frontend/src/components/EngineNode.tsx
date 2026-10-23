@@ -20,6 +20,9 @@ const ignoredByAuto = (data: EngineNode['data'], port: string) =>
 
 const NUMERIC = ['number', 'scalar', 'int']
 
+/** How long a node's card keeps its flash class (the animation itself is 1.4 s). */
+const FLASH_MS = 1500
+
 /** Number field: accepts "0,35" as well as "0.35"; arrow keys nudge (Shift = x10). */
 function NumberInput({ value, integer, onCommit }: { value: unknown; integer?: boolean; onCommit: (v: number) => void }) {
   const [text, setText] = useState(fmt(value))
@@ -282,6 +285,19 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
   const setInput = useStore((s) => s.setInput)
   const editing = useStore((s) => !!s.editing)
 
+  // A change made from the 3D view flashes the node's card for a moment (a new flash restarts it).
+  const flashAt = useStore((s) => (s.flash.ids.includes(id) ? s.flash.at : 0))
+  const [flash, setFlash] = useState({ n: 0, on: false })
+  const flashTimer = useRef<number>()
+  useEffect(() => () => window.clearTimeout(flashTimer.current), [])
+  useEffect(() => {
+    const left = flashAt + FLASH_MS - Date.now()
+    if (!flashAt || left <= 0) return
+    setFlash((f) => ({ n: f.n + 1, on: true }))
+    window.clearTimeout(flashTimer.current)
+    flashTimer.current = window.setTimeout(() => setFlash((f) => ({ ...f, on: false })), left)
+  }, [flashAt])
+
   if (!spec) return <div className="enode enode-error">Unknown node type “{data.typeId}”</div>
 
   const linked = Object.fromEntries(links.map((l) => l.split('|')))
@@ -295,7 +311,8 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
   const group = data.typeId.startsWith(GROUP_PREFIX) ? data.typeId.slice(GROUP_PREFIX.length) : null
 
   return (
-    <div className={`enode ${selected ? 'selected' : ''} ${messages.length ? 'has-error' : ''} ${group ? 'group' : ''}`}
+    <div className={`enode ${selected ? 'selected' : ''} ${messages.length ? 'has-error' : ''} ${group ? 'group' : ''}` +
+      (flash.on ? ` node-flash node-flash-${flash.n % 2}` : '')}
       style={{ ['--cat' as string]: color }} title={spec.doc}
       onDoubleClick={group && !editing ? () => useStore.getState().editGroup(group) : undefined}>
       <div className="enode-header">
@@ -365,7 +382,8 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
       {(status?.state === 'running' || (status?.time ?? 0) >= 0.05) && (
         <div className="enode-footer">
           {status?.state === 'running'
-            ? status.progress ? `${status.progress[0]} / ${status.progress[1]}` : 'working…'
+            ? status.progress ? `${status.step ? `${status.step} ` : ''}${status.progress[0]} / ${status.progress[1]}`
+              : status.view ? 'meshing for the view…' : 'working…'
             : `${status!.time!.toFixed(1)} s`}
         </div>
       )}

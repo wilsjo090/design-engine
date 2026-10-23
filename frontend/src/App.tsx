@@ -5,6 +5,7 @@ import { useStore } from './store'
 import { FileBrowser } from './components/FileBrowser'
 import { LogPanel } from './components/LogPanel'
 import { NodeEditor } from './components/NodeEditor'
+import { NodeLibrary } from './components/NodeLibrary'
 import { RecoveryBanner, Toolbar, openRecipe, saveRecipe, useAutosave } from './components/Toolbar'
 import { Viewport } from './components/Viewport'
 
@@ -18,6 +19,24 @@ function useAutoRun() {
     const t = setTimeout(() => startRun('preview'), 450)
     return () => clearTimeout(t)
   }, [graphVersion, autoRun, ready])
+}
+
+/** A pause before each finer preview: a change made meanwhile starts from Draft again instead of
+ *  waiting for a heavy run to stop. */
+const REFINE_DELAY = 800
+
+/** Refine the view (Refine on): when a preview is done and nothing has changed since it was asked
+ *  for, the next finer quality runs, up to the chosen one (the store sets `run.next`). */
+function useRefine() {
+  const run = useStore((s) => s.run)
+  useEffect(() => {
+    if (!run || run.running || !run.next) return
+    const t = setTimeout(() => {
+      const s = useStore.getState()
+      if (s.run === run && s.refine && s.connected && run.tag?.version === s.graphVersion) startRun('preview', run.next)
+    }, REFINE_DELAY)
+    return () => clearTimeout(t)
+  }, [run])
 }
 
 function useSplit() {
@@ -50,6 +69,7 @@ export default function App() {
   const [paletteSignal, setPaletteSignal] = useState(0)
   const { split, startDrag } = useSplit()
   useAutoRun()
+  useRefine()
   useAutosave()
 
   useEffect(() => {
@@ -99,8 +119,11 @@ export default function App() {
         <Toolbar onAddNode={() => setPaletteSignal((n) => n + 1)} />
         <div className="main">
           <div className="editor-pane" style={{ flexBasis: `${split * 100}%` }}>
-            <NodeEditor paletteSignal={paletteSignal} />
-            <LogPanel />
+            <NodeLibrary />
+            <div className="editor-body">
+              <NodeEditor paletteSignal={paletteSignal} />
+              <LogPanel />
+            </div>
           </div>
           <div className="divider" onMouseDown={startDrag} />
           <div className="viewport-pane"><Viewport /></div>

@@ -63,7 +63,7 @@ def import_step(path, tolerance, skip_duplicates, angle):
         from ..cad_import import load_step, tessellate
         bodies, found = load_step(path), []
         for i, body in enumerate(bodies):
-            report_progress(i, len(bodies))
+            report_progress(i, len(bodies), "body")
             found.append(tessellate(body, tolerance=tolerance, angular_tolerance=angle, check=check_cancel))
         save_step_meshes(path, tolerance, angle, found)
     meshes, seen = Many(), set()
@@ -716,6 +716,59 @@ def _view_one(body, voxel, padding):
     return _mesh(body, bounds, voxel, room, 1.0, cut_hint=(
         f"it reaches more than {padding:g} mm beyond its own box (an offset by a field whose size is not known?). "
         "Mesh from Implicit Body needs at least that much Padding."))
+
+
+DETAIL_MAX_BLOCKS = 40   # blocks in one detail piece (a few seconds with the workers); the voxel grows to fit
+DETAIL_MAX_BOX = 4096    # blocks in the boxes probed for the surface (each probe is 9^3 samples)
+DETAIL_MIN_VOXEL = 0.01  # mm: finer shows nothing a print or the fields themselves have
+
+
+@node("mesh.detail", "Detail Mesh", "Mesh",
+      [Port("body", "implicit", many=True), Port("lo", "text"), Port("hi", "text"), Port("voxel", "number", 0.1)],
+      [Port("mesh", "mesh")], hidden=True)
+def detail_mesh(body, lo, hi, voxel):
+    """Used by the editor to show the part of a shown body that is on screen finer than its view: the
+    surface inside the box lo..hi (open where it leaves the box), meshed in blocks near the surface
+    only. The voxel grows until the surface takes at most DETAIL_MAX_BLOCKS blocks; mesh.metadata
+    ["voxel"] is the one used. An empty mesh when no surface passes through the box."""
+    lo, hi = np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+    voxel = max(float(voxel), DETAIL_MIN_VOXEL)
+    boxes = []  # (body, the part of the box it can reach)
+    for b in (_field(x) for x in _items(body)):
+        if b.bounds is None:
+            continue
+        (blo, bhi), room = F.mesh_box(b, 0.0, voxel)
+        box = (np.maximum(lo, np.asarray(blo) - room), np.minimum(hi, np.asarray(bhi) + room))
+        if np.all(box[1] > box[0]):
+            boxes.append((b, box))
+    while True:  # a box too big to even look for the surface in at this voxel: coarser
+        count = sum(tiles.Plan(b, box, voxel, 0.0).count for b, box in boxes)
+        if count <= DETAIL_MAX_BOX:
+            break
+        voxel *= max(1.1, (count / DETAIL_MAX_BOX) ** (1 / 3))
+    for _ in range(8):
+        check_cancel()
+        found = [tiles.find_surface(b, tiles.Plan(b, box, voxel, 0.0)) for b, box in boxes]
+        total = sum(len(f) for f in found)
+        if total <= DETAIL_MAX_BLOCKS:
+            break
+        voxel *= max(1.2, (total / DETAIL_MAX_BLOCKS) ** 0.5)  # blocks near a surface go with its area
+    pieces = []
+    for (b, box), todo in zip(boxes, found):
+        if not todo:
+            continue
+        try:
+            mesh, _, _ = tiles.mesh_tiled(b, box, voxel, 0.0, 1.0, parallel_map, close=False, surface=todo)
+        except ValueError:  # no surface after all
+            continue
+        pieces.append(mesh)
+    out = trimesh.util.concatenate(pieces) if len(pieces) > 1 else pieces[0] if pieces else trimesh.Trimesh()
+    if len(out.faces):  # whole blocks reach past the box: only what the editor shows (it clips at the box)
+        near = np.all((out.vertices >= lo - 2 * voxel) & (out.vertices <= hi + 2 * voxel), axis=1)
+        out = trimesh.Trimesh(out.vertices, out.faces[near[out.faces].any(axis=1)], process=False)
+        out.remove_unreferenced_vertices()
+    out.metadata["voxel"] = voxel
+    return out
 
 
 @node("mesh.from_cad", "Mesh from CAD", "Mesh",

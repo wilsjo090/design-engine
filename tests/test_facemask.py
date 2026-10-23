@@ -228,3 +228,117 @@ def test_apply_to_is_a_node_input():
     from engine.graph.core import REGISTRY
     port = REGISTRY["field.face_mask"].input("apply")
     assert port.default == "chosen faces" and port.choices == ["chosen faces", "all other faces"]
+
+
+def test_face_info_describes_planes_and_a_bore():
+    # the wall bracket: face 0 is the plane x = 0 (30 x 50 mm), face 6 the pin hole (radius 4 mm, along
+    # Y at x = 50, z = 40, through the 30 mm wall)
+    from engine.graph.nodes import import_step
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
+                       0.01, 1, 0.5)[0]
+    plane = facemask.face_info(mesh, 0, 0)
+    assert plane["type"] == "plane" and plane["area"] == pytest.approx(1500.0, rel=1e-3)
+    assert plane["normal"] == pytest.approx([-1, 0, 0], abs=1e-6)       # outward: away from the part
+    assert plane["centre"] == pytest.approx([0, 15, 25], abs=1e-3)
+    assert plane["axis"] is None and plane["radius"] is None and plane["hole"] is False
+    assert plane["triangles"] == int(np.sum(facemask.cad_faces(mesh) == 0))
+    bore = facemask.face_info(mesh, 0, 6)
+    assert bore["type"] == "cylinder" and bore["hole"] is True and bore["normal"] is None
+    assert bore["radius"] == pytest.approx(4.0, rel=1e-3)
+    assert np.abs(bore["axis"]) == pytest.approx([0, 1, 0], abs=1e-6)
+    assert bore["area"] == pytest.approx(2 * np.pi * 4 * 30, rel=2e-3)
+    assert bore["centre"] == pytest.approx([50, 15, 40], abs=0.05)
+    assert facemask.face_info(mesh, 0, 99) is None and facemask.face_info(mesh, 1, 6) is None
+
+
+def test_face_info_tells_a_shaft_from_a_bore_also_for_a_part_of_a_cylinder():
+    # half a cylinder (its centroid is not on its axis), turned and moved away from the origin
+    from trimesh.transformations import rotation_matrix
+    tube = trimesh.creation.cylinder(radius=8.0, height=20.0, sections=64)
+    side = np.abs(tube.face_normals[:, 2]) < 1e-6
+    tube.face_attributes["cad_face"] = np.where(side & (tube.triangles_center[:, 0] > 0), 0, 1).astype(np.int32)
+    tube.metadata["cad_surfaces"] = np.array([[1, 2 * np.pi, 0], [0, 0, 0]], dtype=float)   # cylinder, plane
+    turn = rotation_matrix(np.radians(30), [1, 0, 0])
+    tube.apply_transform(turn)
+    tube.apply_translation([5.0, -3.0, 2.0])
+    shaft = facemask.face_info(tube, 0, 0)
+    assert shaft["type"] == "cylinder" and shaft["hole"] is False
+    assert shaft["radius"] == pytest.approx(8.0, rel=1e-3)
+    assert np.abs(shaft["axis"] @ (turn[:3, :3] @ [0, 0, 1])) == pytest.approx(1.0, abs=1e-6)
+    assert shaft["axis"][int(np.argmax(np.abs(shaft["axis"])))] > 0                          # sign is fixed
+    tube.invert()                                                                          # now a bore
+    bore = facemask.face_info(tube, 0, 0)
+    assert bore["hole"] is True and bore["radius"] == pytest.approx(8.0, rel=1e-3)
+    assert bore["axis"] == pytest.approx(shaft["axis"])
+    assert facemask.face_info(tube, 0, 1)["type"] == "plane"
+
+
+def test_face_info_finds_the_body_by_its_number():
+    boxes = []
+    for number, size in ((3, 10.0), (4, 20.0)):
+        box = cad_box((size, size, size))
+        box.metadata["cad_body"] = number
+        box.metadata["cad_surfaces"] = np.zeros((6, 3))
+        boxes.append(box)
+    assert facemask.face_info(boxes, 4, TOP)["area"] == pytest.approx(400.0)
+    assert facemask.face_info(boxes, 3, TOP)["area"] == pytest.approx(100.0)
+    assert facemask.face_info(boxes, 5, TOP) is None
+    assert facemask.face_info(boxes[0], 3, TOP)["normal"] == pytest.approx([0, 0, 1])
+    plain = trimesh.creation.box((1, 1, 1))                       # no CAD faces at all
+    assert facemask.face_info(plain, 0, 0) is None
+
+
+def test_nearest_face_of_the_wall_bracket():
+    from engine.graph.nodes import import_step
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
+                       0.01, 1, 0.5)[0]
+    face, body, distance = facemask.nearest_face(mesh, (-0.5, 15, 25))           # just off the plane x = 0
+    assert (face, body) == (0, 0) and distance == pytest.approx(0.5, abs=1e-6)
+    face, body, distance = facemask.nearest_face([mesh], (52, 15, 40))           # inside the pin hole
+    assert face == 6 and distance == pytest.approx(2.0, abs=0.05)
+    assert facemask.nearest_face(mesh, (-0.5, 15, 25), within=0.4) is None
+
+
+def test_nearest_face_picks_the_nearest_body_and_skips_far_ones():
+    boxes = []
+    for k in range(40):                                  # a row of cubes 100 mm apart, numbered like a STEP file
+        box = cad_box((10, 10, 10))
+        box.apply_translation([100.0 * k, 0, 0])
+        box.metadata["cad_body"] = 10 + k
+        boxes.append(box)
+    plain = trimesh.creation.box((1, 1, 1))              # no CAD faces: never an answer
+    plain.apply_translation([-20, 0, 0])
+    boxes.insert(0, plain)
+    assert facemask.cad_body(plain, 7) == 7              # (the list index stands in for a missing number)
+
+    built = []
+    original = facemask._face_tree
+    facemask._face_tree = lambda mesh: built.append(1) or original(mesh)
+    try:
+        face, body, distance = facemask.nearest_face(boxes, (208, 0, 0))          # 3 mm off cube 2's +X side
+    finally:
+        facemask._face_tree = original
+    assert (face, body) == (0, 12) and distance == pytest.approx(3.0, abs=1e-9)
+    assert len(built) == 1                               # the other 39 cubes were ruled out by their boxes
+    face, body, distance = facemask.nearest_face(boxes, (200, 0, 5.4))             # above the top of cube 2
+    assert (face, body) == (TOP, 12) and distance == pytest.approx(0.4, abs=1e-9)
+    assert facemask.nearest_face(boxes, (200, 0, 5.4), within=0.3) is None
+    assert facemask.nearest_face(plain, (0, 0, 0)) is None and facemask.nearest_face([], (0, 0, 0)) is None
+
+
+def test_copies_of_one_part_share_face_numbers():
+    copies = [cad_box((10, 10, 10)), cad_box((13, 13, 13))]                        # a scaled copy
+    ids = [facemask.cad_faces(m) for m in copies]
+    assert facemask.same_part(copies, ids)
+    other = [cad_box((10, 10, 10)), cad_box((40, 10, 2))]                          # a slab: other shares per face
+    assert not facemask.same_part(other, [facemask.cad_faces(m) for m in other])
+
+
+def test_surface_types_match_opencascade():
+    from OCP.GeomAbs import GeomAbs_SurfaceType as T
+    assert facemask.SURFACE_TYPES[T.GeomAbs_Plane.value] == "plane"
+    assert facemask.SURFACE_TYPES[T.GeomAbs_Cylinder.value] == "cylinder"
+    assert facemask.SURFACE_TYPES[T.GeomAbs_Cone.value] == "cone"
+    assert facemask.SURFACE_TYPES[T.GeomAbs_Sphere.value] == "sphere"
+    assert facemask.SURFACE_TYPES[T.GeomAbs_Torus.value] == "torus"
+    assert facemask.SURFACE_TYPES[T.GeomAbs_BSplineSurface.value] == "bspline"

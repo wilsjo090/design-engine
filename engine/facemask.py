@@ -10,6 +10,8 @@ as "1 mm from the selection".
 """
 import os
 import re
+import threading
+from collections import OrderedDict
 
 import numpy as np
 import trimesh
@@ -24,6 +26,9 @@ APPLY = ("chosen faces", "all other faces")  # where the effect goes: the picked
 POSITIONS = ("inside", "center", "outside")
 REACHES = ("surface", "volume")
 _TREES = {}  # (mesh fingerprint, faces, which) -> igl AABB of that subset of triangles
+_FACE_TREES = OrderedDict()  # mesh fingerprint -> (igl AABB of all its triangles, triangle count), newest last
+_FACE_TREES_LOCK = threading.Lock()
+MAX_TREE_TRIANGLES = 2_000_000  # nearest_face keeps search trees for about this many triangles in all
 
 
 def cad_faces(mesh):
@@ -56,6 +61,138 @@ def parse_faces(text):
     if isinstance(text, (list, tuple)):
         return sorted({int(f) for f in text})
     return sorted({int(f or p) for _, f, p in re.findall(r"(\d+)\s*:\s*(\d+)|(\d+)", str(text or ""))})
+
+
+# OpenCascade's GeomAbs_SurfaceType numbers, as kept in mesh.metadata["cad_surfaces"][:, 0]
+SURFACE_TYPES = {0: "plane", 1: "cylinder", 2: "cone", 3: "sphere", 4: "torus", 5: "bezier", 6: "bspline",
+                 7: "revolution", 8: "extrusion", 9: "offset"}
+
+
+def face_info(meshes, body, face):
+    """What one CAD face is, for the face menu of the 3D view: a dict with `type` (plane, cylinder,
+    cone, sphere, torus, bspline, ... or other), `area` (mm²), `centre` (area-weighted centroid of its
+    triangles), `triangles`, and for a plane its unit `normal`, for a cylinder its `axis` (unit
+    vector, sign fixed), `radius` and `hole` (the faces' normals point towards the axis: a bore, not a
+    shaft); entries that do not apply are None (hole: False). `meshes` is a tessellated body or a
+    list of them; `body` is the body number as /api/faces reports it (the first mesh with that
+    number is used: copies share faces). None if the body or the face is not there."""
+    items = list(meshes) if isinstance(meshes, (list, tuple)) else [meshes]
+    for k, mesh in enumerate(items):
+        ids = cad_faces(mesh)
+        if ids is None or cad_body(mesh, k) != body:
+            continue
+        on = ids == face
+        if on.any():
+            return _describe_face(mesh, np.flatnonzero(on), face)
+    return None
+
+
+def _describe_face(mesh, rows, face):
+    corners = np.asarray(mesh.faces)[rows]
+    tri = np.asarray(mesh.vertices, dtype=np.float64)[corners]
+    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    size = np.linalg.norm(cross, axis=1)
+    area = float(0.5 * size.sum())
+    centre = (0.5 * size[:, None] * tri.mean(axis=1)).sum(axis=0) / area if area > 0 else tri.mean(axis=(0, 1))
+    normals = cross / np.maximum(size, 1e-300)[:, None]
+    kinds = np.asarray(mesh.metadata.get("cad_surfaces", np.zeros((0, 3))))
+    kind = SURFACE_TYPES.get(int(kinds[face][0]), "other") if face < len(kinds) else "other"
+    info = {"type": kind, "area": area, "centre": centre.tolist(), "normal": None, "axis": None, "radius": None,
+            "hole": False, "triangles": len(rows)}
+    if kind == "plane" and area > 0:
+        total = cross.sum(axis=0)   # sum of (2 x area x normal)
+        info["normal"] = (total / max(np.linalg.norm(total), 1e-300)).tolist()
+    elif kind == "cylinder" and area > 0:
+        fit = _fit_cylinder(tri, corners, normals, 0.5 * size)
+        if fit is not None:
+            info.update(fit)
+    return info
+
+
+def _fit_cylinder(tri, corners, normals, areas):
+    """{axis, radius, hole} of a cylinder from its triangles, or None if they do not show one. The
+    axis is the direction the normals avoid (smallest eigenvector of the sum of n nᵀ, which holds
+    for a part of a cylinder as well as a whole one); the circle the corner points make across the
+    axis is fitted (Kåsa), as the centroid of an arc is not on its axis."""
+    _, vectors = np.linalg.eigh(np.einsum("k,ki,kj->ij", areas, normals, normals))
+    axis = vectors[:, 0]
+    axis = axis if axis[np.argmax(np.abs(axis))] > 0 else -axis
+    side = vectors[:, 1:]                               # two directions across the axis
+    points = tri.reshape(-1, 3)[np.unique(corners.ravel(), return_index=True)[1]]
+    flat = (points - points.mean(axis=0)) @ side        # corner points seen along the axis
+    A = np.column_stack([2 * flat, np.ones(len(flat))])
+    solution, _, rank, _ = np.linalg.lstsq(A, (flat ** 2).sum(axis=1), rcond=None)
+    if rank < 3 or not np.all(np.isfinite(solution)):
+        return None
+    middle = solution[:2]
+    radius = float(np.linalg.norm(flat - middle, axis=1).mean())
+    if not np.isfinite(radius) or radius <= 0:
+        return None
+    # the normals of a bore look at the axis: on average against the way out from it
+    out = tri.mean(axis=1) - (points.mean(axis=0) + side @ middle)
+    out -= np.outer(out @ axis, axis)
+    hole = float((areas * np.einsum("ij,ij->i", out, normals)).sum()) < 0
+    return {"axis": axis.tolist(), "radius": radius, "hole": hole}
+
+
+def same_part(meshes, ids):
+    """The bodies are copies of one part (the petals, also when scaled): the same faces, the same
+    triangles per face and the same share of the surface per face, so they share face numbers.
+    `ids` is the CAD face per triangle of each body (`cad_faces`)."""
+    counts = [np.bincount(i) for i in ids]
+    shares = [np.bincount(i, weights=m.area_faces) / max(m.area, 1e-12) for m, i in zip(meshes, ids)]
+    return all(len(c) == len(counts[0]) and np.array_equal(c, counts[0]) and np.allclose(a, shares[0], atol=1e-4)
+               for c, a in zip(counts, shares))
+
+
+def _face_tree(mesh):
+    """igl AABB over all of a body's triangles, kept per process for the bodies asked about last (a
+    click on the 3D view asks about a few bodies again and again; the lamp's 145 petals are small, its
+    centre part is not)."""
+    import igl
+    key = mesh_fingerprint(mesh)
+    with _FACE_TREES_LOCK:
+        if key in _FACE_TREES:
+            _FACE_TREES.move_to_end(key)
+            return _FACE_TREES[key][0]
+    tree = igl.AABB()
+    tree.init(np.ascontiguousarray(mesh.vertices, dtype=np.float64), np.ascontiguousarray(mesh.faces, dtype=np.int64))
+    with _FACE_TREES_LOCK:
+        _FACE_TREES[key] = (tree, len(mesh.faces))
+        while len(_FACE_TREES) > 1 and sum(n for _, n in _FACE_TREES.values()) > MAX_TREE_TRIANGLES:
+            _FACE_TREES.popitem(last=False)
+    return tree
+
+
+def nearest_face(meshes, point, within=np.inf):
+    """The CAD face closest to `point`: (face number, body number, distance in mm), or None when no
+    body with CAD faces lies closer than `within` mm. `meshes` is a tessellated body or a list of
+    them; the body number is the one /api/faces reports (`cad_body`, the list index for a body
+    without one). Bodies are tried nearest bounding box first and the search stops at the first
+    box that is not closer than the best distance so far, so a list of 145 petals costs a handful of
+    tree queries (a box is never nearer than its triangles)."""
+    items = list(meshes) if isinstance(meshes, (list, tuple)) else [meshes]
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    ranked = []
+    for k, mesh in enumerate(items):
+        ids = cad_faces(mesh)
+        if ids is None or len(ids) == 0:
+            continue
+        vertices = np.asarray(mesh.vertices)
+        reach = np.linalg.norm(np.maximum(vertices.min(axis=0) - point, 0) + np.maximum(point - vertices.max(axis=0), 0))
+        ranked.append((float(reach), k, ids))
+    best = None
+    for reach, k, ids in sorted(ranked, key=lambda r: r[0]):
+        if reach >= within:
+            break
+        mesh = items[k]
+        sq, tri, _ = _face_tree(mesh).squared_distance(
+            np.ascontiguousarray(mesh.vertices, dtype=np.float64), np.ascontiguousarray(mesh.faces, dtype=np.int64),
+            point[None])
+        distance = float(np.sqrt(sq[0]))
+        if distance < within:
+            within, best = distance, (int(ids[int(tri[0])]), cad_body(mesh, k), distance)
+    return best
 
 
 def fade_range(fade, position):

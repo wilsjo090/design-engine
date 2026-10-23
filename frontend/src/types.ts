@@ -70,12 +70,21 @@ export type EngineNode = Node<EngineNodeData, 'engine' | 'groupIn' | 'groupOut'>
 export type EngineEdge = Edge
 
 export type Quality = 'draft' | 'medium' | 'final'
+/** coarse to fine */
+export const QUALITIES: Quality[] = ['draft', 'medium', 'final']
+export const QUALITY_LABEL: Record<Quality, string> = { draft: 'Draft', medium: 'Medium', final: 'Final' }
 
 export interface NodeStatus {
   state: 'running' | 'done' | 'cached' | 'error'
   time?: number
   message?: string
   progress?: [number, number]
+  /** while running: what the progress counts ("Blocks", "iteration") */
+  step?: string | null
+  /** while running: the hidden mesher is meshing the node's body for the 3D view */
+  view?: boolean
+  /** while running: the step inside a group (the group node shows its inner nodes' events) */
+  inner?: string | null
   /** the values the node's output can take, when the engine can tell (e.g. 0 ... 1 for a mask) */
   range?: [number, number] | null
   /** a line from the node about its result (e.g. "not optimized for these settings yet") */
@@ -96,6 +105,29 @@ export interface ViewMesh {
   positions: Float32Array
   indices: Uint32Array
   bounds: [[number, number, number], [number, number, number]]
+  /** what the shown output is made of (the engine's content key) and the quality it was made at: a
+   *  later preview at this quality or coarser keeps it instead of computing it again */
+  key?: string
+  level?: Quality
+  /** looks the same at every quality (a CAD body) */
+  exact?: boolean
+  /** mm: the voxel it was meshed with, and the finest a detail of it may use (null: no detail) */
+  voxel?: number | null
+  floor?: number | null
+}
+
+/** Part of a shown body meshed finer than its view (the part on screen, when zoomed in): drawn
+ *  instead of the view inside the box lo..hi. */
+export interface Detail {
+  /** the engine's version of this detail, and of the view it was made from */
+  version: number
+  viewVersion: number
+  /** what the view it refines is made of: it stays while the view shows the same */
+  key: string
+  lo: [number, number, number]
+  hi: [number, number, number]
+  voxel: number
+  mesh: ViewMesh
 }
 
 export type Axis = 'x' | 'y' | 'z'
@@ -139,6 +171,9 @@ export interface Paint {
   reverse?: boolean
   /** some values lie beyond min..max (a stress peak at a support), shown in the end colour */
   clipped?: boolean
+  /** a field's colours: what the field is made of and the quality it was sampled at (see ViewMesh) */
+  key?: string | null
+  level?: Quality
 }
 
 /** A frame's bars (Frame Optimization) for the 3D view's frame view: pieces between nodes, each
@@ -168,12 +203,25 @@ export interface Marker {
   load?: string
   centre?: [number, number, number]
   arrow?: [number, number, number] | null
+  /** the CAD face and body number under each point */
+  faces?: number[]
+  bodies?: number[]
+}
+
+/** What the editor sends with a run and gets back with its run_start. */
+export interface RunTag {
+  /** graphVersion when the run was asked for: its result is out of date once this changes */
+  version: number
+  /** a step of refining the view (not the first look after a change) */
+  refining?: boolean
 }
 
 export interface QueueState {
   current: { id: number; label: string } | null
   exports: { id: number; label: string; queued: number }[]
   preview_waiting: boolean
+  /** the run going on now, of any kind (an editor opened during it adopts it) */
+  running?: { run: number; mode: string; quality: Quality; label: string; tag: RunTag | null; elapsed: number } | null
 }
 
 export type Bounds = [[number, number, number], [number, number, number]]
@@ -184,6 +232,17 @@ export interface RunState {
   running: boolean
   startedAt: number
   message?: string
+  quality?: Quality
+  /** undefined from an engine that does not send it back (one not restarted since an update) */
+  tag?: RunTag | null
+  /** what the engine does after the nodes (preparing views, colouring, slicing) */
+  phase?: string
+  /** refining: the quality the next preview runs at, once this one is done and nothing changed */
+  next?: Quality
+  /** after the run: the coarsest quality of what the view shows (null: nothing that changes with it) */
+  shown?: Quality | null
+  /** a detail run: the voxel it was meshed with, mm */
+  voxel?: number
 }
 
 export interface LogEntry {
@@ -237,6 +296,58 @@ export interface FaceData {
   /** the bodies are copies of one part: a plain face number means that face on all of them */
   same: boolean
   groups: Uint32Array[]
+}
+
+/** An entry of a right-click menu in the 3D view (ViewportMenu). */
+export type MenuEntry = { kind: 'header'; text: string } | { kind: 'separator' } | MenuItem
+
+export interface MenuItem {
+  kind: 'item'
+  label: string
+  /** small grey text on the right (a shortcut, a node type) */
+  hint?: string
+  /** greyed out: why it cannot be used (its tooltip) */
+  disabled?: string
+  /** tooltip of an enabled item */
+  title?: string
+  /** a check mark in front (toggles such as Wireframe) */
+  checked?: boolean
+  /** a submenu (opens on hover or →) */
+  items?: MenuEntry[]
+  /** shift: Shift was held (e.g. skips the quick-edit popover) */
+  run?: (o: { shift: boolean }) => void
+}
+
+/** A small graph change made from the 3D view: one undo step, one preview run. Nodes are named by
+ *  id, or by the `key` of a node the same edit adds. */
+export interface GraphEdit {
+  /** new nodes, placed next to `near`: one column to its right ('right', the default) or in its row
+   *  after it ('after': the next node of a supports-and-loads chain), never on top of another node */
+  add?: { key: string; type: string; inputs?: Record<string, unknown>; near?: string; place?: 'right' | 'after' }[]
+  /** typed-in values */
+  inputs?: { node: string; port: string; value: unknown }[]
+  /** links (from.port -> to.input); each replaces whatever was linked into to.input */
+  links?: { from: string; port: string; to: string; input: string }[]
+  remove?: string[]
+  /** saved face selections to set */
+  selections?: Record<string, string>
+  /** select these nodes (and no others) */
+  select?: string[]
+  /** start picking faces on this node afterwards */
+  pick?: string
+}
+
+export interface ToastAction { label: string; run: () => void }
+
+/** A short note in the 3D view after an action there: what changed, with Undo. */
+export interface Toast {
+  text: string
+  /** every change, one line each (its tooltip) */
+  detail: string[]
+  actions: ToastAction[]
+  /** Undo is offered while graphVersion is still this (nothing changed since) */
+  version: number
+  at: number
 }
 
 /** Face keys in a faces text: "3" (face 3 on every body) or "2:15" (face 15 of body 2), sorted. */

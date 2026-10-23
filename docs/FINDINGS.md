@@ -1289,6 +1289,24 @@ Plan: docs/FRAME_PLAN.md ("F1 as built" lists what differs from it). Engine only
   a 2.5M-triangle target on the 12.5M lamp and took 24 s. The browser draws 12M+ triangles fine,
   so the view gets full meshes up to 15M triangles (fast decimation above that).
 
+## Refining the view and on-screen detail (2026-10-23)
+
+- Refine (toolbar): a change previews at Draft, then Medium and Final follow while nothing changes;
+  views whose content key is unchanged are kept from finer runs, so only edited bodies are meshed
+  again. Test part (`wave_offset`, 0.1 mm mesh): an edit showed Draft after 0.4 s and Final after
+  7.6 s; an edit during the Final step dropped back to Draft 0.2 s later (blocks are short).
+- On-screen detail (zoomed in, camera still): the visible part of a shown body is meshed again in
+  blocks near its surface and drawn instead of the view inside its box, both cut per pixel in the
+  shader: the user found the edges seamless. Smoothen body of the test part, middle of the top at
+  0.036 mm (asked 0.03; the budget of 40 blocks made it coarser): 1.6 s with warm workers, ~7 s
+  cold (worker processes and their CUDA contexts starting). The whole part asked at 0.02 mm came
+  back at 0.17 mm in 1.6 s (the budget), coarser than the Final view: the editor ignores such ones.
+- Whole blocks reach up to 96 voxels past the box; trimming to the box (plus 2 voxels) before
+  sending keeps the download to what is drawn.
+- Testing in the hidden browser pane: the page reports visible, but no frames, ResizeObserver or
+  requestAnimationFrame run there (the canvas stays 300x150 and draws nothing), so the look of a
+  3D change can only be judged with the pane shown or in the user's editor.
+
 ## Tooling pitfalls met
 
 - PowerShell 5.1 `Get-Content`/`Set-Content` reads BOM-less UTF-8 as Windows-1252: non-ASCII text

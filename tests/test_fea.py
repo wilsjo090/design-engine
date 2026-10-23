@@ -220,6 +220,59 @@ def test_a_bearing_load_presses_only_on_the_contact_side():
         Condition("load", hole.triangles, load="bearing", amount=1.0, direction="into the face").traction(normals)
 
 
+def test_markers_tell_which_cad_face_and_body_each_point_is_on():
+    # the wall bracket: face 0 is the plane x = 0, face 1 the plane y = 0, face 6 the pin hole (radius
+    # 4 mm about the line x = 50, z = 40). The editor's right-click menu on a marker needs the face.
+    from pathlib import Path
+    from engine.fea.model import markers, marker_samples
+    from engine.graph import nodes_fea
+    from engine.graph.nodes import import_step
+    from engine.transform import scale_about
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
+                       0.01, 1, 0.5)[0]
+    on_face = {0: lambda p: p[:, 0], 1: lambda p: p[:, 1],
+               6: lambda p: np.hypot(p[:, 0] - 50.0, p[:, 2] - 40.0) - 4.0}   # 0 on the face
+
+    def check(info, chosen):
+        points = np.array(info["points"])
+        assert len(points) > 3
+        assert len(info["faces"]) == len(info["bodies"]) == len(points)
+        assert set(info["faces"]) <= set(chosen)
+        for face, distance in on_face.items():
+            mine = np.array(info["faces"]) == face
+            if mine.any():
+                # the point really lies on that face (the hole's flat triangles lie inside it by <= 0.01 mm)
+                assert np.abs(distance(points[mine])).max() < 0.02, face
+
+    support = nodes_fea.fixed_faces(mesh, "0, 1, 6", None)
+    check(support.markers, (0, 1, 6))
+    assert set(support.markers["faces"]) == {0, 1, 6} and set(support.markers["bodies"]) == {0}
+    load = nodes_fea.load(mesh, "6, 1", "bearing", 200.0, "-Z", "0, 0, -1", support)
+    check(load.markers, (6, 1))
+    assert set(load.markers["faces"]) == {6}                        # a bearing load acts on one side of the hole only
+    # two bodies (the second as a scaled copy with its own number): the point's body is its own
+    other = scale_about(mesh, np.zeros(3), 1.5)
+    other.metadata["cad_body"] = 1
+    both = nodes_fea.fixed_faces([mesh, other], "0:0, 1:6", None).markers
+    assert set(zip(both["bodies"], both["faces"])) == {(0, 0), (1, 6)}
+    assert np.abs(on_face[0](np.array(both["points"])[np.array(both["bodies"]) == 0])).max() < 1e-6
+    # a selection with no faces keeps the same keys
+    empty = nodes_fea.fixed_faces(mesh, "", None).markers
+    assert empty["points"] == [] and empty["faces"] == [] and empty["bodies"] == []
+    # the points are the ones markers() gives, and each lies on the triangle it was sampled from
+    ids = mesh.face_attributes["cad_face"]
+    condition = Condition("load", mesh.triangles[np.isin(ids, [0, 1, 6])], amount=10.0, direction="+X",
+                          faces=ids[np.isin(ids, [0, 1, 6])])
+    points, dirs, sizes, tri = marker_samples(condition)
+    for plain, extended in zip(markers(condition), (points, dirs, sizes)):
+        assert np.array_equal(plain, extended)
+    corners = condition.triangles[tri]
+    normal = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+    assert np.abs(((points - corners[:, 0]) * normal).sum(axis=1)).max() < 1e-6
+    assert np.all(points >= corners.min(axis=1) - 1e-6) and np.all(points <= corners.max(axis=1) + 1e-6)
+
+
 def test_a_load_partly_off_the_part_keeps_its_total():
     # a topology result often lacks the unloaded side of a pin hole: put back by area, the 200 N
     # bearing load became 276 N there; by what each point carries it stays 200 N
@@ -450,6 +503,8 @@ def test_the_nodes_analyse_a_part_and_report(beam_step, beam):
     assert fixed_markers[0]["kind"] == "fixed" and len(fixed_markers[0]["points"]) > 0
     assert load_markers[0]["kind"] == "load" and np.allclose(load_markers[0]["dirs"], [0, 0, -1])
     assert all(p[0] == pytest.approx(100.0) for p in load_markers[0]["points"])
+    assert set(fixed_markers[0]["faces"]) == {_face_id(beam, 0, 0.0)} and set(load_markers[0]["bodies"]) == {0}
+    assert set(load_markers[0]["faces"]) == {_face_id(beam, 0, 100.0)}
 
 
 def test_previews_show_supports_and_colour_the_analysed_part(beam_step, beam):

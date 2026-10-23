@@ -43,7 +43,8 @@ button.on { background: #3a4a33; border-color: var(--accent); color: #d6f5c3; }
 /* ---------- layout ---------- */
 .app { display: flex; flex-direction: column; height: 100%; }
 .main { flex: 1; display: flex; min-height: 0; }
-.editor-pane { position: relative; flex-shrink: 0; min-width: 0; }
+.editor-pane { position: relative; flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; }
+.editor-body { position: relative; flex: 1; min-height: 0; }
 .viewport-pane { flex: 1; position: relative; min-width: 0; }
 .divider { width: 5px; cursor: col-resize; background: var(--panel); border-left: 1px solid var(--border); border-right: 1px solid #111; }
 .divider:hover { background: #3a3d44; }
@@ -69,6 +70,24 @@ button.on { background: #3a4a33; border-color: var(--accent); color: #d6f5c3; }
 .run-status { color: var(--muted); display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
 .run-status.running { color: #e3d27a; }
 .run-status.error { color: var(--danger); }
+.run-status.stale { color: #e3a35a; }
+.run-status .run-text { overflow: hidden; text-overflow: ellipsis; }
+.tb-status { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.tb-short { display: none; }
+/* narrow window: data-fit is set by the toolbar: 1 = no brand, the memory as a bar only, tighter;
+   2 = action buttons as icons; 3 = quality as first letters; 4 = the status on a row of its own */
+.toolbar:not([data-fit='0']) { gap: 10px; }
+.toolbar:not([data-fit='0']) .tb-group { padding-left: 10px; }
+.toolbar:not([data-fit='0']) .brand,
+.toolbar:is([data-fit='1'], [data-fit='2'], [data-fit='3']) .memory-text { display: none; }
+.toolbar:is([data-fit='2'], [data-fit='3'], [data-fit='4']) .tb-label { display: none; }
+.toolbar:is([data-fit='2'], [data-fit='3'], [data-fit='4']) .recipe-select { min-width: 0; max-width: 140px; }
+.toolbar:is([data-fit='3'], [data-fit='4']) .tb-long { display: none; }
+.toolbar:is([data-fit='3'], [data-fit='4']) .tb-short { display: inline; }
+.toolbar[data-fit='4'] { flex-wrap: wrap; height: auto; padding: 6px 12px; row-gap: 6px; }
+.toolbar[data-fit='4'] .spacer { display: none; }
+.toolbar[data-fit='4'] .tb-status { flex: 1 0 100%; }
+.toolbar[data-fit='4'] .run-status { flex: 1; max-width: none; }
 .memory-meter { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .memory-bar { width: 46px; height: 6px; background: #2c2f35; border-radius: 3px; overflow: hidden; }
 .memory-bar > span { display: block; height: 100%; background: var(--accent); transition: width 0.4s; }
@@ -362,3 +381,142 @@ body.scrubbing, body.scrubbing * { cursor: ew-resize !important; user-select: no
   display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .queue-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .pick-banner b.left-out { color: #e5534b; }
+
+/* ---------- 3D view: right-click menu, toast, node flash ---------- */
+.vp-menu {
+  position: fixed; z-index: 60; min-width: 200px; max-width: 340px; max-height: calc(100vh - 8px);
+  padding: 4px 0; overflow-x: hidden; overflow-y: auto; user-select: none; font-size: 13px;
+  background: var(--panel); border: 1px solid #50545c; border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.vp-menu-item { display: flex; align-items: center; height: 26px; padding: 0 12px 0 6px; color: #eef0f2; white-space: nowrap; cursor: pointer; }
+.vp-menu-item.active { background: #34383f; }
+.vp-menu-item.disabled { color: var(--muted); opacity: 0.65; cursor: default; }
+.vp-menu-check { flex: none; width: 18px; text-align: center; font-size: 12px; color: var(--accent); }
+.vp-menu-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.vp-menu-hint { flex: none; margin-left: 24px; font-size: 11px; color: var(--muted); }
+.vp-menu-arrow { flex: none; margin-left: 14px; font-size: 10px; color: var(--muted); }
+.vp-menu-header { padding: 5px 12px 4px; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vp-menu-sep { height: 1px; margin: 4px 0; background: var(--border); }
+
+.vp-toast {
+  position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 30; pointer-events: auto;
+  display: flex; align-items: center; gap: 6px; max-width: calc(100% - 32px); padding: 5px 6px 5px 14px;
+  background: var(--panel); border: 1px solid #50545c; border-radius: 18px; font-size: 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5); animation: vp-toast-in 0.15s ease-out;
+}
+@keyframes vp-toast-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+/* the load arrow's hint and the toast share the bottom centre, the toast on top (a new Load is
+   selected, so its hint shows at once) */
+.viewport-bottom { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); z-index: 30;
+  display: flex; flex-direction: column-reverse; align-items: center; gap: 8px; max-width: 70%; pointer-events: none; }
+.viewport-bottom > .gizmo-hint, .viewport-bottom > .vp-toast { position: static; transform: none; max-width: 100%; }
+.viewport-bottom > .vp-toast { animation-name: vp-toast-rise; }
+@keyframes vp-toast-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.vp-toast-text { min-width: 0; margin-right: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vp-toast .vp-toast-btn { padding: 2px 9px; background: none; border: none; border-radius: 12px; color: var(--accent-2); font-weight: 600; }
+.vp-toast .vp-toast-btn:hover:not(:disabled) { background: #34383f; border: none; }
+.vp-toast .vp-toast-close { padding: 0 8px; color: var(--muted); font-size: 15px; font-weight: 400; }
+.vp-toast .vp-toast-close:hover:not(:disabled) { color: var(--text); }
+
+/* a node the 3D view just changed: an outline and glow in the accent colour that fade out (two
+   names, so that a second flash of the same node starts the animation again) */
+.enode.node-flash { outline: 2px solid transparent; outline-offset: 2px; }
+.enode.node-flash-0 { animation: node-flash-0 1.4s ease-out; }
+.enode.node-flash-1 { animation: node-flash-1 1.4s ease-out; }
+@keyframes node-flash-0 {
+  from { outline-color: var(--accent); filter: drop-shadow(0 0 10px var(--accent)); }
+  to { outline-color: transparent; filter: drop-shadow(0 0 0 transparent); }
+}
+@keyframes node-flash-1 {
+  from { outline-color: var(--accent); filter: drop-shadow(0 0 10px var(--accent)); }
+  to { outline-color: transparent; filter: drop-shadow(0 0 0 transparent); }
+}
+
+/* ---------- 3D view: quick-edit box at the cursor (a node's few key inputs, QuickEdit.tsx) ---------- */
+.vp-quick {
+  position: fixed; z-index: 60; width: 240px; padding: 7px 0 5px; font-size: 13px;
+  background: var(--panel); border: 1px solid #50545c; border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.vp-quick-head { padding: 0 12px 6px; color: #eef0f2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vp-quick-title { font-size: 11px; color: var(--muted); }
+.vp-quick-row { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 2px 12px; color: #eef0f2; }
+.vp-quick-label { flex: none; width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vp-quick-field {
+  flex: 1; min-width: 0; height: 24px; padding: 2px 6px;
+  background: var(--input-bg); border: 1px solid #44474e; border-radius: 3px; color: var(--text);
+}
+select.vp-quick-field { padding: 2px 4px; }
+.vp-quick-field:focus { outline: none; border-color: var(--accent-2); }
+.vp-quick-unit { flex: none; font-size: 11px; color: var(--muted); }
+.vp-quick-linked { flex: 1; min-width: 0; color: var(--accent); font-size: 12px; font-style: italic; }
+.vp-quick-foot { padding: 5px 12px 0; font-size: 11px; color: var(--muted); }
+
+/* ---------- node library: ribbon of category tabs above the graph, panel of node tiles over it (NodeLibrary.tsx) ---------- */
+.nlib { --nlib-h: 34px; flex: none; }
+.nlib-bar { container-type: inline-size; display: flex; align-items: stretch; height: var(--nlib-h);
+  background: var(--panel); border-bottom: 1px solid #111; }
+.nlib-tabs { flex: 1 1 0; min-width: 0; display: flex; overflow: hidden; }
+.nlib-tab {
+  position: relative; flex: none; display: flex; align-items: center; gap: 5px; height: 100%; padding: 0 8px;
+  background: none; border: none; border-radius: 0; color: var(--text); font-size: 12px;
+}
+.nlib-tab:hover:not(:disabled), .nlib-tab.active:not(:disabled) { background: rgba(255, 255, 255, 0.06); border: none; }
+.nlib-tab::after {  /* the category colour: faint, full while hovered or open */
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--cat); opacity: 0.32; transition: opacity 0.12s;
+}
+.nlib-tab:hover::after, .nlib-tab.active::after { opacity: 1; }
+.nlib-glyph { width: 14px; text-align: center; font-size: 14px; line-height: 1; color: var(--cat);
+  font-family: 'Segoe UI Symbol', 'Segoe UI', system-ui, sans-serif; }
+.nlib-count { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* narrow pane: data-fit is set by the component: 1 = no counts, 2 = glyph and count, 3 = glyphs only */
+.nlib-tabs[data-fit='1'] .nlib-count, .nlib-tabs[data-fit='3'] .nlib-count { display: none; }
+.nlib-tabs[data-fit='2'] .nlib-name, .nlib-tabs[data-fit='3'] .nlib-name { display: none; }
+.nlib-tabs[data-fit='1'] .nlib-tab { padding: 0 7px; }
+.nlib-tabs[data-fit='2'] .nlib-tab, .nlib-tabs[data-fit='3'] .nlib-tab { gap: 4px; padding: 0 7px; }
+.nlib-tab.nlib-all { border-right: 1px solid #3a3d44; }
+
+/* the field keeps its place in the row; focused, it grows to the left over the last tabs */
+.nlib-search { position: relative; flex: none; width: 160px; margin: 5px 6px 5px 4px; }
+@container (max-width: 520px) { .nlib-search { width: 100px; } }
+.nlib-search input {
+  position: absolute; top: 0; right: 0; bottom: 0; z-index: 1; width: 100%; padding: 0 8px; font-size: 12.5px;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 4px; outline: none;
+  transition: width 0.15s ease, border-color 0.15s;
+}
+.nlib-search input:focus { width: min(250px, 80cqw); border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.25); }
+
+/* the panel overlays the top of the canvas: its containing block is .editor-pane */
+.nlib-panel {
+  position: absolute; z-index: 40; top: var(--nlib-h); left: 0; right: 0; max-height: 55%;
+  overflow-y: auto; overscroll-behavior: contain; padding: 8px 12px 12px;
+  background: var(--panel); border-bottom: 1px solid #50545c; box-shadow: 0 14px 28px rgba(0, 0, 0, 0.5);
+}
+.nlib-panel.all { max-height: 78%; }  /* every node at once: the overview */
+.nlib-section + .nlib-section { margin-top: 12px; }
+.nlib-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.nlib-head-name { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--cat); }
+.nlib-head-note { font-size: 11px; color: var(--muted); }
+.nlib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+.nlib-tile {
+  display: flex; flex-direction: column; min-width: 0; padding: 7px 9px 7px 10px; cursor: pointer; user-select: none;
+  background: var(--node); border: 1px solid var(--border); border-left: 3px solid var(--cat); border-radius: 5px;
+}
+.nlib-tile:hover, .nlib-tile.active { background: #373a41; border-color: #565b64; border-left-color: var(--cat); }
+.nlib-tile.active { box-shadow: inset 0 0 0 1px rgba(78, 163, 245, 0.55); }
+.nlib-tile-title { font-size: 13px; font-weight: 600; color: #f1f2f4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nlib-tile-doc {
+  flex: 1; margin-top: 2px; font-size: 12px; line-height: 1.35; color: var(--muted);
+  display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.nlib-tile-types { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; margin-top: 6px; }
+.nlib-tile-meta { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.nlib-chip { padding: 0 5px; border-radius: 3px; font-size: 10.5px; line-height: 16px; color: var(--t);
+  background: color-mix(in srgb, var(--t) 15%, transparent); }
+.nlib-arrow, .nlib-more { font-size: 11px; color: var(--muted); }
+.nlib-arrow { padding: 0 1px; }
+.nlib-empty { padding: 14px 4px; color: var(--muted); }

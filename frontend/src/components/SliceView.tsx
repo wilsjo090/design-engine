@@ -83,8 +83,8 @@ export interface HoverValue {
   node?: string
 }
 
-export function SliceObject({ slice, cmap, onHover }: {
-  slice: SliceView; cmap: ColorMap; onHover: (h: HoverValue | null) => void
+export function SliceObject({ node, slice, cmap, onHover }: {
+  node: string; slice: SliceView; cmap: ColorMap; onHover: (h: HoverValue | null) => void
 }) {
   const texture = useMemo(() => {
     const t = new THREE.DataTexture(colorize(slice, cmap), slice.width, slice.height, THREE.RGBAFormat)
@@ -119,7 +119,8 @@ export function SliceObject({ slice, cmap, onHover }: {
   }
 
   return (
-    <mesh position={position} quaternion={quaternion} onPointerMove={hover} onPointerOut={() => onHover(null)}>
+    <mesh position={position} quaternion={quaternion} onPointerMove={hover} onPointerOut={() => onHover(null)}
+      userData={{ menu: { slice: node } }}>
       <planeGeometry args={[Math.max(u1 - u0, 1e-3), Math.max(v1 - v0, 1e-3)]} />
       <meshBasicMaterial map={texture} side={THREE.DoubleSide} transparent toneMapped={false} />
     </mesh>

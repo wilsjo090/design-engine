@@ -158,6 +158,10 @@ class Condition:
     direction: str = "into the face"
     vector: tuple = (0.0, 0.0, -1.0)
     offset: tuple = (0.0, 0.0, 0.0)  # force and bearing: where the force acts, mm from the faces' centre
+    # The CAD face number and body number of every triangle (parallel to `triangles`, or None), so the
+    # 3D view can tell which face a marker sits on. Not part of the key: they change no numbers.
+    faces: np.ndarray = field(default=None, repr=False, compare=False)
+    bodies: np.ndarray = field(default=None, repr=False, compare=False)
 
     @property
     def key(self):
@@ -359,7 +363,14 @@ def _stretched(m, n):
 
 
 def sample_triangles(triangles, spacing, stretch=True):
-    """Points on triangles about `spacing` apart: (points, area each, outward normal each).
+    """Points on triangles about `spacing` apart: (points, area each, outward normal each). See
+    `sample_triangles_from`, which also tells which triangle each point lies on."""
+    return sample_triangles_from(triangles, spacing, stretch)[:3]
+
+
+def sample_triangles_from(triangles, spacing, stretch=True):
+    """Points on triangles about `spacing` apart: (points, area each, outward normal each, index of
+    the triangle each point lies on in `triangles`).
 
     A triangle is split into m x m equal ones, m from its longest edge. Long thin CAD triangles (the
     strips along a hole) would get m^2 points across a width that needs a few: with `stretch`, those
@@ -375,9 +386,10 @@ def sample_triangles(triangles, spacing, stretch=True):
     cross = np.cross(b - a, c - a)
     double = np.linalg.norm(cross, axis=1)
     keep = double > 1e-12
+    source = np.flatnonzero(keep)   # row in `triangles` of each triangle that is kept
     a, b, c, cross, double = a[keep], b[keep], c[keep], cross[keep], double[keep]
     if not len(a):
-        return np.zeros((0, 3)), np.zeros(0), np.zeros((0, 3))
+        return np.zeros((0, 3)), np.zeros(0), np.zeros((0, 3)), np.zeros(0, dtype=np.int64)
     normal = cross / double[:, None]
     edges = np.stack([np.linalg.norm(b - a, axis=1), np.linalg.norm(c - b, axis=1), np.linalg.norm(a - c, axis=1)], axis=1)
     m = np.maximum(1, np.ceil(edges.max(axis=1) / spacing)).astype(np.int64)
@@ -388,7 +400,7 @@ def sample_triangles(triangles, spacing, stretch=True):
         f = math.sqrt(MAX_SAMPLES / total)
         m = np.maximum(1, np.ceil(m * f)).astype(np.int64)
         n = np.maximum(1, np.ceil(n * f)).astype(np.int64)
-    points, areas, normals = [], [], []
+    points, areas, normals, rows_of = [], [], [], []
     for mm in np.unique(m[~thin]):
         sel = (m == mm) & ~thin
         bary = _subdivision(int(mm))
@@ -396,6 +408,7 @@ def sample_triangles(triangles, spacing, stretch=True):
         points.append(p.reshape(-1, 3))
         areas.append(np.repeat(0.5 * double[sel] / (mm * mm), mm * mm))
         normals.append(np.repeat(normal[sel], mm * mm, axis=0))
+        rows_of.append(np.repeat(source[sel], mm * mm))
     rows = np.flatnonzero(thin)
     if len(rows):
         corners = np.stack([a[rows], b[rows], c[rows]], axis=1)
@@ -410,36 +423,43 @@ def sample_triangles(triangles, spacing, stretch=True):
             points.append(p.reshape(-1, 3))
             areas.append((0.5 * double[rows][sel, None] * share).ravel())
             normals.append(np.repeat(normal[rows][sel], mm * nn, axis=0))
-    return np.concatenate(points), np.concatenate(areas), np.concatenate(normals)
+            rows_of.append(np.repeat(source[rows][sel], mm * nn))
+    return np.concatenate(points), np.concatenate(areas), np.concatenate(normals), np.concatenate(rows_of)
 
 
 def markers(condition, count=24):
     """A few well-spread points on the condition's faces, the direction to draw there (the load's
     direction; into the part for supports) and how hard the load presses there (0..1 of its most,
     so a bearing load's sides and a torque's middle get short arrows; 1 for supports), for the 3D view."""
+    return marker_samples(condition, count)[:3]
+
+
+def marker_samples(condition, count=24):
+    """`markers` and, as a fourth array, the index in `condition.triangles` of the triangle each
+    point was sampled from (so `condition.faces[index]` is the CAD face it sits on)."""
     area = condition.area
     if area <= 0:
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0)
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=np.int64)
     cell = math.sqrt(area / count)
-    pts, _, normals = sample_triangles(condition.triangles, cell / 3)
+    pts, _, normals, tri = sample_triangles_from(condition.triangles, cell / 3)
     peak = 0.0
     if condition.kind == "load":  # only where the load acts (a bearing load: the contact side)
         size = np.linalg.norm(condition.traction(normals, pts), axis=1)
         peak = float(size.max())
         on = size > 0.05 * peak if peak > 0 else np.ones(len(size), dtype=bool)
-        pts, normals = pts[on], normals[on]
+        pts, normals, tri = pts[on], normals[on], tri[on]
         cell = math.sqrt(area * on.mean() / count) if on.any() else cell
     keys = np.floor(pts / cell).astype(np.int64)
     _, first = np.unique(keys, axis=0, return_index=True)
     if len(first) > count:
         first = np.sort(np.random.default_rng(0).choice(first, count, replace=False))
-    pts, normals = pts[first], normals[first]
+    pts, normals, tri = pts[first], normals[first], tri[first]
     if condition.kind == "fixed":
-        return pts, -normals, np.ones(len(pts))
+        return pts, -normals, np.ones(len(pts)), tri
     dirs = condition.traction(normals, pts)
     norm = np.linalg.norm(dirs, axis=1, keepdims=True)
     sizes = norm[:, 0] / peak if peak > 0 else np.ones(len(pts))
-    return pts, np.where(norm > 0, dirs / np.maximum(norm, 1e-300), -normals), sizes
+    return pts, np.where(norm > 0, dirs / np.maximum(norm, 1e-300), -normals), sizes, tri
 
 
 def apply_conditions(grid, phi, conditions):

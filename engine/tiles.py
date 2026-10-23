@@ -87,7 +87,7 @@ def find_surface(field, plan):
     return found
 
 
-def mesh_blocks(field, plan, blocks, keep, gpu, tolerance=0.0):
+def mesh_blocks(field, plan, blocks, keep, gpu, tolerance=0.0, close=True):
     """Mesh a few blocks (runs in a worker). One result per block: (block, vertices in global
     sample units, faces, border-vertex mask, crossings, (inside, nonfinite)), where
     crossings[axis][side] tells whether the surface runs into the neighbour on that side (side 0 =
@@ -95,13 +95,13 @@ def mesh_blocks(field, plan, blocks, keep, gpu, tolerance=0.0):
     counts the NaN and infinite samples (see meshing.finite_values)."""
     xp = backend.cupy() if gpu and backend.gpu_enabled() else np
     try:
-        return [_mesh_block(field, plan, b, keep, xp, tolerance) for b in blocks]
+        return [_mesh_block(field, plan, b, keep, xp, tolerance, close) for b in blocks]
     finally:
         if xp is not np:
             backend.release_gpu_memory()
 
 
-def _mesh_block(field, plan, b, keep, xp, tolerance=0.0):
+def _mesh_block(field, plan, b, keep, xp, tolerance=0.0, close=True):
     values = Context(plan.eval_grid(b), None, xp).eval_full(field)
     h = plan.halo
     if h:
@@ -117,7 +117,7 @@ def _mesh_block(field, plan, b, keep, xp, tolerance=0.0):
     if values.min() > 0 or values.max() < 0:
         return b, None, None, None, crossings, found
     # close the surface on the outer faces of the whole box (inner faces are shared with neighbours)
-    pad = [(int(b[a] == 0), int(b[a] == plan.blocks[a] - 1)) for a in range(3)]
+    pad = [(int(close and b[a] == 0), int(close and b[a] == plan.blocks[a] - 1)) for a in range(3)]
     if any(lo or hi for lo, hi in pad):
         values = np.pad(values, pad, mode="constant", constant_values=max(float(values.max()), plan.voxel))
     verts, faces, _, _ = marching_cubes(values, level=0.0)
@@ -146,11 +146,12 @@ def _border(faces, count):
     return mask
 
 
-def stitch(results, plan, tolerance=0.0):
+def stitch(results, plan, tolerance=0.0, close=True):
     """One mesh from the blocks' pieces (a dict, emptied on the way to save memory): border
     vertices that lie on the same grid edge are the same vertex. With a tolerance the blocks were
     reduced with their borders kept: the seams are reduced here (half the tolerance, as they now
-    sit next to reduced surface)."""
+    sit next to reduced surface). An open piece (close=False) has no volume to orient it by; marching
+    cubes already faces it outward."""
     pieces = [(V, F, B) for _, V, F, B, *_ in results.values() if V is not None and len(F)]
     results.clear()
     if not pieces:
@@ -183,7 +184,7 @@ def stitch(results, plan, tolerance=0.0):
         seam = on_seam[F].any(axis=1)
         if seam.any():
             V, F = reduce(V, F, tolerance / 2 / plan.voxel, frozen=~seam, snap=False)
-    if signed_volume(V, F) < 0:
+    if close and signed_volume(V, F) < 0:
         F = F[:, ::-1]  # same as meshing.field_to_mesh: outward-facing triangles
     mesh = trimesh.Trimesh(plan.base + V * plan.voxel, F, process=False)
     del V, F
@@ -191,15 +192,18 @@ def stitch(results, plan, tolerance=0.0):
     return snap_float32(mesh)
 
 
-def mesh_tiled(field, bounds, voxel, padding, keep, map_fn, tolerance=0.0):
+def mesh_tiled(field, bounds, voxel, padding, keep, map_fn, tolerance=0.0, close=True, surface=None):
     """Mesh `field` block by block. `map_fn(fn, arg_list, need=, gpu=, gpu_need=)` runs the block tasks
     (in parallel when it can). Returns (mesh, blocks computed, blocks in the box); `mesh.metadata`
-    has `nonfinite` and `clipped` as from meshing.field_to_mesh."""
+    has `nonfinite`, `clipped` and `voxel` as from meshing.field_to_mesh. close=False leaves the surface
+    open where it leaves the box (a piece of a body: the editor's detail view); `surface`: the blocks
+    find_surface gave for the same layout, if already known."""
     plan = Plan(field, bounds, voxel, padding)
     gpu = backend.gpu_enabled()
-    done, todo = {}, find_surface(field, plan)
+    done, todo = {}, (find_surface(field, plan) if surface is None else list(surface))
     while todo:
-        tasks = [dict(field=field, plan=plan, blocks=todo[i:i + BATCH], keep=keep, gpu=gpu, tolerance=tolerance)
+        tasks = [dict(field=field, plan=plan, blocks=todo[i:i + BATCH], keep=keep, gpu=gpu, tolerance=tolerance,
+                      close=close)
                  for i in range(0, len(todo), BATCH)]
         for results in map_fn(mesh_blocks, tasks, need=worker_memory(plan, field), gpu=gpu,
                               gpu_need=MESH_GPU_BYTES * mesh_triangles(field)):
@@ -218,6 +222,6 @@ def mesh_tiled(field, bounds, voxel, padding, keep, map_fn, tolerance=0.0):
     clipped = any(r[5][0][a][side] for b, r in done.items() for a in range(3) for side in (0, 1)
                   if b[a] == (0 if side == 0 else plan.blocks[a] - 1))
     nonfinite = sum(r[5][1] for r in done.values())
-    mesh = stitch(done, plan, tolerance)
-    mesh.metadata.update(nonfinite=nonfinite, clipped=clipped)
+    mesh = stitch(done, plan, tolerance, close)
+    mesh.metadata.update(nonfinite=nonfinite, clipped=clipped, voxel=plan.voxel)
     return mesh, computed, plan.count

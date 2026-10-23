@@ -367,10 +367,10 @@ def test_the_node_starts_coarse_and_continues_after_a_stop(box_step, box, monkey
 
     progress = nodes_fea.report_progress
 
-    def stop_at_10(done, total):
+    def stop_at_10(done, total, step=None):
         if done == 10:
             raise Cancelled("stopped")
-        progress(done, total)
+        progress(done, total, step)
 
     monkeypatch.setattr(nodes_fea, "report_progress", stop_at_10)
     with pytest.raises(Cancelled):

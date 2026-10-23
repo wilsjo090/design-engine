@@ -62,14 +62,15 @@ FREE_LAST_RESORT = int(0.75 * 2**30)  # after a stop: end the process if it stay
 _current = threading.local()  # (evaluator, node id) of the node running on this thread
 
 
-def report_progress(done, total):
-    """Called by slow node functions to report progress (and to let a cancel take effect)."""
+def report_progress(done, total, step=None):
+    """Called by slow node functions to report progress (and to let a cancel take effect). `step`:
+    what is being counted (e.g. "iteration"), shown with the numbers."""
     ctx = getattr(_current, "ctx", None)
     if ctx is None:
         return
     evaluator, node_id = ctx
     evaluator._check_cancel()
-    evaluator._emit(type="progress", node=node_id, done=done, total=total)
+    evaluator._emit(type="progress", node=node_id, done=done, total=total, step=step)
 
 
 def check_cancel():
@@ -89,7 +90,7 @@ def parallel_map(fn, arg_list, need=0, gpu=False, title="Blocks", gpu_need=0):
     if ctx is None:
         return [fn(**a) for a in arg_list]
     evaluator, node_id = ctx
-    return evaluator._map_in_workers(node_id, fn, arg_list, need, gpu, title, gpu_need)
+    return evaluator._map_in_workers(node_id, fn, arg_list, need, gpu, title, gpu_need, step=title)
 
 
 def report_view(mesh):
@@ -508,6 +509,7 @@ class Evaluator:
         self.computed = []  # node ids actually computed in the last run
         self.failed = []    # run(keep_going=True): a GraphError per node that failed or has a problem
         self.memory_peak = 0
+        self._notices = set()  # lines already sent this run (_notice)
 
     def cancel(self):
         self._cancel = True
@@ -542,6 +544,15 @@ class Evaluator:
         if level != "info" and self._warnings is not None and len(self._warnings) < self.MAX_WARNINGS:
             if [text, level] not in self._warnings:
                 self._warnings.append([text, level])
+
+    def _notice(self, text, node_id=None):
+        """A line about how the run goes (slowed down to stay within memory) for the log, not the
+        node's card. Each line once per run; safe from the memory watchdog's thread."""
+        if text in self._notices:
+            return
+        self._notices.add(text)
+        self.log(text)
+        self._emit(type="message", text=text, level="info", **({"node": node_id} if node_id else {}))
 
     def _gathered(self, node_id, lines):
         """Report the lines that the items of a list reported, each line once, with how many items
@@ -591,14 +602,14 @@ class Evaluator:
                 # so stop them (they restart on the next parallel step) instead of failing the run.
                 self._pool = None
                 pool.terminate()
-                self.log(f"memory {used / gb:.1f} GB of {limit / gb:.1f} GB: stopped idle worker processes")
+                self._notice(f"Memory {used / gb:.1f} GB of {limit / gb:.1f} GB: stopped idle worker processes")
                 continue
             if tight:
                 ARRAY_CACHE.set_limit(ARRAY_CACHE.max_bytes // 2)  # moves to the SSD cache
                 if self._pool is not None:
                     self._pool.shrink_caches()
                 if not shrunk:
-                    self.log(f"memory {used / gb:.1f} GB of {limit / gb:.1f} GB: freeing caches")
+                    self._notice(f"Memory {used / gb:.1f} GB of {limit / gb:.1f} GB: freeing caches")
                 shrunk = True
             if used > limit or free < FREE_STOP:
                 self._stop_reason = (
@@ -636,6 +647,7 @@ class Evaluator:
         self._cancel = False
         self._stop_reason = None
         self.memory_peak = 0
+        self._notices = set()
         stop = threading.Event()
         watchdog = threading.Thread(target=self._watch_memory, args=(stop,), daemon=True)
         watchdog.start()
@@ -752,7 +764,7 @@ class Evaluator:
         items = self._map_in_workers(node_id, ntype.fn, arg_list, need, uses_gpu, ntype.title)
         return [self._normalise(ntype, r) for r in items]
 
-    def _map_in_workers(self, node_id, fn, arg_list, need, uses_gpu, title, gpu_need=0):
+    def _map_in_workers(self, node_id, fn, arg_list, need, uses_gpu, title, gpu_need=0, step=None):
         # Separate processes: most of the work holds the GIL, so threads barely help. Item i
         # always goes to the same worker, whose caches then stay warm across edits.
         if self.workers <= 1 or len(arg_list) < 2:
@@ -761,7 +773,7 @@ class Evaluator:
                 for i, args in enumerate(arg_list):
                     self._check_cancel()
                     out.append(fn(**args))
-                    self._emit(type="progress", node=node_id, done=i + 1, total=len(arg_list))
+                    self._emit(type="progress", node=node_id, done=i + 1, total=len(arg_list), step=step)
             finally:  # also the lines of the items done before one failed
                 lines, self._collect = self._collect, outer
                 self._gathered(node_id, lines)
@@ -776,21 +788,22 @@ class Evaluator:
             self._pool.gpu = gpu
         active = min(self._parallel_slots(need), self._pool.n)
         if active < self._pool.n:
-            self.log(f"{title}: running {active} at a time to stay within the memory limit")
+            self._notice(f"{title}: running {active} at a time to stay within the memory limit", node_id)
         if gpu and uses_gpu:
             # Each worker that touches the GPU keeps a CUDA context (~0.8 GB of GPU memory with
             # its work): only as many as the card's free memory allows (workers 0..n-1, so the
             # same ones are reused).
             n_gpu = backend.gpu_worker_count(active, running=self._pool.gpu_contexts, extra=gpu_need)
             if n_gpu < active:
-                self.log(f"{title}: {n_gpu} on the GPU at a time (limited by free GPU memory)")
+                self._notice(f"{title}: {n_gpu} on the GPU at a time (limited by free GPU memory)", node_id)
             active = n_gpu
             self._pool.gpu_contexts = max(self._pool.gpu_contexts, active)
         lines = []
         try:
             items = self._pool.map(
                 fn, arg_list, active=active,
-                on_progress=lambda done, total: self._emit(type="progress", node=node_id, done=done, total=total),
+                on_progress=lambda done, total: self._emit(type="progress", node=node_id, done=done, total=total,
+                                                           step=step),
                 should_stop=lambda: self._cancel, lines=lines)
         finally:
             self._gathered(node_id, lines)  # also the lines of the items done before one failed

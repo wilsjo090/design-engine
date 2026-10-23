@@ -259,7 +259,9 @@ block) and record `mesh.metadata` `nonfinite` and `clipped` (the body reaches th
 samples); `nodes._report_mesh` warns about both (not for a Domain or a lattice's own box,
 `fills_box`).
 `core.report_message(text, level)` puts a line in the editor log from inside a node (levels
-info, warning, error). Warnings and errors are kept with the node's cached result and sent with
+info, warning, error); `core.report_progress(done, total, step)` drives the card's and status bar's
+progress (`parallel_map`'s `title` is its step); runs slowed down to stay within memory say so in the
+log (`Evaluator._notice`). Warnings and errors are kept with the node's cached result and sent with
 every `node_done` (`messages`), so the card shows them on cached runs too (the hidden mesher's as
 `viewWarnings`; a group's inner nodes' on the group). In a worker process the lines go back with
 the item's result (`_current.sink`); the same line from many list items is reported once, "(xN)".
@@ -297,7 +299,22 @@ library; a new `@node` function appears in the editor automatically. Heavy per-b
 **Server** (`engine/server.py`): the browser owns the graph and POSTs the whole recipe for every
 run. `build_run_graph` applies preview quality (Draft = voxel ×4, Medium ×2, no decimation except
 Final), adds hidden `mesh.view` nodes for visible implicit bodies and slice jobs for visible plain
-fields (also group nodes). A preview keeps going past a failing node (`Evaluator.run(keep_going=True)`,
+fields (also group nodes). Each view (`ViewSpec`) has a content key (`_content_key`: type and inputs
+of every node it needs, before the quality changed them, no positions) and `exact` (nothing in it
+changes with the quality: no `QUALITY_TYPES` node, not an implicit body, no own colours); a preview
+gets `have` (the editor's views: key, level, version) and leaves out the views it shows with the same
+key at that quality or finer (`kept`; their field colours are redone only for a changed field), so
+refining only recomputes what changed. run_start echoes the editor's `tag` and lists `keep_status`
+(cards that keep their state), `phase` events name the steps after the nodes (views, colours,
+slices), run_done has `shown` (the coarsest quality on screen) and `sharper`; `/api/queue` reports
+the `running` run, so an editor opened during an export shows it. Details (`/api/detail`,
+`Session.detail`, job mode "detail"): the part lo..hi of a shown body meshed finer than its view,
+from the graph of the run that made the view (`view_sources`) plus a hidden `mesh.detail` node
+(`tiles.mesh_tiled(close=False)`: open where it leaves the box, blocks near the surface only, the
+voxel grown to `DETAIL_MAX_BLOCKS`, trimmed to the box); a body's view may go down to
+`DETAIL_MIN_VOXEL`, a Mesh from Implicit Body only to its own voxel (`detail_floor`; view_ready
+carries `voxel` and `floor`). A detail never stops another run (it answers busy) and any preview
+stops it; its cached node_done events are not sent, so the cards keep their state. A preview keeps going past a failing node (`Evaluator.run(keep_going=True)`,
 `Evaluator.failed`): only what needs it is left out, `run_done` lists those nodes (`left_out`) and the
 editor drops their old views and markers (supports picked on the previous STEP file once kept a new part
 from showing at all); exports and optimizations still stop at the first error. Progress streams over `/ws` (events of nodes inside a group are sent as
@@ -315,12 +332,60 @@ history (snapshots include groups and selections); `graphConvert.ts` converts re
 Flow (and a group ↔ its edit view with `groupIn`/`groupOut` nodes). Group specs are built in the
 browser (`groupSpec`). While a group is open, `nodes`/`edges` are its inner graph and the recipe's
 own are in `editing.outer`; `recipe()` composes both. Edits bump `graphVersion`, which triggers a
-debounced (450 ms) preview run. The viewport is three.js / react-three-fiber with Z up (section
+debounced (450 ms) preview run. Refine (`store.refine`; it and the quality are kept in localStorage):
+a change previews at Draft, and when a preview is done and `graphVersion` is still its `tag.version`,
+the store sets `run.next` and `App.useRefine` runs it after `REFINE_DELAY`, up to the chosen quality.
+Then, while the camera rests and nothing runs, `Viewport.DetailProbe` finds each body's part on screen
+(front-facing sampled triangles inside the frustum, `onScreen`) and the voxel that spans
+`PX_PER_VOXEL` pixels there, and asks for a detail when that is `DETAIL_GAIN` finer than the view;
+`store.details` are drawn instead of their view inside their box, both cut per pixel in the shader
+(`useBoxCut`), so they meet exactly; kept while the view's key is the same and they are finer.
+The toolbar's `RunStatus` shows the run kind and level, the running node (progress `step`, the hidden
+view mesher, a group's inner node), the `phase`, view downloads (`loadingViews`), a change waiting
+for an uninterruptible step to stop (`requested`) and, with Auto off, changes not shown yet. The
+toolbar fits the window like the library's tabs (`useToolbarFit`, `data-fit` 0-4: brand and memory
+figures, action button words, quality words, then the status on a row of its own) so the status
+always keeps `STATUS_ROOM`; content changes refit it through a MutationObserver, not ResizeObserver. The node library (`NodeLibrary.tsx`) is a ribbon over the graph: All,
+then the categories in build order (`ORDER`), groups and presets; each opens a panel of tiles (first
+sentence of the doc, input → output type chips without plain settings); a click adds at the canvas
+centre, a drag (`NODE_DRAG_TYPE`) where it is dropped (`NodeEditor` onDrop, `addFromLibrary`); "/"
+focuses its search; tabs drop counts, then names, as the pane narrows (`data-fit`). The viewport is three.js / react-three-fiber with Z up (section
 plane via `clippingPlanes`, variants drawn to the left of the result, check panel). Ball, Bar and Box
 nodes (`fields.ball/bar/box`, exact distances) are drawn by the viewport itself (`Guides.tsx`; the server
 runs them but adds no view, `server.DRAWN_BY_VIEWPORT`), translucent and faintly through the bodies:
 Place (`store.placing`) puts a point in the middle of the wall under a click on a shown body (meshes
 marked `userData.placeable`), the selected one's yellow handles drag in the view's plane.
+Right-click menus in the 3D view (plan and status in docs/VIEWPORT_MENU_PLAN.md): a DOM `contextmenu`
+on the canvas (only when the right button moved ≤ 5 px, since right-drag pans) raycasts the meshes
+tagged `userData.menu = {view}` itself (`MenuProbe`; not R3F events, so a left-drag never raycasts
+big bodies), building their search tree on the first right-click (`ensureBoundsTree`, always
+`indirect: true`: the default build reorders triangles and breaks CAD face numbers), skipping hits
+the section plane cuts away. `viewActions.ts` builds the entries (`faceMenu`, `bodyMenu`,
+`pickingMenu`, `markerMenu`) from the store alone; every action is one `store.applyEdit(GraphEdit)`:
+one undo step, nodes placed next to their anchor without overlapping (`freeSpot`), changed nodes
+flash in the graph (`flash`), a toast lists the changes with Undo (`toast`, `ViewportMenu.tsx`).
+Face data per CAD view is cached in `store.faceData` (`api.loadFaces`, by view version) for picking
+and menus; `api.loadFaceInfo` (`/api/faceinfo`, `facemask.face_info`) gives a face's surface type
+and size. New supports and loads link to the source the body's face nodes already use (a Pick Body
+of that body before Import STEP; a new Pick Body in the same edit when other bodies of the list have
+one) and are appended to its supports-and-loads chain (`add_to` from the tail, the tail's consumers
+relinked to the new node); deleting one from its marker splices the chain back. Support and load
+arrows carry invisible hit balls (`userData.menu.marker`; markers list the CAD face and body of
+each point, `faces` / `bodies`). After adding a load, `store.quickEdit` opens `QuickEdit.tsx` at the
+cursor (inputs per node type in `QUICK_INPUTS`; Shift on the menu item skips it). On an implicit
+body or mesh the face menu acts on the CAD face under the click: `/api/face_at` walks the last run's
+graph (`Session.view_sources`, `cad_sources`) up to the first `cad` outputs and finds the nearest
+face (`facemask.nearest_face`, bodies ranked by box distance, trees in an LRU of ~2M triangles).
+Slices (`userData.menu.slice`) and frame bars (`userData.menu.bar`, instance = bar piece) have their
+own menus. A still left-click (≤ 4 px, no modifier, not picking or placing; objects with their own
+R3F click handlers, like the load arrow's handles and guide shapes, keep their clicks) selects,
+flashes and pans to the node that made what is under the cursor: a marker's, slice's or bar's node,
+and for a body `/api/node_at` (`engine/creator.py`: walks up from what the view shows, following
+`implicit` inputs whose surface also passes through the point, within max(`tol`, 1.5 × the node's
+own value there); where none does, that node made the surface: an Offset Body's bump, a Hole
+Pattern's hole wall, the CAD node for a plain face). `tol` is a quarter of the clicked triangle's
+longest edge: the whole edge (a Draft edge is as long as a 1 mm bump is high) sent every stud click
+to the CAD node. The axis gizmo's corner (`GIZMO_MARGIN`, its own scene) never selects.
 
 **Recipes** (`recipes/*.json`): `{"version": 1, "nodes": {id: {"type", "inputs", "pos",
 "visible"}}}`; an input is a literal or `{"link": "node.port"}`. Unknown keys are preserved, so

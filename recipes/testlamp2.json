@@ -14,14 +14,11 @@
     "mesh": {
       "type": "mesh.from_implicit",
       "inputs": {
-        "voxel": 0.2,
-        "body": {
-          "link": "offset_3.out"
-        }
+        "voxel": 0.2
       },
       "pos": [
-        1684,
-        -1057
+        2672,
+        -706
       ],
       "visible": true
     },
@@ -34,8 +31,8 @@
         }
       },
       "pos": [
-        2164,
-        -582
+        4028,
+        -814
       ]
     },
     "voronoi_1": {
@@ -288,6 +285,63 @@
       "pos": [
         269,
         -1481
+      ]
+    },
+    "holes_1": {
+      "type": "pattern.holes",
+      "inputs": {
+        "faces": "8",
+        "shape": "voronoi",
+        "randomness": 0.99,
+        "size": 5.59,
+        "cad": {
+          "link": "import.bodies"
+        },
+        "depth": {
+          "link": "face_mask_2.out"
+        }
+      },
+      "pos": [
+        1373,
+        729
+      ]
+    },
+    "offset_1": {
+      "type": "implicit.offset",
+      "inputs": {},
+      "pos": [
+        2440,
+        420
+      ]
+    },
+    "subtract_1": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {
+          "link": "offset_3.out"
+        },
+        "b": {
+          "link": "holes_1.out"
+        }
+      },
+      "pos": [
+        2003,
+        -279
+      ],
+      "visible": true
+    },
+    "face_mask_2": {
+      "type": "field.face_mask",
+      "inputs": {
+        "faces": "8",
+        "fade": 23.6,
+        "cad": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        828,
+        1128
       ]
     }
   }
