@@ -4,24 +4,11 @@
     "import": {
       "type": "input.import_step",
       "inputs": {
-        "path": "samples/wall_bracket_space.step"
+        "path": "parts/nyckellada.STEP"
       },
       "pos": [
-        0,
-        0
-      ]
-    },
-    "space": {
-      "type": "input.pick_body",
-      "inputs": {
-        "bodies": {
-          "link": "import.bodies"
-        },
-        "index": 0
-      },
-      "pos": [
-        300,
-        0
+        -292,
+        2
       ]
     },
     "petg": {
@@ -37,56 +24,108 @@
     "wall": {
       "type": "sim.fixed",
       "inputs": {
+        "faces": "83",
         "cad": {
-          "link": "space.body"
+          "link": "import.bodies"
         },
-        "faces": "0"
+        "add_to": {
+          "link": "load_3.conditions"
+        }
       },
       "pos": [
-        620,
-        120
+        220,
+        137
       ]
     },
     "hang": {
       "type": "sim.load",
       "inputs": {
-        "cad": {
-          "link": "space.body"
-        },
-        "faces": "6",
+        "faces": "15, 16, 17, 18, 19, 20, 37, 38, 39, 40, 41, 58, 59, 60, 61, 62, 78, 79, 80, 81",
         "kind": "bearing",
-        "amount": 200.0,
-        "direction": "-Z",
+        "amount": 200,
+        "direction": "-Y",
         "add_to": {
           "link": "wall.conditions"
+        },
+        "cad": {
+          "link": "import.bodies"
         }
       },
       "pos": [
-        940,
-        120
+        624,
+        -374
       ]
     },
-    "topology": {
+    "topology_1": {
       "type": "sim.topology",
       "inputs": {
+        "min_thickness": 3,
+        "max_thickness": 15,
+        "members": "struts only",
+        "detail": "medium",
         "space": {
-          "link": "space.body"
+          "link": "import.bodies"
         },
         "material": {
           "link": "petg.material"
         },
         "conditions": {
           "link": "hang.conditions"
-        },
-        "keep": 25.0,
-        "skin": 2.0,
-        "detail": "draft"
+        }
       },
       "pos": [
-        1260,
-        0
+        1619,
+        -140
       ],
       "visible": true
+    },
+    "load_1": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "64",
+        "direction": "+X",
+        "cad": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        233,
+        -1216
+      ]
+    },
+    "load_2": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "43, 64",
+        "direction": "-Z",
+        "cad": {
+          "link": "import.bodies"
+        },
+        "add_to": {
+          "link": "load_1.conditions"
+        }
+      },
+      "pos": [
+        718,
+        -1161
+      ]
+    },
+    "load_3": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "22, 43, 64",
+        "direction": "custom",
+        "cad": {
+          "link": "import.bodies"
+        },
+        "add_to": {
+          "link": "load_2.conditions"
+        }
+      },
+      "pos": [
+        948,
+        -761
+      ]
     }
   }
 }
