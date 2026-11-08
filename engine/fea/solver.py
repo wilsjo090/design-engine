@@ -16,6 +16,7 @@ the Galerkin operator of the fixed (masked) fine one, so the V-cycle is symmetri
 definite, as conjugate gradients needs. The answer is always that of the exact fine operator.
 """
 import math
+import os
 
 import numpy as np
 import scipy.sparse as sp
@@ -33,6 +34,12 @@ SLAB_BYTES_GPU = 256 * 2**20
 
 def slab_bytes(xp):
     return SLAB_BYTES if xp is np else SLAB_BYTES_GPU
+
+
+# On the GPU, products, smoothing steps and the V-cycle's transfers (and topology's OC update) run as
+# fused Warp kernels (engine/fea/gpu.py: one launch each instead of dozens of CuPy ones; wall bracket
+# topology 4.5-5.7x faster per iteration). False (or DESIGN_ENGINE_FEA_KERNELS=0): the CuPy code below.
+GPU_KERNELS = os.environ.get("DESIGN_ENGINE_FEA_KERNELS", "1") not in ("0", "false", "off")
 # Smoothing: Chebyshev polynomials of the Jacobi-preconditioned operator D^-1 K, aimed at its
 # eigenvalues from lmax / EIG_RATIO to lmax. Plain damped Jacobi diverged where stiff and soft
 # material meet: lmax rose from 3.1 (uniform part) to 4.2-4.9 (1 : 1e6 contrast), so a damping
@@ -60,7 +67,11 @@ DENSE_FILL = 0.5         # levels at least this full go in slabs of the whole gr
 
 
 class NotConverged(RuntimeError):
-    pass
+    """A solve that stopped short; `u`, `iterations` and `residual` say how far it got."""
+
+    def __init__(self, message, u=None, iterations=0, residual=math.inf):
+        super().__init__(message)
+        self.u, self.iterations, self.residual = u, iterations, residual
 
 
 def node_shape(shape):
@@ -225,10 +236,21 @@ class Level:
         self.inv_diag = None
         self.lmax = None      # largest eigenvalue of D^-1 K (an upper estimate), for smoothing
         self.direct = None    # coarsest level: solves exactly
+        self._gpu = None      # GPU kernels' data (gpu.LevelKernels), made on first use
 
     @property
     def nodes(self):
         return node_shape(self.shape)
+
+    def _fused(self, a):
+        """Whether work on arrays like `a` goes to the fused GPU kernels."""
+        return GPU_KERNELS and self.xp is not np and a.dtype == self.per.dtype
+
+    def kernels(self):
+        if self._gpu is None:
+            from .gpu import LevelKernels
+            self._gpu = LevelKernels(self)
+        return self._gpu
 
     def with_data(self, per_full, const):
         """A copy of this level with other element data (e.g. float64), sharing cells and nodes."""
@@ -239,6 +261,7 @@ class Level:
         level.const = const
         if self.kind == "children":
             level.const_wide = self.xp.ascontiguousarray(const.transpose(1, 0, 2).reshape(24, -1))
+        level._gpu = None
         return level
 
     def full(self):
@@ -294,6 +317,8 @@ class Level:
     def apply(self, u, masked=True, out=None):
         """K u (masked: only the free DOFs, and u is taken as 0 on the others), into `out` if given
         (a C-ordered array of u's shape and type)."""
+        if self._fused(u):
+            return self.kernels().apply(u, out, masked)
         # C order: `u` may be a transposed view (prolong), and zeros_like would copy its layout, so
         # the flat view written to below would be a copy (the element path then returned zeros)
         if out is None:
@@ -393,6 +418,13 @@ class Level:
         theta, delta = (beta + alpha) / 2, (beta - alpha) / 2
         sigma = theta / delta
         rho = 1 / sigma
+        if self._fused(r):   # the same steps as below, each one kernel
+            steps = []
+            for _ in range(DEGREE - 1):
+                rho_new = 1 / (2 * sigma - rho)
+                steps.append((rho_new * rho, 2 * rho_new / delta))
+                rho = rho_new
+            return self.kernels().smooth(r, x, (theta, steps))
         if x is None:
             res = r.copy()
         else:
@@ -417,9 +449,8 @@ class Level:
         return x
 
 
-def _direct_solver(level, dtype):
-    """Factorize the level's free part with scipy; returns r -> K^-1 r."""
-    xp = level.xp
+def _assemble(level):
+    """(the level's stiffness matrix on its free DOFs, CSC, on the host; their numbers among all DOFs)."""
     conn, Ke = level.cell_matrices()
     dofs = (3 * conn[:, :, None] + np.arange(3)).reshape(-1, 24)
     n = int(np.prod(level.nodes)) * 3
@@ -427,15 +458,37 @@ def _direct_solver(level, dtype):
     cols = np.broadcast_to(dofs[:, None, :], Ke.shape).ravel()
     A = sp.coo_matrix((Ke.ravel(), (rows, cols)), shape=(n, n)).tocsr()
     free = np.flatnonzero(to_host(level.free).ravel() > 0)
+    return A[free][:, free].tocsc(), free
+
+
+def _factorize(A, symmetric=False):
+    """SuperLU of A. symmetric: no off-diagonal pivots (SymmetricMode), as a symmetric positive definite
+    matrix allows: a strut web's coarse level of 23k unknowns took 0.2 s so, and was not done after 10
+    minutes with SuperLU's own partial pivoting (a solid block's 20k: 1.0 s)."""
+    pivots = dict(diag_pivot_thresh=0.0, options=dict(SymmetricMode=True)) if symmetric else {}
+    # minimum degree on A + A^T suits a symmetric matrix: 3x faster than the default on a thin grid
+    return splu(A, permc_spec="MMD_AT_PLUS_A", **pivots)
+
+
+def _fill(lu):
+    return lu.L.nnz + lu.U.nnz
+
+
+def _direct_solver(level, dtype, symmetric=False, made=None):
+    """Factorize the level's free part with scipy (`made`: its (matrix, free DOFs, LU) when that is done
+    already); returns r -> K^-1 r. symmetric: see _factorize."""
+    xp, nodes = level.xp, level.nodes   # (solve must not refer to the level: it keeps solve, and the
+    A, free, lu = made if made is not None else (*_assemble(level), None)   # cycle held each hierarchy's
+    n = int(np.prod(nodes)) * 3                                             # coarsest level and LU until gc ran)
     if len(free) == 0:
         return lambda r: xp.zeros_like(r)
-    # minimum degree on A + A^T suits a symmetric matrix: 3x faster than the default on a thin grid
-    lu = splu(A[free][:, free].tocsc(), permc_spec="MMD_AT_PLUS_A")
+    lu = _factorize(A, symmetric) if lu is None else lu
+    del A
 
     def solve(r):
         x = np.zeros(n)
         x[free] = lu.solve(np.asarray(to_host(r), dtype=np.float64).ravel()[free])
-        return xp.asarray(x.reshape(level.nodes + (3,)), dtype=dtype)
+        return xp.asarray(x.reshape(nodes + (3,)), dtype=dtype)
     return solve
 
 
@@ -446,9 +499,11 @@ class Hierarchy:
     matrix; fixed: (X, Y, Z, 3) bool; coarsenings: how often each axis is halved (its element count
     must be divisible by 2 that often). power: None, or the `power` of a hierarchy of a similar
     operator on the same grid (its lmax estimates start from those vectors; [] = from random ones):
-    `self.power` then holds this one's vectors for the next."""
+    `self.power` then holds this one's vectors for the next. direct_fill: the coarsest level is the finest
+    one whose factorization (without pivots) is predicted to keep at most this many nonzeros (_finest_direct;
+    static analysis); 0 = the last of `coarsenings` (topology, which factorizes every iteration)."""
 
-    def __init__(self, scale, KE, fixed, coarsenings, xp=np, dtype=np.float64, power=None):
+    def __init__(self, scale, KE, fixed, coarsenings, xp=np, dtype=np.float64, power=None, direct_fill=0):
         self.xp, self.dtype = xp, dtype
         shape = tuple(int(n) for n in scale.shape)
         for n, k in zip(shape, coarsenings):
@@ -489,6 +544,11 @@ class Hierarchy:
             has = d > DIAG_EPS * max(dmax, 1e-300)
             level.free = (has & xp.asarray(~fx)).astype(dtype)
             level.inv_diag = xp.where(level.free > 0, 1.0 / xp.where(has, d, 1.0), 0.0).astype(dtype)
+        if direct_fill:
+            k, made = self._finest_direct(direct_fill)
+            del self.levels[k + 1:]
+            self.levels[k].direct = _direct_solver(self.levels[k], dtype, True, made)
+            del made
         smoothed = self.levels[:-1]
         start = list(power or ())
         if len(start) != len(smoothed) or any(v.shape != level.nodes + (3,) for v, level in zip(start, smoothed)):
@@ -498,10 +558,36 @@ class Hierarchy:
             level.lmax, v = level.estimate_lmax(dtype, start=v0)
             if self.power is not None:
                 self.power.append(v)
-        self.levels[-1].direct = _direct_solver(self.levels[-1], dtype)
+        if not direct_fill:
+            self.levels[-1].direct = _direct_solver(self.levels[-1], dtype)
         # the exact operator for float32 solves (only the fine level, in float64)
         self.exact = None if dtype == np.float64 else self.levels[0].with_data(
             xp.asarray(scale_exact, dtype=np.float64), xp.asarray(KE, dtype=np.float64))
+
+    def _finest_direct(self, budget):
+        """(level number, its (matrix, free DOFs, LU)): the finest level whose factorization keeps at most
+        about `budget` nonzeros. From the coarsest up, the next finer level is factorized instead while its
+        fill is predicted to stay within it: the last matrix's nonzeros scaled by the unknowns, times the
+        last fill ratio, grown as it grew from the level before. The fill depends on the shape, not on the
+        unknowns: a strut web's 86k unknowns kept 18M nonzeros (1.2 s), a solid block's 121k 200M (44 s,
+        1.6 GB); their fill ratios grew 1.0-1.3x and 2.75x a level (FINDINGS, "The result's check").
+        Coarse levels whose elements are wider than a part's members cannot bend them: that web took 154
+        iterations with its grid's 4 levels, 28 with 1."""
+        k = len(self.levels) - 1
+        A, free = _assemble(self.levels[k])
+        if not len(free):
+            return k, (A, free, None)
+        lu = _factorize(A, symmetric=True)
+        ratio, growth = _fill(lu) / max(A.nnz, 1), 1.0
+        while k > 0:
+            unknowns = float(self.levels[k - 1].free.sum())
+            if A.nnz * unknowns / len(free) * ratio * growth > budget:
+                break
+            A, free = _assemble(self.levels[k - 1])
+            lu = _factorize(A, symmetric=True)
+            growth, ratio = _fill(lu) / max(A.nnz, 1) / ratio, _fill(lu) / max(A.nnz, 1)
+            k -= 1
+        return k, (A, free, lu)
 
     @property
     def free(self):
@@ -514,6 +600,12 @@ class Hierarchy:
         level = self.levels[depth]
         if level.direct is not None:
             return level.direct(r)
+        if level._fused(r):   # the same V-cycle in fused kernels (residual, restriction, correction)
+            kernels = level.kernels()
+            x = level.smooth(r)
+            rc = kernels.restrict(kernels.residual(x, r), self.levels[depth + 1])
+            kernels.prolong_add(self._vcycle(depth + 1, rc), x)
+            return level.smooth(r, x)
         x = level.smooth(r)
         res = level.apply(x)
         self.xp.subtract(r, res, out=res)
@@ -579,4 +671,4 @@ class Hierarchy:
             beta = (rz - dot(r, z_old)) / rz_old if self.exact is not None else rz / rz_old
             p *= beta
             p += z
-        raise NotConverged(f"the solver did not converge (residual {res:.1e} after {maxiter} iterations)")
+        raise NotConverged(f"the solver did not converge (residual {res:.1e} after {maxiter} iterations)", u, maxiter, res)

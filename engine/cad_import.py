@@ -19,8 +19,10 @@ from OCP.TopoDS import TopoDS, TopoDS_Face
 from .meshing import signed_volume
 
 
-def load_step(path):
-    """Read a STEP file and return the list of solid bodies it contains (units: mm)."""
+def load_step(path, names=False):
+    """Read a STEP file and return the list of solid bodies it contains (units: mm). With `names`, also
+    each body's name in the file ("" when it has none): SolidWorks writes the body's name from its Solid
+    Bodies folder there ("Fillet9", "CirPattern1[3]")."""
     reader = STEPControl_Reader()
     if reader.ReadFile(str(Path(path))) != IFSelect_RetDone:
         raise IOError(f"Could not read STEP file: {path}")
@@ -34,7 +36,15 @@ def load_step(path):
         exp.Next()
     if not bodies:
         raise ValueError(f"No solid bodies found in {path}")
-    return bodies
+    if not names:
+        return bodies
+    found = reader.WS().TransferReader()
+    titles = []
+    for body in bodies:
+        entity = found.EntityFromShapeResult(body, 1)  # the STEP item the body came from (its own name)
+        name = entity.Name() if entity is not None and hasattr(entity, "Name") else None
+        titles.append(name.ToCString().strip() if name is not None else "")
+    return bodies, titles
 
 
 def tessellate(body, tolerance=0.01, angular_tolerance=0.1, check=None):

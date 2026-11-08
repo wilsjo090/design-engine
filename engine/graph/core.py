@@ -41,22 +41,29 @@ import os
 import re
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from .. import backend
-from ..cache import available_memory, memory_limit, psutil
+from ..cache import (COMMIT_LAST_RESORT, COMMIT_STOP, COMMIT_TIGHT, available_memory, commit_room, memory_limit,
+                     memory_room, psutil, ram_cache_budget, refresh_memory_limit)
 from .workers import StickyPool
 
 REQUIRED = object()
 
-# Free RAM (whole PC) at which the memory watchdog acts. Generous on purpose: this PC's page file
-# is on a mechanical hard disk, and once Windows starts paging to it the whole machine freezes
-# (that happened with ~1 GB still "free"), long before memory is actually exhausted.
-FREE_TIGHT = 3 * 2**30        # free caches, stop idle worker processes
-FREE_STOP = int(1.5 * 2**30)  # stop the run
-FREE_LAST_RESORT = int(0.75 * 2**30)  # after a stop: end the process if it stays this low
+# Free RAM (whole PC) at which the memory watchdog acts. With the page file on a mechanical hard disk
+# the PC froze long before memory ran out (with ~1 GB still "free"), so runs stopped at 1.5 GB free.
+# Since 2026-10-24 it is on the NVMe SSD: 13 minutes with ~0 GB free stayed responsive, and other
+# programs' idle memory went to it at 0.6-1.3 GB/s without slowing anything (FINDINGS, "The PC freeze").
+# So low free RAM only frees caches; runs stop on the commit room (cache.COMMIT_*) and the limit, which
+# keeps the engine's own data in RAM (31.5 GB read back from the page file took 4-9 minutes). Free RAM
+# that stays near 0 means Windows cannot page out fast enough for what is asked of it: then it stops.
+FREE_TIGHT = int(1.5 * 2**30)  # free caches, stop idle worker processes
+FREE_STOP = int(0.25 * 2**30)  # stop the run when free RAM stays under this ...
+STARVED_SECONDS = 30           # ... for this long
+LAST_RESORT_SECONDS = 30       # after a stop: end the process if commit stays under COMMIT_LAST_RESORT this long
 
 
 _current = threading.local()  # (evaluator, node id) of the node running on this thread
@@ -73,6 +80,15 @@ def report_progress(done, total, step=None):
     evaluator._emit(type="progress", node=node_id, done=done, total=total, step=step)
 
 
+def report_finished(text):
+    """Called by an optimizing node whose saved result has nothing left to do with these settings, as soon as
+    it knows: the card says why at once, not when the result is built (minutes), and offers no Optimize.
+    Its first output's `finished` says the same for runs that read the cached node."""
+    ctx = getattr(_current, "ctx", None)
+    if ctx is not None:
+        ctx[0]._emit(type="finished", node=ctx[1], text=text)
+
+
 def check_cancel():
     """Called inside long node functions: raises Cancelled once the run is cancelled."""
     ctx = getattr(_current, "ctx", None)
@@ -80,17 +96,19 @@ def check_cancel():
         ctx[0]._check_cancel()
 
 
-def parallel_map(fn, arg_list, need=0, gpu=False, title="Blocks", gpu_need=0):
+def parallel_map(fn, arg_list, need=0, gpu=False, title="Blocks", gpu_need=0, parts=None):
     """Run fn(**args) for every item, in the evaluator's worker processes when called by a node
     running in the main process (one big body split into pieces); one by one inside a worker or
     outside a run. `need`: bytes one item needs (limits how many run at once); `gpu`: the items
     use the GPU (limits how many run at once by free GPU memory, `gpu_need` = extra GPU bytes per
-    worker)."""
+    worker). `parts`: the node's output (a port name) is the list of the results, in order: each is
+    passed on as it comes (Evaluator.on_item; the 3D view shows them before the last is done)."""
     ctx = getattr(_current, "ctx", None)
     if ctx is None:
         return [fn(**a) for a in arg_list]
     evaluator, node_id = ctx
-    return evaluator._map_in_workers(node_id, fn, arg_list, need, gpu, title, gpu_need, step=title)
+    return evaluator._map_in_workers(node_id, fn, arg_list, need, gpu, title, gpu_need, step=title,
+                                     parts=(lambda value: {parts: value}) if parts else None)
 
 
 def report_view(mesh):
@@ -101,6 +119,16 @@ def report_view(mesh):
         return
     evaluator, node_id = ctx
     evaluator._emit(type="live_view", node=node_id, mesh=mesh)
+
+
+def report_frame(view):
+    """Called by Frame Optimization while it works: the frame as it is now (`nodes_frame.frame_view`
+    plus a `stage`), drawn in the 3D view in place of the node's bars until its result comes."""
+    ctx = getattr(_current, "ctx", None)
+    if ctx is None:
+        return
+    evaluator, node_id = ctx
+    evaluator._emit(type="live_frame", node=node_id, frame=view)
 
 
 def report_message(text, level="info"):
@@ -115,6 +143,15 @@ def report_message(text, level="info"):
         return
     evaluator, node_id = ctx
     evaluator._message(node_id, text, level)
+
+
+def stop_idle_workers():
+    """Called by a node running in the main process that needs memory the run's idle worker processes
+    hold (RAM, and on the GPU a CUDA context and cached meshes each): stops them, as the memory
+    watchdog does when memory is tight; they start again on the next parallel step, their results are
+    in the SSD cache. Returns whether any were stopped (False in a worker or outside a run)."""
+    ctx = getattr(_current, "ctx", None)
+    return ctx is not None and ctx[0]._stop_idle_workers()
 
 # Which output types may feed which input types. Scalar fields and implicit bodies are the
 # same thing underneath (a body can drive math too), so they connect both ways.
@@ -163,6 +200,19 @@ class Port:
     many: bool = False     # receive a whole Many instead of mapping over it
     optional: bool = False # may be left unconnected (value None)
     hidden: bool = False   # set by the server, not shown in the editor (Topology Optimization's compute)
+    # The editor shows the input only while it applies: {other input: [values]} (every one must hold), or
+    # a list of such dicts (any one may hold). A linked input, or one whose other input is linked, shows.
+    when: Any = None
+    advanced: bool = False # tucked under the card's "more" row while it has its default and no link
+    # Shown in the editor's number field: "mm", or {other input: {its value: unit}} (a Load's Amount).
+    unit: Any = None
+    zero: str = None       # what 0 means, shown in place of it ("auto", "no limit", "sharp")
+    slider: tuple = None   # (low, high): the usual values, a slider under the field (typing may go beyond)
+    # A list in the editor to choose the value from: "body" (an int: which item of the node's first cad input,
+    # /api/bodies), "font" (a font file in the Windows Fonts folder, /api/fonts). (Int inputs named seed get a
+    # dice button in the editor without it.)
+    pick: str = None
+    switch: bool = False   # an int that is 1 or 0: shown as an on/off switch
 
     def __post_init__(self):
         self.label = self.label or self.name.replace("_", " ").title()
@@ -171,7 +221,8 @@ class Port:
         d = {"name": self.name, "type": self.type, "label": self.label}
         if self.default is not REQUIRED:
             d["default"] = self.default
-        for k in ("doc", "choices", "many", "optional", "hidden"):
+        for k in ("doc", "choices", "many", "optional", "hidden", "when", "advanced", "unit", "zero", "slider", "pick",
+                  "switch"):
             if getattr(self, k):
                 d[k] = getattr(self, k)
         return d
@@ -192,6 +243,7 @@ class NodeType:
     estimate: Callable = None  # kwargs -> bytes one call needs (limits how many run in parallel)
     paint: str = None          # output (a field) that colours the node's own body in the 3D view
     preview: bool = False      # evaluated in every preview once its inputs are linked (shows markers)
+    numeric: bool = False      # Math: its scalar output is a plain number when every scalar input is one
 
     def input(self, name):
         for p in self.inputs:
@@ -206,22 +258,25 @@ class NodeType:
         raise GraphError(f"{self.type_id} has no output '{name}'")
 
     def describe(self):
-        return {"type": self.type_id, "title": self.title, "category": self.category, "doc": self.doc,
-                "inputs": [p.describe() for p in self.inputs],
-                "outputs": [p.describe() for p in self.outputs]}
+        d = {"type": self.type_id, "title": self.title, "category": self.category, "doc": self.doc,
+             "inputs": [p.describe() for p in self.inputs],
+             "outputs": [p.describe() for p in self.outputs]}
+        if self.numeric:
+            d["numeric"] = True
+        return d
 
 
 REGISTRY: dict = {}
 
 
 def node(type_id, title, category, inputs, outputs, doc="", parallel=False, side_effect=False, hidden=False,
-         estimate=None, paint=None, preview=False):
+         estimate=None, paint=None, preview=False, numeric=False):
     """Register a function as a node type. The function receives inputs as keyword arguments
     and returns a dict of outputs, or a single value when the node has one output."""
     def register(fn):
         REGISTRY[type_id] = NodeType(type_id, title, category, inputs, outputs, fn,
                                      doc or (fn.__doc__ or "").strip(), parallel, side_effect, hidden, estimate,
-                                     paint, preview)
+                                     paint, preview, numeric)
         return fn
     return register
 
@@ -324,12 +379,50 @@ def _resolve_selections(nodes, selections):
                 inputs[port.name] = _SELECTION_NAME.sub(lambda m: str(selections.get(m.group(0), m.group(0))), value)
 
 
+def bypass_input(spec):
+    """The input a bypassed node passes on: its first linked input of the same type as its first
+    output (an Offset Body's body, a Multiply's A), as (input name, output name), or None."""
+    ntype = REGISTRY.get(spec.get("type"))
+    if ntype is None or not ntype.outputs:
+        return None
+    out = ntype.outputs[0]
+    for port in ntype.inputs:
+        if port.type == out.type and _is_link(spec.get("inputs", {}).get(port.name)):
+            return port.name, out.name
+    return None
+
+
+def _apply_bypass(nodes):
+    """Nodes marked "bypass": true pass that input straight on (see bypass_input): every link to
+    their first output is replaced by the link into that input, following chains of bypassed nodes.
+    The nodes stay (their other outputs still work). Returns {"node.output": "source.port"}."""
+    through = {}
+    for node_id, spec in nodes.items():
+        found = bypass_input(spec) if spec.get("bypass") else None
+        if found:
+            through[f"{node_id}.{found[1]}"] = spec["inputs"][found[0]]["link"]
+
+    def resolve(ref):
+        seen = set()
+        while ref in through and ref not in seen:
+            seen.add(ref)
+            ref = through[ref]
+        return ref
+
+    for spec in nodes.values():
+        for port, value in spec.get("inputs", {}).items():
+            if _is_link(value) and value["link"] in through:
+                spec["inputs"][port] = link(resolve(value["link"]))
+    return {ref: resolve(ref) for ref in through}
+
+
 @dataclass
 class Graph:
     nodes: dict = field(default_factory=dict)
     aliases: dict = field(default_factory=dict)  # "<group node>.<output>" -> "<inner node>.<port>"
     groups: dict = field(default_factory=dict)   # group node id -> [(output name, type)]
     owners: dict = field(default_factory=dict)   # node id inside a group -> the (top level) group node
+    bypassed: dict = field(default_factory=dict)  # "<bypassed node>.<output>" -> "<source>.<port>" it passes on
 
     # construction ----------------------------------------------------------------------
     def add(self, node_id, type_id, **inputs):
@@ -360,9 +453,11 @@ class Graph:
                 if _is_link(value) and value["link"] in aliases:
                     spec["inputs"][port] = link(_resolve_alias(value["link"], aliases))
         _resolve_selections(nodes, data.get("selections") or {})
+        bypassed = _apply_bypass(nodes)
         owners = {n: n.split(GROUP_SEP, 1)[0] for n in nodes if n not in top and n.split(GROUP_SEP, 1)[0] in outputs}
-        aliases = {ref: _resolve_alias(ref, aliases) for ref in aliases if ref.split(".", 1)[0] in outputs}
-        return cls(nodes, aliases, {n: o for n, o in outputs.items() if n in top}, owners)
+        aliases = {ref: bypassed.get(r, r) for ref in aliases if ref.split(".", 1)[0] in outputs
+                   for r in [_resolve_alias(ref, aliases)]}
+        return cls(nodes, aliases, {n: o for n, o in outputs.items() if n in top}, owners, bypassed)
 
     def save(self, path):
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
@@ -429,6 +524,12 @@ class Graph:
                         problems.append((node_id, f"{name}: {err}"))
                         continue
                     if out.type not in _COMPATIBLE.get(port.type, {port.type}):
+                        if out.type == "scalar" and "number" in _COMPATIBLE.get(port.type, ()) \
+                                and REGISTRY[src["type"]].numeric:
+                            if not self.gives_number(src_id):
+                                problems.append((node_id, f"{port.label} needs a plain number, but '{src_id}' "
+                                                          f"gives a field (one of its inputs varies with position)"))
+                            continue
                         problems.append((node_id, f"{name}: cannot connect {out.type} output "
                                                   f"'{value['link']}' to {port.type} input"))
             for port in ntype.inputs:
@@ -439,6 +540,29 @@ class Graph:
         except GraphError as err:
             problems.append((None, str(err)))
         return problems
+
+    def gives_number(self, node_id, _seen=None):
+        """Whether a Math node's output is a plain number: every scalar input a literal or a number
+        (a Number node, or Math that gives one). Such a node can drive number inputs (a Voxel size)."""
+        path = _seen if _seen is not None else set()  # the nodes being checked further down (a cycle)
+        spec = self.nodes.get(node_id) or {}
+        ntype = REGISTRY.get(spec.get("type"))
+        if node_id in path or ntype is None or not ntype.numeric:
+            return False
+        path.add(node_id)
+        try:
+            for port in ntype.inputs:
+                value = spec.get("inputs", {}).get(port.name)
+                if port.type != "scalar" or not _is_link(value):
+                    continue
+                src_id, src_port = _split(value["link"])
+                src = REGISTRY.get((self.nodes.get(src_id) or {}).get("type"))
+                out = next((p.type for p in src.outputs if p.name == src_port), None) if src else None
+                if out not in ("number", "int") and not (out == "scalar" and self.gives_number(src_id, path)):
+                    return False
+            return True
+        finally:
+            path.discard(node_id)
 
     def validate(self, node_ids=None):
         """Raise GraphError listing every problem found."""
@@ -468,16 +592,21 @@ def _output_range(outputs):
 
 def _output_extras(outputs):
     """Extra node_done fields from a node's first output: `markers` (supports and loads to draw in
-    the 3D view; a list for a list of values), `note` (a line shown on the node's card) and `frames`
-    (a frame's bars for the editor's frame view)."""
+    the 3D view; a list for a list of values), `note` (a line shown on the node's card: a list's
+    own, else its first item's), `frames`
+    (a frame's bars for the editor's frame view), `ground` (a frame's candidate nodes, Show:
+    candidate nodes) and `finished` (see report_finished)."""
     if not outputs:
         return {}
     value = next(iter(outputs.values()))
     items = value if isinstance(value, list) else [value]
     found = [m for v in items if (m := getattr(v, "markers", None))]
-    notes = [n for v in items if (n := getattr(v, "note", None))]
+    notes = [n for v in ([value] if isinstance(value, list) else []) + items if (n := getattr(v, "note", None))]
     frames = [f for v in items if (f := getattr(v, "frame_view", None))]
-    return {"markers": found or None, "note": notes[0] if notes else None, "frames": frames or None}
+    grounds = [g for v in items if (g := getattr(v, "ground_view", None))]
+    finished = [f for v in items if (f := getattr(v, "finished", None))]
+    return {"markers": found or None, "note": notes[0] if notes else None, "frames": frames or None,
+            "ground": grounds[0] if grounds else None, "finished": finished[0] if finished else None}
 
 
 def _literal_signature(port, value):
@@ -493,6 +622,9 @@ class Evaluator:
     `on_event` receives dicts while running: node_start, node_done (with time and cached),
     node_error, and progress (done/total while mapping over a list). `cancel()` may be called
     from another thread; the run stops at the next node or list item with `Cancelled`.
+    `on_result(node_id, outputs)` gets each node's outputs as soon as they are there (also cached
+    ones), `on_item(node_id, index, total, outputs)` each item of a node's output list as it comes
+    (a node mapped over a list, or `parallel_map(parts=)`): the server shows them before the run ends.
     """
 
     def __init__(self, graph, workers=4, log=print, on_event=None):
@@ -500,12 +632,15 @@ class Evaluator:
         self.workers = workers
         self.log = log or (lambda *_: None)
         self.on_event = on_event
-        self._cache = {}  # node id -> (signature, outputs, warnings)
+        self.on_result = None
+        self.on_item = None
+        self._cache = {}  # node id -> (signature, outputs, warnings, node type)
         self._warnings = None  # warnings and errors reported by the node being computed
         self._collect = None   # lines of a list's items, gathered to report each line once
         self._cancel = False
         self._stop_reason = None  # set when the memory watchdog stops a run
         self._pool = None  # worker processes, kept alive so later runs start instantly
+        self._pool_lock = threading.Lock()  # (the watchdog's thread and a node may both stop them)
         self.computed = []  # node ids actually computed in the last run
         self.failed = []    # run(keep_going=True): a GraphError per node that failed or has a problem
         self.memory_peak = 0
@@ -514,24 +649,61 @@ class Evaluator:
     def cancel(self):
         self._cancel = True
 
+    def clear_stop(self):
+        """Forget a stop asked for. A server does this before it starts a run's thread, not the run itself
+        when it gets going: a stop in between was wiped out there, and whoever asked waited for the whole
+        run (Optimize after a changed setting, behind a preview of a topology result: 3 minutes)."""
+        self._cancel = False
+        self._stop_reason = None
+
     def close(self):
         if self._pool is not None:
             self._pool.close()
             self._pool = None
+
+    def _stop_idle_workers(self):
+        """Stop the worker processes if none is working (see stop_idle_workers); whether it did."""
+        with self._pool_lock:
+            pool = self._pool
+            if pool is None or pool.busy:
+                return False
+            self._pool = None
+        pool.terminate()
+        return True
 
     def release_memory(self):
         """Between runs, when the PC needs memory back: stop the worker processes and forget the
         cached meshes (the biggest results; they are rebuilt, mostly from the SSD cache, on the
         next run). Imported bodies and fields are kept."""
         self.close()
-        for node_id in list(self._cache):
-            spec = self.graph.nodes.get(node_id, {})
-            if str(spec.get("type", "")).startswith(("mesh.", "output.")):
+        for node_id, cached in list(self._cache.items()):
+            if cached[3].startswith(("mesh.", "output.")):  # (the type as cached: the last run may have used another graph)
                 self._cache.pop(node_id, None)
+
+    def forget(self, keep):
+        """Drop the cached results of nodes not in `keep` (node ids): nodes deleted from the recipe, or
+        of a recipe closed since. Node ids are names recipes share (`import`, `mesh`), so the rest of a
+        closed recipe's results otherwise stayed in memory for the life of the server."""
+        for node_id in [n for n in self._cache if n not in keep]:
+            self._cache.pop(node_id, None)
 
     def _emit(self, **event):
         if self.on_event:
             self.on_event(event)
+
+    def _result(self, node_id, outputs):
+        if self.on_result:
+            try:
+                self.on_result(node_id, outputs)
+            except Exception:  # (showing it early failed: the run goes on, its end shows it)
+                traceback.print_exc()
+
+    def _item(self, node_id, index, total, outputs):
+        if self.on_item:
+            try:
+                self.on_item(node_id, index, total, outputs)
+            except Exception:
+                traceback.print_exc()
 
     MAX_WARNINGS = 20  # kept per node for its card
 
@@ -572,8 +744,9 @@ class Evaluator:
 
         When RAM runs short, Windows pages memory out and this drops while a process keeps
         growing (a runaway import showed 5 GB resident with 23 GB committed). Committed memory is
-        no better a measure: loading the engine commits 1.3 GB it never touches, starting CUDA
-        another 0.4 GB. That case is caught by the free-memory checks in _watch_memory instead."""
+        no better a measure: loading the engine commits 1.5 GB it never touches (OpenBLAS's buffers,
+        in the main process), starting CUDA another 0.6 GB. That case is caught by the commit room
+        checks in _watch_memory instead."""
         if psutil is None:
             return 0
         pids = [os.getpid()] + (self._pool.pids() if self._pool is not None else [])
@@ -591,17 +764,14 @@ class Evaluator:
         out of memory."""
         from .nodes import ARRAY_CACHE
         limit, gb = memory_limit(), 2 ** 30
-        shrunk = False
+        shrunk, starved_since = False, None
         while not stop.wait(0.5):
-            used, free = self.memory_in_use(), available_memory()
+            used, free, room = self.memory_in_use(), available_memory(), commit_room()
             self.memory_peak = max(self.memory_peak, used)
-            pool = self._pool
-            tight = used > 0.85 * limit or free < FREE_TIGHT
-            if tight and pool is not None and not pool.busy:
-                # Idle workers hold ~0.6-1 GB each; their cached results are on the SSD anyway,
-                # so stop them (they restart on the next parallel step) instead of failing the run.
-                self._pool = None
-                pool.terminate()
+            tight = used > 0.85 * limit or free < FREE_TIGHT or room < COMMIT_TIGHT
+            # Idle workers hold ~0.6-1 GB each; their cached results are on the SSD anyway,
+            # so stop them (they restart on the next parallel step) instead of failing the run.
+            if tight and self._stop_idle_workers():
                 self._notice(f"Memory {used / gb:.1f} GB of {limit / gb:.1f} GB: stopped idle worker processes")
                 continue
             if tight:
@@ -611,11 +781,15 @@ class Evaluator:
                 if not shrunk:
                     self._notice(f"Memory {used / gb:.1f} GB of {limit / gb:.1f} GB: freeing caches")
                 shrunk = True
-            if used > limit or free < FREE_STOP:
-                self._stop_reason = (
-                    f"stopped to protect the PC: memory use reached {used / gb:.1f} GB "
-                    f"(limit {limit / gb:.1f} GB, {free / gb:.1f} GB left free). Use a larger voxel "
-                    f"size or Draft quality, or close other programs.")
+            starved_since = (starved_since or time.time()) if free < FREE_STOP else None
+            starved = starved_since is not None and time.time() - starved_since > STARVED_SECONDS
+            if used > limit or room < COMMIT_STOP or starved:
+                why = (f"memory use reached {used / gb:.1f} GB (limit {limit / gb:.1f} GB)" if used > limit else
+                       f"the PC can give out only {room / gb:.1f} GB more memory (RAM and page file)"
+                       if room < COMMIT_STOP else
+                       f"the PC has had under {FREE_STOP / gb:.2f} GB of RAM free for {STARVED_SECONDS} s")
+                self._stop_reason = (f"stopped to protect the PC: {why}. Use a larger voxel size or Draft "
+                                     f"quality, or close other programs.")
                 self._cancel = True
                 pool, self._pool = self._pool, None
                 if pool is not None:
@@ -623,15 +797,27 @@ class Evaluator:
                 self._last_resort(limit, stop)
                 return
 
+    def _reset_cache_budgets(self):
+        """Give the RAM caches their share of this run's limit (main process and each worker). The
+        watchdog halves them when memory gets tight; before, they then stayed small for the rest of the
+        session."""
+        from .nodes import ARRAY_CACHE
+        pool = self._pool
+        main, each = ram_cache_budget(pool.n if pool is not None else 0)
+        ARRAY_CACHE.set_limit(main)
+        if pool is not None:
+            pool._cache_cap.value = each
+
     def _last_resort(self, limit, stop):
         """The run has been told to stop, but a step that cannot be interrupted may keep growing.
-        If memory stays far over the limit, end the whole process rather than freeze the PC (the
-        editor's graph lives in the browser, so nothing is lost)."""
+        If memory stays far over the limit, or the PC has almost nothing left to commit, end the whole
+        process rather than let other programs' allocations fail (the editor's graph lives in the
+        browser, so nothing is lost)."""
         over_since = None
         while not stop.wait(1.0):
-            if self.memory_in_use() > 1.25 * limit or available_memory() < FREE_LAST_RESORT:
+            if self.memory_in_use() > 1.25 * limit or commit_room() < COMMIT_LAST_RESORT:
                 over_since = over_since or time.time()
-                if time.time() - over_since > 10:
+                if time.time() - over_since > LAST_RESORT_SECONDS:
                     print("Design Engine: memory is still far over the limit after stopping the run; "
                           "closing to protect the PC. Start it again; your graph is still in the browser.",
                           flush=True)
@@ -644,10 +830,10 @@ class Evaluator:
         fails stops the run with GraphError, unless `keep_going` (previews): then only the nodes
         that need it are left out of the results, and `failed` says why (a support whose faces were
         picked on the previous STEP file must not keep the new part from being shown)."""
-        self._cancel = False
-        self._stop_reason = None
         self.memory_peak = 0
         self._notices = set()
+        refresh_memory_limit(self.memory_in_use())  # from the RAM free now, fixed for this run
+        self._reset_cache_budgets()
         stop = threading.Event()
         watchdog = threading.Thread(target=self._watch_memory, args=(stop,), daemon=True)
         watchdog.start()
@@ -656,6 +842,7 @@ class Evaluator:
         finally:
             stop.set()
             watchdog.join()
+            self.clear_stop()
 
     def _run(self, targets, keep_going=False):
         order = self.graph.order(targets)
@@ -694,6 +881,7 @@ class Evaluator:
                 results[node_id] = cached[1]
                 self._emit(type="node_done", node=node_id, time=0.0, cached=True, range=_output_range(cached[1]),
                            messages=cached[2], **_output_extras(cached[1]))
+                self._result(node_id, cached[1])
                 continue
             start = time.perf_counter()
             self._emit(type="node_start", node=node_id)
@@ -716,16 +904,19 @@ class Evaluator:
                 _current.ctx = None
                 warnings, self._warnings, self._collect = self._warnings, None, None
             results[node_id] = outputs
-            self._cache[node_id] = (sig, outputs, warnings)
+            self._cache[node_id] = (sig, outputs, warnings, spec["type"])
             self.computed.append(node_id)
             took = time.perf_counter() - start
             self._emit(type="node_done", node=node_id, time=took, cached=False, range=_output_range(outputs),
                        messages=warnings, **_output_extras(outputs))
+            self._result(node_id, outputs)
             if took > 0.05 or ntype.side_effect:
                 self.log(f"[{time.perf_counter() - t0:6.1f}s] {node_id} ({ntype.title}) {took:.1f}s")
         return results
 
     def _call(self, node_id, ntype, kwargs):
+        if ntype.estimate is not None and not ntype.parallel:  # runs here, all at once (Merge Meshes' fuse)
+            self._make_room(node_id, ntype, kwargs)
         mapped = [p.name for p in ntype.inputs if not p.many and isinstance(kwargs.get(p.name), Many)]
         if not mapped:
             return self._normalise(ntype, ntype.fn(**kwargs))
@@ -746,6 +937,7 @@ class Evaluator:
                 for i in range(count):
                     self._check_cancel()
                     items.append(self._normalise(ntype, ntype.fn(**args_for(i))))
+                    self._item(node_id, i, count, items[-1])
                     self._emit(type="progress", node=node_id, done=i + 1, total=count)
             finally:  # also the lines of the items done before one failed
                 lines, self._collect = self._collect, outer
@@ -761,18 +953,23 @@ class Evaluator:
             except Exception:
                 need = 0
         uses_gpu = need >= grid_memory(backend.GPU_MIN_VOXELS)  # big enough to run on the GPU
-        items = self._map_in_workers(node_id, ntype.fn, arg_list, need, uses_gpu, ntype.title)
+        items = self._map_in_workers(node_id, ntype.fn, arg_list, need, uses_gpu, ntype.title,
+                                     parts=lambda result: self._normalise(ntype, result))
         return [self._normalise(ntype, r) for r in items]
 
-    def _map_in_workers(self, node_id, fn, arg_list, need, uses_gpu, title, gpu_need=0, step=None):
+    def _map_in_workers(self, node_id, fn, arg_list, need, uses_gpu, title, gpu_need=0, step=None, parts=None):
         # Separate processes: most of the work holds the GIL, so threads barely help. Item i
         # always goes to the same worker, whose caches then stay warm across edits.
+        # `parts(result)`: the node's outputs of one item, when the results are its output list
+        # (passed on to on_item as each comes)
         if self.workers <= 1 or len(arg_list) < 2:
             out, outer, self._collect = [], self._collect, []
             try:
                 for i, args in enumerate(arg_list):
                     self._check_cancel()
                     out.append(fn(**args))
+                    if parts and self.on_item:
+                        self._item(node_id, i, len(arg_list), parts(out[-1]))
                     self._emit(type="progress", node=node_id, done=i + 1, total=len(arg_list), step=step)
             finally:  # also the lines of the items done before one failed
                 lines, self._collect = self._collect, outer
@@ -804,7 +1001,9 @@ class Evaluator:
                 fn, arg_list, active=active,
                 on_progress=lambda done, total: self._emit(type="progress", node=node_id, done=done, total=total,
                                                            step=step),
-                should_stop=lambda: self._cancel, lines=lines)
+                should_stop=lambda: self._cancel, lines=lines,
+                on_item=(lambda i, result: self._item(node_id, i, len(arg_list), parts(result)))
+                if parts and self.on_item else None)
         finally:
             self._gathered(node_id, lines)  # also the lines of the items done before one failed
         if items is None:  # cancelled; unless the watchdog killed them, workers keep warm caches
@@ -812,12 +1011,35 @@ class Evaluator:
             raise Cancelled("cancelled")
         return items
 
+    def _make_room(self, node_id, ntype, kwargs):
+        """Before a node that runs in this process and needs much memory at once (its estimate): stop the
+        run's idle worker processes when it does not fit beside them (they held ~3 GB while the lamp's
+        fuse needed 5-10 GB), and stop with a readable error when it does not fit even then, rather than
+        the watchdog stopping the run halfway or Windows paging to its hard disk."""
+        try:
+            need = int(ntype.estimate(**kwargs))
+        except Exception:
+            return
+        room = lambda: min(memory_limit() - self.memory_in_use(), memory_room())
+        if need <= 0 or need <= room():
+            return
+        gb = 2 ** 30
+        if self._stop_idle_workers():
+            self._notice(f"{ntype.title}: stopped idle worker processes to make room ({need / gb:.1f} GB needed)",
+                         node_id)
+        left = room()
+        if need > left:
+            raise GraphError(f"{ntype.title} needs about {need / gb:.1f} GB of memory at once but only "
+                             f"{max(left, 0) / gb:.1f} GB is left (limit {memory_limit() / gb:.1f} GB, the PC "
+                             f"can give out {commit_room() / gb:.1f} GB more). Close other programs, or use "
+                             f"fewer triangles (Keep or Tolerance in Mesh from Implicit Body).")
+
     def _parallel_slots(self, need):
         """How many items may run at once: as many workers as fit in the memory still free
         under the limit, given what one item needs."""
         if need <= 0:
             return self.workers
-        room = min(memory_limit() - self.memory_in_use(), available_memory() - FREE_TIGHT)
+        room = min(memory_limit() - self.memory_in_use(), memory_room())
         return max(1, min(self.workers, int(room // need)))
 
     @staticmethod

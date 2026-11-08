@@ -288,6 +288,29 @@ def test_face_info_finds_the_body_by_its_number():
     assert facemask.face_info(plain, 0, 0) is None
 
 
+def test_similar_faces_finds_the_same_holes_the_same_plane_and_the_same_kind():
+    from engine.graph.nodes import import_step
+    mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_bolts.step"), 0.01, 1, 0.5)[0]
+    table = facemask.face_table(mesh)
+    bores = [f for f, info in table.items() if info["type"] == "cylinder" and info["hole"]]
+    assert len(bores) >= 2
+    first = table[bores[0]]
+    same = facemask.similar_faces(mesh, 0, bores[0], "size")
+    assert bores[0] in same and len(same) >= 2 and same == sorted(same)
+    assert all(table[f]["hole"] and abs(table[f]["radius"] - first["radius"]) < 0.01 for f in same)
+    assert set(same) == {f for f in bores if abs(table[f]["radius"] - first["radius"]) <= max(1e-3, 2e-3 * first["radius"])}
+    assert set(facemask.similar_faces(mesh, 0, bores[0], "type")) == set(bores)
+    plane = next(f for f, info in table.items() if info["type"] == "plane")
+    flat = facemask.similar_faces(mesh, 0, plane, "plane")
+    n, c = np.array(table[plane]["normal"]), np.array(table[plane]["centre"])
+    assert plane in flat and all(abs(n @ (np.array(table[f]["centre"]) - c)) < 0.01 and n @ table[f]["normal"] > 0.9999
+                                 for f in flat)
+    assert facemask.similar_faces(mesh, 0, bores[0], "plane") == []         # a hole lies in no plane
+    assert facemask.similar_faces(mesh, 1, bores[0], "size") is None
+    with pytest.raises(ValueError):
+        facemask.similar_faces(mesh, 0, bores[0], "colour")
+
+
 def test_nearest_face_of_the_wall_bracket():
     from engine.graph.nodes import import_step
     mesh = import_step(str(Path(__file__).resolve().parents[1] / "samples" / "wall_bracket_space.step"),
@@ -324,6 +347,38 @@ def test_nearest_face_picks_the_nearest_body_and_skips_far_ones():
     assert (face, body) == (TOP, 12) and distance == pytest.approx(0.4, abs=1e-9)
     assert facemask.nearest_face(boxes, (200, 0, 5.4), within=0.3) is None
     assert facemask.nearest_face(plain, (0, 0, 0)) is None and facemask.nearest_face([], (0, 0, 0)) is None
+
+
+def test_face_region_splits_rounded_edges_and_corners_down_the_middle():
+    from skimage.measure import marching_cubes
+    box = cad_box((10, 10, 10))
+    axis = np.linspace(-7, 7, 71)                       # the box offset by 1 mm: edges and corners rounded
+    q = np.abs(np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1)) - 5
+    sdf = np.linalg.norm(np.maximum(q, 0), axis=-1) + np.minimum(q.max(axis=-1), 0) - 1.0
+    V, faces, _, _ = marching_cubes(sdf, 0.0, spacing=(0.2, 0.2, 0.2))
+    V -= 7
+    rows = facemask.face_region(box, 0, TOP, V, faces, reach=3.0)
+    c = np.abs(V[faces].mean(axis=1)) - 5                # how far each centre lies off each pair of sides
+    lead = c[:, 2] - np.maximum(c[:, 0], c[:, 1])        # > 0: straighter off the top than off any side
+    chosen = np.isin(np.arange(len(faces)), rows)
+    top = V[faces].mean(axis=1)[:, 2] > 0
+    assert chosen[top & (lead > 0.05)].all()             # the whole top, half way round each edge and corner,
+    assert not chosen[~top | (lead < -0.05)].any()       # and nothing beyond: no speckles
+    assert facemask.face_region(box, 0, TOP, V, faces, reach=0.5).size == 0   # the offset is 1 mm
+
+
+def test_face_region_leaves_a_neighbouring_body_its_own_surface():
+    lower, upper = cad_box((10, 10, 10)), cad_box((10, 10, 10))
+    upper.apply_translation([0, 0, 10.5])                # 0.5 mm above the lower one's top
+    sheets = []
+    for z in (5.1, 5.4):                                 # thin sheets in the gap, nearer one body each
+        sheet = trimesh.creation.box((8, 8, 0.01))
+        sheet.apply_translation([0, 0, z])
+        sheets.append(sheet)
+    shown = trimesh.util.concatenate(sheets)
+    rows = facemask.face_region([lower, upper], 0, TOP, shown.vertices, shown.faces, reach=3.0)
+    z = shown.triangles_center[rows][:, 2]
+    assert len(rows) == len(sheets[0].faces) and np.all(z < 5.25)   # all of the lower sheet, none of the upper
 
 
 def test_copies_of_one_part_share_face_numbers():

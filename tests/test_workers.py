@@ -32,6 +32,11 @@ def chatty(i):
     return i
 
 
+def commit(i):
+    import psutil
+    return os.environ.get("OPENBLAS_NUM_THREADS"), psutil.Process().memory_info().private
+
+
 @pytest.fixture
 def pool():
     p = StickyPool(3)
@@ -62,6 +67,29 @@ def test_results_in_order_and_sticky(pool):
     assert [r[0] for r in first] == list(range(9))
     assert first == second                       # item i ran in the same process both times
     assert len({pid for _, pid in first}) == 3   # and the work was spread over all workers
+
+
+def test_workers_start_only_when_given_work(pool):
+    assert pool.pids() == []
+    one = pool.map(whoami, [{"i": i} for i in range(4)], active=1)   # e.g. limited by free GPU memory
+    assert len(pool.pids()) == 1 and {pid for _, pid in one} == set(pool.pids())
+    assert pool.map(whoami, [{"i": 0}, {"i": 1}])[0] == one[0]       # worker 0 kept; 1 joins
+    assert len(pool.pids()) == 2 and pool.alive()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="private bytes are a Windows measure")
+def test_workers_load_blas_with_their_share_of_the_cores():
+    # numpy's and scipy's OpenBLAS commit ~23 MB per thread when they load, one thread per core: a
+    # worker committed 1.5 GB more than it ever used, and 7 GPU workers took 17 GB of the PC's commit
+    before = os.environ.get("OPENBLAS_NUM_THREADS")
+    pool = StickyPool(8)
+    try:
+        (threads, private), = pool.map(commit, [{"i": 0}])   # (only worker 0 starts)
+    finally:
+        pool.close()
+    assert threads == str(max(1, (os.cpu_count() or 4) // 8))
+    assert private < 0.6 * 2**30                              # engine imports included (1.6 GB on 32 cores before)
+    assert os.environ.get("OPENBLAS_NUM_THREADS") == before   # this process's own setting is left as it was
 
 
 def test_report_lines_come_back_from_the_workers(pool):

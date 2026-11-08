@@ -143,3 +143,21 @@ def test_step_import_is_kept_on_the_ssd(tmp_path, monkeypatch):
     os.utime(step, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # saved again from the CAD program
     import_step(str(step), 0.01, 1, 0.5)
     assert len(reads) == 3
+
+
+def test_mesh_queries_are_bounded_by_size(monkeypatch):
+    # every new shape (a topology result, another texture) is a new key: the cache keeps at most
+    # MAX_QUERY_BYTES of search structures, the newest always, oldest out first
+    from collections import OrderedDict
+
+    from engine import sdf
+    meshes = [trimesh.creation.icosphere(subdivisions=3, radius=r) for r in (1.0, 2.0, 3.0)]
+    one = MeshQuery(meshes[0].vertices, meshes[0].faces).nbytes
+    monkeypatch.setattr(sdf, "_QUERIES", OrderedDict())
+    monkeypatch.setattr(sdf, "MAX_QUERY_BYTES", int(2.5 * one))
+    for i, m in enumerate(meshes):
+        sdf.mesh_query(m.vertices, m.faces, key=f"shape {i}")
+    assert list(sdf._QUERIES) == ["shape 1", "shape 2"]
+    monkeypatch.setattr(sdf, "MAX_QUERY_BYTES", 1)   # one too big for the budget is still kept, alone
+    sdf.mesh_query(meshes[0].vertices, meshes[0].faces, key="big")
+    assert list(sdf._QUERIES) == ["big"]

@@ -11,7 +11,48 @@ export interface PortSpec {
   optional?: boolean
   /** set by the engine (e.g. Topology Optimization's compute flag), not shown on the node */
   hidden?: boolean
+  /** shown only while it applies: {other input: its values} (every one must hold), or a list of such
+   *  (any one may hold), e.g. a pattern's Sides only for polygons and stars */
+  when?: Record<string, string[]> | Record<string, string[]>[]
+  /** tucked under the card's "more" row while it has its default value and no link */
+  advanced?: boolean
+  /** shown in the number field: "mm", or {other input: {its value: unit}} (a Load's Amount by its Kind) */
+  unit?: string | Record<string, Record<string, string>>
+  /** what 0 means ("auto", "no limit", "sharp"), shown in the field in place of 0 */
+  zero?: string
+  /** a list to choose the value from (components/PickLists.tsx): "body" (which item of the node's first cad
+   *  input), "font" (an installed font) */
+  pick?: 'body' | 'font'
+  /** an int that is 1 or 0, shown as an on/off switch */
+  switch?: boolean
+  /** [low, high]: the usual values, a slider under the field (typing may go beyond) */
+  slider?: [number, number]
 }
+
+/** The unit of a number input: its own, or the one for the value of the input it depends on
+ *  (undefined while that input is linked). */
+export function unitOf(port: PortSpec, value: (name: string) => unknown): string | undefined {
+  const u = port.unit
+  if (!u || typeof u === 'string') return u
+  const [name, units] = Object.entries(u)[0]
+  const v = value(name)
+  return v === undefined ? undefined : units[String(v)]
+}
+
+/** Whether an input applies with the node's other values (`PortSpec.when`). `value` reads another
+ *  input: undefined when it is linked (it may be anything, so the input applies). */
+export function portApplies(port: PortSpec, value: (name: string) => unknown): boolean {
+  if (!port.when) return true
+  const conditions = Array.isArray(port.when) ? port.when : [port.when]
+  return conditions.some((c) => Object.entries(c).every(([name, allowed]) => {
+    const v = value(name)
+    return v === undefined || allowed.map(String).includes(String(v))
+  }))
+}
+
+/** An input set to something other than its default (shown even when it is `advanced`). */
+export const changedFromDefault = (port: PortSpec, value: unknown) =>
+  value !== undefined && JSON.stringify(value) !== JSON.stringify(port.default)
 
 export interface NodeSpec {
   type: string
@@ -20,6 +61,8 @@ export interface NodeSpec {
   doc: string
   inputs: PortSpec[]
   outputs: PortSpec[]
+  /** Math: the scalar output is a plain number while every scalar input is one (see `outputType`) */
+  numeric?: boolean
 }
 
 export interface Catalog {
@@ -36,6 +79,10 @@ export interface RecipeNode {
   inputs?: Record<string, unknown>
   pos?: [number, number]
   visible?: boolean
+  /** passes its first input of its output's type straight on, as if it were not there (engine: bypass_input) */
+  bypass?: boolean
+  /** drawn as its header only in the node editor */
+  collapsed?: boolean
 }
 
 /** A group: own node made from other nodes. Inner links "$in.<name>" are the group's inputs;
@@ -53,6 +100,23 @@ export interface Recipe {
   groups?: Record<string, GroupDef>
   /** named face selections: name -> face list ("10, 11" or "2:15") */
   selections?: Record<string, string>
+  /** boxes drawn behind nodes in the graph (graphFrames.ts), by id ("frame:1"); the engine ignores them */
+  frames?: Record<string, GraphFrame>
+}
+
+/** A frame in the node graph: a labelled box behind nodes. Its nodes are the ones whose middle lies inside
+ *  it (and the frames inside it), so dragging it moves them; folded, it is a title bar that hides them. */
+export interface GraphFrame {
+  label: string
+  /** "#rrggbb", one of FRAME_COLORS */
+  color: string
+  pos: [number, number]
+  /** unfolded size (a folded frame is drawn as its title bar) */
+  size: [number, number]
+  /** folded: the nodes and frames it hides (the ones inside it when it was folded) */
+  folded?: string[]
+  /** selected in the graph (not saved) */
+  selected?: boolean
 }
 
 export const GROUP_PREFIX = 'group:'
@@ -64,6 +128,16 @@ export interface EngineNodeData extends Record<string, unknown> {
   typeId: string
   /** literal values typed into the node; kept even while a link overrides them */
   inputs: Record<string, unknown>
+  /** see RecipeNode */
+  bypass?: boolean
+  collapsed?: boolean
+}
+
+/** The input a bypassed node passes on: its first linked input of the same type as its first output
+ *  (as the engine's bypass_input), or null. */
+export function bypassInput(spec: NodeSpec | undefined, linked: (port: string) => boolean): string | null {
+  const out = spec?.outputs[0]
+  return spec?.inputs.find((p) => out && p.type === out.type && linked(p.name))?.name ?? null
 }
 
 export type EngineNode = Node<EngineNodeData, 'engine' | 'groupIn' | 'groupOut'>
@@ -89,6 +163,8 @@ export interface NodeStatus {
   range?: [number, number] | null
   /** a line from the node about its result (e.g. "not optimized for these settings yet") */
   note?: string | null
+  /** an optimizer's saved result has nothing left to do with these settings: why (there is no Optimize to press) */
+  finished?: string | null
   /** warnings and errors the node reported while computing its result (kept while it is cached) */
   warnings?: Warning[] | null
   /** the same from meshing the node's body for the 3D view (e.g. "cut flat at the edge of its box") */
@@ -114,6 +190,19 @@ export interface ViewMesh {
   /** mm: the voxel it was meshed with, and the finest a detail of it may use (null: no detail) */
   voxel?: number | null
   floor?: number | null
+  /** a list's view: the triangles of each item, one after the other (a later run's items are drawn over it
+   *  as they come, see Pieces) */
+  parts?: number[] | null
+}
+
+/** A list's items from a run still going on, drawn as each is made (the lamp's 144 petals, 13-24 s at Final),
+ *  each instead of that item in the view shown (`base`), until the run's whole view comes. */
+export interface Pieces {
+  /** the version of the view they are drawn over (0: none shown yet) */
+  base: number
+  /** total items in the list */
+  total: number
+  meshes: Record<number, ViewMesh>
 }
 
 /** Part of a shown body meshed finer than its view (the part on screen, when zoomed in): drawn
@@ -187,6 +276,42 @@ export interface FrameView {
   utilisation: number[]
   axial: number[]
   lengths: number[]
+  /** a frame being made (a `live_frame` event while Frame Optimization runs) */
+  live?: boolean
+  /** live: the bars have their real sizes (else they are as thick as their force needs) */
+  sized?: boolean
+  /** live: the step of the run (optimize.STAGES) and what it just did */
+  stage?: string
+  what?: string
+  /** live, body check: its most stressed spot */
+  spot?: [number, number, number] | null
+  /** live: what the step's LP did (`layout.optimize`): LPs solved so far, bars in the LP of all candidates,
+   *  bars member adding takes in next, volume of the bars at their forces and with every bar at least Min size (mm3) */
+  numbers?: { lp?: number; in_lp?: number; candidates?: number; adding?: number; volume?: number; real?: number }
+  /** live: the bars' mass as drawn, g */
+  mass?: number
+}
+
+/** A frame's candidate nodes (Frame Optimization, Show: candidate nodes): the points bars may meet at,
+ *  as Optimize lays them out (`nodes_frame._ground_view`). */
+export interface GroundView {
+  /** mm between the lattice's nodes */
+  spacing: number
+  /** the Node spacing was automatic */
+  auto: boolean
+  /** the automatic spacing that left a support or load without bars (this one is finer) */
+  coarser: number | null
+  /** lattice nodes inside the design space (that bars reach) */
+  lattice: [number, number, number][]
+  /** nodes at supports, loads and connections, each with its kind and its node's label */
+  points: [number, number, number][]
+  kinds: ('fixed' | 'load' | 'attach')[]
+  labels: string[]
+  /** points (indices) no bar reaches: Optimize stops with `error` */
+  lonely: number[]
+  /** candidate bars */
+  bars: number
+  error: string | null
 }
 
 /** Supports and loads drawn in the 3D view (from Fixed Faces and Load nodes). */
@@ -214,6 +339,8 @@ export interface RunTag {
   version: number
   /** a step of refining the view (not the first look after a change) */
   refining?: boolean
+  /** the editor tab that asked for the run (store.CLIENT): the others take none of its events */
+  client?: string
 }
 
 export interface QueueState {
@@ -229,6 +356,8 @@ export type Bounds = [[number, number, number], [number, number, number]]
 export interface RunState {
   id: number
   mode: string
+  /** "optimize <node>" for an optimization */
+  label?: string
   running: boolean
   startedAt: number
   message?: string
@@ -243,6 +372,8 @@ export interface RunState {
   shown?: Quality | null
   /** a detail run: the voxel it was meshed with, mm */
   voxel?: number
+  /** Stop was pressed (the engine said so): the run ends at its next stopping point */
+  stopping?: boolean
 }
 
 export interface LogEntry {
@@ -335,9 +466,45 @@ export interface GraphEdit {
   select?: string[]
   /** start picking faces on this node afterwards */
   pick?: string
+  /** show these nodes in the 3D view, hide these */
+  show?: string[]
+  hide?: string[]
+  /** turn a node's bypass on or off */
+  bypass?: { node: string; on: boolean }[]
 }
 
 export interface ToastAction { label: string; run: () => void }
+
+/** One input in the quick-edit box: of `node`, with its own label (else the port's). */
+export interface QuickField { node: string; port: string; label?: string }
+
+/** The quick-edit box in the 3D view at client x, y: a node's main inputs (QUICK_INPUTS, else all its
+ *  plain ones), or `fields` of several nodes under `title` (e.g. a texture's amplitude and scale). */
+export interface QuickEditState { node: string; x: number; y: number; fields?: QuickField[]; title?: string }
+
+/** A CAD face: its number and its body's number, as /api/faces reports them. */
+export interface FaceRef { face: number; body: number }
+
+/** Faces chosen in the 3D view with Ctrl+click or Select similar, for one right-click action on all of
+ *  them: the clicked view, the CAD output they are faces of (`source`.`port`), whether its bodies are
+ *  copies of one part and how many there are; `marks`: the triangles of shown views that highlight each
+ *  face (by "body:face"). */
+export interface FaceSelection {
+  view: string
+  source: string
+  port: string
+  same: boolean
+  bodyCount: number
+  faces: FaceRef[]
+  marks: Record<string, { view: string; version: number; triangles: Uint32Array }>
+}
+
+/** A small text box in the 3D view asking for a name (Save as selection…). */
+export interface PromptState { x: number; y: number; label: string; value: string; done: (text: string) => void }
+
+/** Turn the 3D view's camera: look along -`dir` (the camera sits on the dir side of the target) at
+ *  `target` (else at what it looks at now). */
+export interface CameraRequest { dir: [number, number, number]; target?: [number, number, number]; at: number }
 
 /** A short note in the 3D view after an action there: what changed, with Undo. */
 export interface Toast {

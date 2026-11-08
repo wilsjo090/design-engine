@@ -4,7 +4,8 @@ A bar in tension needs A >= SF N / strength. A bar in compression also must not 
 unbraced length: Euler sigma_cr = pi^2 E / (K L / r)^2 for slender bars, Johnson's parabola
 sigma_cr = strength (1 - (K L / r)^2 / (2 Cc^2)) below the transition slenderness
 Cc = pi sqrt(2 E / strength). Sizes are rounded up to the size step (or the next size of a list),
-never below the smallest size; *max sizes* groups the bars into that many sizes with the least
+never below the smallest size and never above *Max size* (the layout keeps every bar's force within
+what that size carries, `force_limits`); *max sizes* groups the bars into that many sizes with the least
 mass (optimal 1D grouping by dynamic programming; a group takes its largest bar's size).
 """
 import math
@@ -25,6 +26,15 @@ def capacity(section, length, material, safety, K=1.0):
     else:
         scr = math.pi ** 2 * E / slender ** 2
     return tension, section.A * scr / safety
+
+
+def force_limits(section, lengths, material, safety, K=1.0, share=1.0):
+    """(tension, compression per length) a bar of this section may carry, N, times `share`: what Max size
+    allows a bar of each length in the layout."""
+    lengths = np.asarray(lengths, dtype=np.float64)
+    tension, _ = capacity(section, 1.0, material, safety, K)
+    compression = np.array([capacity(section, float(L), material, safety, K)[1] for L in lengths])
+    return np.full(len(lengths), share * tension), share * compression
 
 
 def required_size(profile, force, length, material, safety, K=1.0, smallest=1e-3):
@@ -49,8 +59,9 @@ def required_size(profile, force, length, material, safety, K=1.0, smallest=1e-3
     return hi
 
 
-def round_up(size, min_size, step=0.5, sizes=None):
-    """Up to the size step or the next listed size, at least min_size."""
+def round_up(size, min_size, step=0.5, sizes=None, largest=0.0):
+    """Up to the size step or the next listed size, at least min_size; `largest` (Max size, 0: none): no
+    size above it (a bar needing more raises)."""
     size = max(size, min_size)
     if sizes:
         above = [s for s in sorted(sizes) if s >= size * (1 - 1e-9)]
@@ -58,17 +69,25 @@ def round_up(size, min_size, step=0.5, sizes=None):
             raise ConditionError(f"a bar needs {size:.3g} mm: larger than the largest size in the list "
                                  f"({max(sizes):g} mm)")
         return float(above[0])
-    return float(math.ceil(size / step - 1e-9) * step)
+    out = float(math.ceil(size / step - 1e-9) * step)
+    if largest and out > largest * (1 + 1e-9):
+        if size > largest * (1 + 1e-9):
+            raise ConditionError(f"a bar needs {size:.3g} mm: more than Max size ({largest:g} mm)")
+        return float(largest)   # (Max size off the size step)
+    return out
 
 
-def next_size(size, step=0.5, sizes=None):
-    """The next size up."""
+def next_size(size, step=0.5, sizes=None, largest=0.0):
+    """The next size up (`largest`: Max size, never above it)."""
     if sizes:
         above = [s for s in sorted(sizes) if s > size * (1 + 1e-9)]
         if not above:
             raise ConditionError(f"a bar needs more than the largest size in the list ({max(sizes):g} mm)")
         return float(above[0])
-    return float(round(size / step) * step + step)
+    if largest and size >= largest * (1 - 1e-9):
+        raise ConditionError(f"a bar needs more than Max size ({largest:g} mm)")
+    out = float(round(size / step) * step + step)
+    return min(out, float(largest)) if largest else out
 
 
 def group(sizes, weights, profile, groups):

@@ -40,8 +40,9 @@ def field_to_mesh(values, grid):
     # Values (almost) exactly zero put several marching-cubes vertices on the same grid corner.
     # They are distinct in memory, but STL stores no connectivity, so slicers re-merge them by
     # position and the surface gets pinched. Pushing them 1% of a voxel off zero keeps every
-    # vertex distinct (surface moves ~0.001 mm).
-    eps = 0.01 * grid.voxel
+    # vertex distinct (surface moves ~0.001 mm). eps is float32: with a Python float the inner
+    # where made two float64 grids (8 B per voxel each) for the same float32 result.
+    eps = np.float32(0.01 * grid.voxel)
     values = xp.where(xp.abs(values) < eps, xp.where(values < 0, -eps, eps), values).astype(xp.float32)
     # Pad with "outside" so surfaces touching the grid boundary still close.
     padded = xp.pad(values, 1, mode="constant", constant_values=max(float(values.max()), grid.voxel))
@@ -56,7 +57,9 @@ def field_to_mesh(values, grid):
     # processing (merging near-coincident vertices, dropping zero-area triangles) can pinch or
     # open it where the surface passes through grid corners, so keep its topology untouched.
     mesh = trimesh.Trimesh(verts, faces, process=False)
-    if mesh.volume < 0:
+    # not mesh.volume: it leaves trimesh's per-triangle arrays (96 B per triangle, 2.7x the mesh) in
+    # the mesh's cache, kept with the node's result and pickled with it from the workers
+    if signed_volume(mesh.vertices, mesh.faces) < 0:
         mesh.invert()
     mesh.metadata.update(nonfinite=nonfinite, clipped=clipped, voxel=grid.voxel)
     return mesh

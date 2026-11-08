@@ -2,6 +2,7 @@
 the supports and loads taken from CAD faces."""
 import hashlib
 import math
+import re
 from dataclasses import dataclass, field
 from functools import cached_property
 
@@ -31,6 +32,12 @@ FIXED_NEAR = 0.2          # a support fixes the corners whose trilinear weight i
 DIRECTIONS = ("into the face", "out of the face", "+X", "-X", "+Y", "-Y", "+Z", "-Z", "custom")
 LOAD_KINDS = ("force", "pressure", "bearing", "torque")
 OFFSET_KINDS = ("force", "bearing")   # loads acting at a point, which Offset moves off the faces
+
+
+# A bearing load's pressure is scaled to give the force along its direction, so it adds up to more than that the
+# further the direction turns from square to the faces (1 / sine of its angle to a hole's axis: 1.1-1.2 in use). Over
+# this much it no longer stands for the force asked for: the direction runs along the faces (19 degrees to an axis).
+MAX_BEARING_GROWTH = 3.0
 
 
 class ConditionError(ValueError):
@@ -162,6 +169,7 @@ class Condition:
     # 3D view can tell which face a marker sits on. Not part of the key: they change no numbers.
     faces: np.ndarray = field(default=None, repr=False, compare=False)
     bodies: np.ndarray = field(default=None, repr=False, compare=False)
+    case: str = None                # the load case (Load Case node) a load belongs to; None: every case
 
     @property
     def key(self):
@@ -170,6 +178,8 @@ class Condition:
                  self.direction, tuple(float(v) for v in self.vector))
         if self.offset_moment() is not None:  # (loads without an offset keep their keys)
             parts += (tuple(float(v) for v in self.offset),)
+        if self.case is not None:
+            parts += (("case", self.case),)
         return _digest(*parts)
 
     @property
@@ -299,8 +309,15 @@ class Condition:
         cross = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
         double = np.linalg.norm(cross, axis=1)
         n = cross / np.maximum(double, 1e-300)[:, None]
-        w = np.maximum(-(n @ d), 0.0)
+        facing = -(n @ d)
+        w = np.maximum(facing, 0.0)
         total = float((0.5 * double * w * w).sum())
+        # (along a hole's axis w is rounding noise, so the total is 1e-32 of the area and not 0: 600 N became
+        # 1.2e18 N sideways, and next to that the part's real loads counted for nothing)
+        if np.abs(facing).max() < 1e-9 or                 np.linalg.norm(((0.5 * double * w)[:, None] * n).sum(axis=0)) > MAX_BEARING_GROWTH * total > 0:
+            raise ConditionError("bearing load: a pin presses sideways on the wall of a hole, so it cannot act along "
+                                 "the hole, and this direction runs along these faces. For a push or pull along the "
+                                 "hole use Kind: force, or give a direction across it")
         if total <= 0:
             raise ConditionError("bearing load: no part of the faces faces against the force (check the "
                                  "direction: a pin pulled down presses on the bottom of the hole: -Z)")
@@ -340,6 +357,21 @@ class Conditions(tuple):
 
     def add(self, condition):
         return Conditions(tuple(self) + (condition,))
+
+    def cases(self):
+        """[(case name, its supports and loads)]: every load case (Load Case node) with the supports and
+        the loads that belong to no case, which act in every case; [(None, all)] when there are none.
+        Cases in natural order of their names (Case 2 before Case 10), as the editor colours them."""
+        names = sorted({c.case for c in self if c.case is not None}, key=natural_key)
+        if not names:
+            return [(None, self)]
+        shared = tuple(c for c in self if c.case is None)
+        return [(n, Conditions(shared + tuple(c for c in self if c.case == n))) for n in names]
+
+
+def natural_key(text):
+    """Sort key putting "Case 2" before "Case 10"."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(text))]
 
 
 def _subdivision(m):
@@ -536,3 +568,20 @@ def apply_conditions(grid, phi, conditions):
         notes.append("most of the load sits on fixed faces and goes straight into the support")
     force[fixed] = 0.0
     return fixed, force, notes
+
+
+def apply_cases(grid, phi, conditions):
+    """`apply_conditions` for every load case (`Conditions.cases`): fixed DOFs (the supports, the same
+    in every case), nodal forces (cases, X, Y, Z, 3), the cases' names ([None] without Load Case
+    nodes) and the notes (each once)."""
+    fixed, forces, names, notes = None, [], [], []
+    for name, subset in conditions.cases():
+        try:
+            held, force, more = apply_conditions(grid, phi, subset)
+        except ConditionError as err:
+            raise ConditionError(f"{name}: {err}" if name else str(err)) from err
+        fixed = held if fixed is None else fixed | held
+        forces.append(force)
+        names.append(name)
+        notes += [n for n in more if n not in notes]
+    return fixed, np.stack(forces), names, notes

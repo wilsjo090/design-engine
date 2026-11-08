@@ -56,3 +56,41 @@ def scale_about(body, anchor, factor):
     v = anchor + (np.asarray(body.vertices) - anchor) * float(factor)
     return trimesh.Trimesh(v, body.faces.copy(), process=False, face_attributes=dict(body.face_attributes),
                            metadata=dict(body.metadata))
+
+
+def transformed(body, matrix):
+    """Copy of `body` moved by a 4 x 4 `matrix` (a move, a turn, a mirror), keeping its CAD face numbers,
+    surface parameters and metadata. A mirror turns the triangles inside out, so their corners are
+    reversed, and the per-corner attributes (the surface parameters, (n, 3, 2)) with them."""
+    m = np.asarray(matrix, dtype=np.float64)
+    if np.allclose(m, np.eye(4), rtol=0, atol=1e-12):
+        return body
+    v = np.asarray(body.vertices) @ m[:3, :3].T + m[:3, 3]
+    faces, attrs = np.array(body.faces), dict(body.face_attributes)
+    if np.linalg.det(m[:3, :3]) < 0:
+        faces = np.ascontiguousarray(faces[:, ::-1])
+        attrs = {k: np.ascontiguousarray(a[:, ::-1]) if np.ndim(a) == 3 and np.shape(a)[1] == 3 else a
+                 for k, a in attrs.items()}
+    return trimesh.Trimesh(v, faces, process=False, face_attributes=attrs, metadata=dict(body.metadata))
+
+
+def face_plane(bodies, faces_of):
+    """(point, unit normal) of the plane the chosen faces lie on; `faces_of(body)` gives each body's
+    chosen triangles (a boolean mask or None). Raises ValueError when there are none or they are not flat."""
+    tris = [np.asarray(b.vertices)[np.asarray(b.faces)[sel]] for b in bodies
+            if (sel := faces_of(b)) is not None and np.any(sel)]
+    if not tris:
+        raise ValueError("none of the chosen faces is on these bodies")
+    tri = np.concatenate(tris)
+    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])  # 2 x area along the normal
+    normal = cross.sum(axis=0)
+    area = np.linalg.norm(cross, axis=1)
+    if np.linalg.norm(normal) < 1e-9 * max(area.sum(), 1e-30):
+        raise ValueError("the chosen faces are not flat")
+    normal /= np.linalg.norm(normal)
+    centre = (tri.mean(axis=1) * area[:, None]).sum(axis=0) / area.sum()
+    off = np.abs((tri.reshape(-1, 3) - centre) @ normal).max()
+    size = np.ptp(tri.reshape(-1, 3), axis=0).max()
+    if off > 0.01 + 1e-4 * size:
+        raise ValueError(f"the chosen faces are not flat (they bend {off:.2g} mm out of their plane)")
+    return centre, normal

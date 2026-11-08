@@ -22,6 +22,25 @@ const isItem = (e: MenuEntry | undefined): e is MenuItem => e?.kind === 'item'
 const usable = (e: MenuEntry | undefined): e is MenuItem => isItem(e) && e.disabled === undefined
 const hasSub = (e: MenuEntry | undefined): e is MenuItem => isItem(e) && !!e.items?.length
 
+/** Every item that runs something, at any depth, named by its path ("Add load here › Force"). */
+function flatten(entries: MenuEntry[], path: string[] = []): MenuItem[] {
+  const out: MenuItem[] = []
+  for (const e of entries) {
+    if (!usable(e)) continue
+    if (e.items?.length) out.push(...flatten(e.items, [...path, e.label]))
+    else if (e.run) out.push({ ...e, label: [...path, e.label].join(' › '), checked: e.checked })
+  }
+  return out
+}
+
+/** The items whose path holds every word typed (search in a menu: just type). */
+function search(entries: MenuEntry[], query: string): MenuEntry[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+  const found = flatten(entries).filter((i) => words.every((w) => i.label.toLowerCase().includes(w)))
+  return [{ kind: 'header', text: `Search: ${query}` },
+    ...(found.length ? found.slice(0, 14) : [{ kind: 'item', label: 'Nothing matches', disabled: '' } as MenuItem])]
+}
+
 /** The entries of each open level: the top menu, then the submenu opened in each. */
 function levelsOf(entries: MenuEntry[], open: number[]): MenuEntry[][] {
   const out = [entries]
@@ -124,19 +143,32 @@ function MenuPanel({ level, entries, anchor, marked, ctl }: {
   )
 }
 
-/** A right-click menu at the cursor in the 3D view, with submenus (hover, → or Enter), check marks
- *  and greyed-out rows that say why. Keys: ↑ ↓ move, → opens, ← or Esc closes a level, Enter runs. */
+/** A right-click menu at the cursor (in the 3D view and on nodes), with submenus (hover, → or Enter),
+ *  check marks and greyed-out rows that say why. Keys: ↑ ↓ move, → opens, ← or Esc closes a level,
+ *  Enter runs; typing searches every item at any depth (Backspace takes a letter back). */
 export function ViewportMenu({ x, y, entries, onClose }: {
   x: number; y: number; entries: MenuEntry[]; onClose: () => void
 }) {
   /** the row whose submenu is open, per level */
   const [open, setOpen] = useState<number[]>([])
   const [marks, setMarks] = useState<Marks>([])
+  const [query, setQuery] = useState('')
+  /** the query as typed so far (keys can come faster than renders) */
+  const typing = useRef('')
   const rows = useRef(new Map<string, HTMLElement>())
   const sides = useRef<Side[]>([])
   const timer = useRef<number>()
-  const levels = levelsOf(entries, open)
+  const top = query ? search(entries, query) : entries
+  const levels = levelsOf(top, open)
   const depth = levels.length - 1
+  const typed = (next: string) => {
+    typing.current = next
+    setQuery(next)
+    setOpen([])
+    const list = next ? search(entries, next) : entries
+    const first = list.findIndex(usable)
+    setMarks(next && first >= 0 ? [first] : [])
+  }
 
   useEffect(() => () => window.clearTimeout(timer.current), [])
 
@@ -207,10 +239,17 @@ export function ViewportMenu({ x, y, entries, onClose }: {
           break
         case 'Escape':
           if (depth > 0) closeDeepest()
+          else if (typing.current) typed('')
           else onClose()
           break
+        case 'Backspace':
+          if (!typing.current) return
+          typed(typing.current.slice(0, -1))
+          break
         default:
-          return
+          // a letter searches (a space only between words)
+          if (e.key.length !== 1 || (e.key === ' ' && !typing.current)) return
+          typed(typing.current + e.key)
       }
       window.clearTimeout(timer.current)
       e.preventDefault()

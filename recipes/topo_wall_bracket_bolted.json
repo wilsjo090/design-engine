@@ -14,15 +14,16 @@
     "space": {
       "type": "input.pick_body",
       "inputs": {
+        "index": 0,
         "bodies": {
           "link": "import.bodies"
-        },
-        "index": 0
+        }
       },
       "pos": [
-        300,
-        0
-      ]
+        337,
+        -205
+      ],
+      "visible": true
     },
     "petg": {
       "type": "sim.material",
@@ -37,38 +38,44 @@
     "wall": {
       "type": "sim.fixed",
       "inputs": {
+        "faces": "5, 7",
         "cad": {
           "link": "space.body"
-        },
-        "faces": "5, 6, 7, 8"
+        }
       },
       "pos": [
-        620,
-        120
+        695,
+        -159
       ]
     },
     "hang": {
       "type": "sim.load",
       "inputs": {
+        "faces": "10",
+        "kind": "bearing",
+        "amount": 200,
+        "direction": "-Z",
         "cad": {
           "link": "space.body"
         },
-        "faces": "10",
-        "kind": "bearing",
-        "amount": 200.0,
-        "direction": "-Z",
         "add_to": {
           "link": "wall.conditions"
         }
       },
       "pos": [
-        940,
-        120
+        1292,
+        200
       ]
     },
     "topology": {
       "type": "sim.topology",
       "inputs": {
+        "keep": 20,
+        "skin": 2,
+        "detail": "fine",
+        "max_thickness": 4,
+        "members": "struts only",
+        "gap": 1,
         "space": {
           "link": "space.body"
         },
@@ -76,19 +83,53 @@
           "link": "petg.material"
         },
         "conditions": {
-          "link": "hang.conditions"
-        },
-        "keep": 20.0,
-        "skin": 2.0,
-        "detail": "medium",
-        "max_thickness": 4.0,
-        "members": "plates and struts"
+          "link": "load_2.conditions"
+        }
       },
       "pos": [
-        1260,
-        0
+        1755,
+        -22
       ],
       "visible": true
+    },
+    "load_1": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "6",
+        "kind": "bearing",
+        "direction": "-Z",
+        "amount": 300,
+        "cad": {
+          "link": "space.body"
+        },
+        "add_to": {
+          "link": "hang.conditions"
+        }
+      },
+      "pos": [
+        1292,
+        530
+      ]
+    },
+    "load_2": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "8",
+        "kind": "bearing",
+        "direction": "custom",
+        "vector": "-0.275, -0.905, -0.326",
+        "amount": 600,
+        "cad": {
+          "link": "space.body"
+        },
+        "add_to": {
+          "link": "load_1.conditions"
+        }
+      },
+      "pos": [
+        1307,
+        940
+      ]
     }
   }
 }

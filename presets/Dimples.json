@@ -1,7 +1,7 @@
 {
   "kind": "design-engine/nodes",
   "version": 1,
-  "doc": "Round dimples with soft sides, like a golf ball. Connect your CAD bodies to the pattern's Body and your part to Offset Body's Body, pick the faces, then show Offset Body. The Number is the height in mm (negative sinks the shapes).",
+  "doc": "Round dimples with soft sides, like a golf ball. Connect your CAD bodies to the pattern's Body and your part to Texture's Body, pick the faces, then show Texture. Texture's Height is in mm (negative sinks the shapes).",
   "nodes": [
     {
       "id": "pattern",
@@ -22,36 +22,13 @@
       ]
     },
     {
-      "id": "amplitude",
-      "type": "input.number",
-      "inputs": {
-        "value": -0.5
-      },
-      "links": {},
-      "pos": [
-        0,
-        760
-      ]
-    },
-    {
-      "id": "height",
-      "type": "math.multiply",
-      "inputs": {},
-      "links": {
-        "a": "pattern.out",
-        "b": "amplitude.out"
-      },
-      "pos": [
-        360,
-        0
-      ]
-    },
-    {
       "id": "textured",
-      "type": "implicit.offset",
-      "inputs": {},
+      "type": "implicit.texture",
+      "inputs": {
+        "height": -0.5
+      },
       "links": {
-        "distance": "height.out"
+        "pattern": "pattern.out"
       },
       "pos": [
         680,

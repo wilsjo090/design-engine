@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/wall_bracket_bolts.step"
+      },
+      "pos": [
+        0,
+        0
+      ]
+    },
+    "space": {
+      "type": "input.pick_body",
+      "inputs": {
+        "index": 0,
+        "bodies": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        337,
+        -205
+      ]
+    },
+    "petg": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "Steel S355"
+      },
+      "pos": [
+        446,
+        976
+      ]
+    },
+    "wall": {
+      "type": "sim.fixed",
+      "inputs": {
+        "faces": "5, 7",
+        "cad": {
+          "link": "space.body"
+        }
+      },
+      "pos": [
+        695,
+        -159
+      ]
+    },
+    "hang": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "10",
+        "kind": "force",
+        "amount": 200,
+        "direction": "custom",
+        "vector": "0.953, -0.038, -0.3",
+        "cad": {
+          "link": "space.body"
+        },
+        "add_to": {
+          "link": "wall.conditions"
+        }
+      },
+      "pos": [
+        1292,
+        200
+      ]
+    },
+    "load_1": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "6",
+        "kind": "bearing",
+        "direction": "-Z",
+        "amount": 300,
+        "cad": {
+          "link": "space.body"
+        },
+        "add_to": {
+          "link": "hang.conditions"
+        }
+      },
+      "pos": [
+        1316,
+        571
+      ]
+    },
+    "load_2": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "8",
+        "kind": "bearing",
+        "direction": "custom",
+        "vector": "-0.275, -0.905, -0.326",
+        "amount": 600,
+        "cad": {
+          "link": "space.body"
+        },
+        "add_to": {
+          "link": "load_1.conditions"
+        }
+      },
+      "pos": [
+        1307,
+        940
+      ]
+    },
+    "frame_1": {
+      "type": "sim.frame",
+      "inputs": {
+        "profile": "round",
+        "spacing": 0,
+        "safety": 1.43,
+        "show": "stress",
+        "conditions": {
+          "link": "load_2.conditions"
+        },
+        "material": {
+          "link": "petg.material"
+        },
+        "space": {
+          "link": "space.body"
+        }
+      },
+      "pos": [
+        2146,
+        138
+      ],
+      "visible": true
+    }
+  }
+}

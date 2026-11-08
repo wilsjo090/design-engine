@@ -531,21 +531,39 @@ def union_edged(a, b, edge, radius):
                   lambda xp, x, y, r: xp.minimum(xp.minimum(x, y), (x + y - r) * math.sqrt(0.5)), bounds, grown)
 
 
-def smooth_union(a, b, radius):
+def bulge(h, k, order):
+    """What a smooth minimum of size k adds below min(a, b), h = 1 - |a - b| / k (0..1): order 1 the
+    quadratic one (G1: tangent, the curvature jumps where the blend meets the bodies), 2 a cubic (G2:
+    curvature continuous), 3 a quintic (G3, also smooth through the blend's middle, where the cubic's
+    third derivative jumps). Each keeps the field's slope within that of a and b. The frame kernel has
+    the same (`frame.kernel._bulge`)."""
+    if order >= 3:
+        return k * h ** 4 * (5.0 - 2.0 * h) * 0.05
+    if order == 2:
+        return k * h ** 3 / 6.0
+    return h * h * k * 0.25
+
+
+def smooth_union(a, b, radius, order=1):
     """Union with a fillet-like blend of roughly `radius` mm where the bodies meet (0 = a plain
-    union)."""
+    union); `order` its continuity (`bulge`)."""
     if radius < 0:
         raise ValueError("radius must be 0 or more")
+    if order not in (1, 2, 3):
+        raise ValueError("order must be 1, 2 or 3")
     if radius == 0:
         return union(a, b)
     a, b = _lift(a), _lift(b)
 
     def fn(ctx):
         da, db = ctx.eval(a), ctx.eval(b)
+        if order > 1:
+            h = np.maximum(1.0 - np.abs(da - db) / radius, 0.0)
+            return np.minimum(da, db) - bulge(h, radius, order)
         h = np.clip(0.5 + 0.5 * (db - da) / radius, 0, 1)
         return db * (1 - h) + da * h - radius * h * (1 - h)
-    f = Field(fn, _digest("smooth_union", a.key, b.key, float(radius)),
-              f"smooth_union({a.name}, {b.name})", _merge_bounds(a.bounds, b.bounds), children=(a, b))
+    key = _digest("smooth_union", a.key, b.key, float(radius), *((order,) if order > 1 else ()))
+    f = Field(fn, key, f"smooth_union({a.name}, {b.name})", _merge_bounds(a.bounds, b.bounds), children=(a, b))
     f.grown = _merged_core((a, b))
     return f
 

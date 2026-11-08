@@ -29,6 +29,8 @@ _TREES = {}  # (mesh fingerprint, faces, which) -> igl AABB of that subset of tr
 _FACE_TREES = OrderedDict()  # mesh fingerprint -> (igl AABB of all its triangles, triangle count), newest last
 _FACE_TREES_LOCK = threading.Lock()
 MAX_TREE_TRIANGLES = 2_000_000  # nearest_face keeps search trees for about this many triangles in all
+_FACE_TABLES = OrderedDict()  # mesh fingerprint -> face_info of every CAD face of that body, newest last
+SIMILAR = ("size", "plane", "type")  # Select similar: the same size, in the same plane, the same kind of surface
 
 
 def cad_faces(mesh):
@@ -82,9 +84,63 @@ def face_info(meshes, body, face):
         if ids is None or cad_body(mesh, k) != body:
             continue
         on = ids == face
-        if on.any():
-            return _describe_face(mesh, np.flatnonzero(on), face)
+        if on.any():  # with the body's name in the STEP file, when known (Import STEP's cad_name)
+            return {**_describe_face(mesh, np.flatnonzero(on), face), "body_name": mesh.metadata.get("cad_name")}
     return None
+
+
+def face_table(mesh):
+    """face_info of every CAD face of one body, {face: info}; kept per process for the last few
+    bodies (Select similar asks about one body again and again)."""
+    key = mesh_fingerprint(mesh)
+    with _FACE_TREES_LOCK:
+        if key in _FACE_TABLES:
+            _FACE_TABLES.move_to_end(key)
+            return _FACE_TABLES[key]
+    ids = cad_faces(mesh)
+    order = np.argsort(ids, kind="stable")
+    faces, starts = np.unique(ids[order], return_index=True)
+    table = {int(f): _describe_face(mesh, rows, int(f)) for f, rows in zip(faces, np.split(order, starts[1:]))}
+    with _FACE_TREES_LOCK:
+        _FACE_TABLES[key] = table
+        while len(_FACE_TABLES) > 8:
+            _FACE_TABLES.popitem(last=False)
+    return table
+
+
+def similar_faces(meshes, body, face, mode):
+    """The faces of body `body` that are like its face `face` (that one included, sorted), for Select
+    similar in the 3D view. `mode`: size = the same kind of surface and size (holes or shafts of the
+    same diameter, other faces of the same area), plane = planes lying in the same plane and facing
+    the same way, type = the same kind of surface (every bore, every shaft, every plane...). `meshes`
+    and `body` as in face_info; None if the body or the face is not there."""
+    if mode not in SIMILAR:
+        raise ValueError(f"mode must be one of: {', '.join(SIMILAR)}")
+    items = list(meshes) if isinstance(meshes, (list, tuple)) else [meshes]
+    for k, mesh in enumerate(items):
+        ids = cad_faces(mesh)
+        if ids is None or cad_body(mesh, k) != body or not np.any(ids == face):
+            continue
+        table = face_table(mesh)
+        return sorted(f for f, info in table.items() if _alike(table[face], info, mode))
+    return None
+
+
+def _alike(a, b, mode):
+    """Whether face info b is like a for similar_faces' `mode`."""
+    if a["type"] != b["type"] or a["hole"] != b["hole"]:
+        return False
+    if mode == "type":
+        return True
+    if mode == "plane":
+        if a["normal"] is None or b["normal"] is None:
+            return False
+        n = np.asarray(a["normal"])
+        return float(n @ b["normal"]) > 0.9999 and abs(float(n @ (np.subtract(b["centre"], a["centre"])))) < 0.01
+    if a["radius"] is not None or b["radius"] is not None:
+        return a["radius"] is not None and b["radius"] is not None and \
+            abs(a["radius"] - b["radius"]) <= max(1e-3, 2e-3 * a["radius"])
+    return abs(a["area"] - b["area"]) <= 0.01 * max(a["area"], b["area"])
 
 
 def _describe_face(mesh, rows, face):
@@ -140,9 +196,24 @@ def same_part(meshes, ids):
     triangles per face and the same share of the surface per face, so they share face numbers.
     `ids` is the CAD face per triangle of each body (`cad_faces`)."""
     counts = [np.bincount(i) for i in ids]
-    shares = [np.bincount(i, weights=m.area_faces) / max(m.area, 1e-12) for m, i in zip(meshes, ids)]
-    return all(len(c) == len(counts[0]) and np.array_equal(c, counts[0]) and np.allclose(a, shares[0], atol=1e-4)
-               for c, a in zip(counts, shares))
+    if not all(len(c) == len(counts[0]) and np.array_equal(c, counts[0]) for c in counts):
+        return False
+    shares = []
+    for m, i in zip(meshes, ids):
+        areas = _triangle_areas(m)
+        shares.append(np.bincount(i, weights=areas) / max(float(areas.sum()), 1e-12))
+    return all(np.allclose(a, shares[0], atol=1e-4) for a in shares)
+
+
+def _triangle_areas(mesh, chunk=1_000_000):
+    """Area of every triangle, in chunks, without filling trimesh's cache on a kept mesh (`area_faces`
+    keeps 104 B per triangle on it; /api/faces runs `same_part` for every CAD view the editor shows)."""
+    V, F = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+    out = np.empty(len(F))
+    for s in range(0, len(F), chunk):
+        a, b, c = (V[F[s:s + chunk, k]] for k in range(3))
+        out[s:s + chunk] = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    return out
 
 
 def _face_tree(mesh):
@@ -164,13 +235,14 @@ def _face_tree(mesh):
     return tree
 
 
-def nearest_face(meshes, point, within=np.inf):
-    """The CAD face closest to `point`: (face number, body number, distance in mm), or None when no
-    body with CAD faces lies closer than `within` mm. `meshes` is a tessellated body or a list of
-    them; the body number is the one /api/faces reports (`cad_body`, the list index for a body
-    without one). Bodies are tried nearest bounding box first and the search stops at the first
-    box that is not closer than the best distance so far, so a list of 145 petals costs a handful of
-    tree queries (a box is never nearer than its triangles)."""
+def nearest_face(meshes, point, within=np.inf, index=False):
+    """The CAD face closest to `point`: (face number, body number, distance in mm), plus the body's
+    position in the list with `index`, or None when no body with CAD faces lies closer than `within`
+    mm. `meshes` is a tessellated body or a list of them; the body number is the one /api/faces
+    reports (`cad_body`, the list index for a body without one). Bodies are tried nearest bounding
+    box first and the search stops at the first box that is not closer than the best distance so
+    far, so a list of 145 petals costs a handful of tree queries (a box is never nearer than its
+    triangles)."""
     items = list(meshes) if isinstance(meshes, (list, tuple)) else [meshes]
     point = np.asarray(point, dtype=np.float64).reshape(3)
     ranked = []
@@ -191,8 +263,84 @@ def nearest_face(meshes, point, within=np.inf):
             point[None])
         distance = float(np.sqrt(sq[0]))
         if distance < within:
-            within, best = distance, (int(ids[int(tri[0])]), cad_body(mesh, k), distance)
+            within, best = distance, (int(ids[int(tri[0])]), cad_body(mesh, k), distance) + ((k,) if index else ())
     return best
+
+
+def face_region(meshes, index, face, V, F, reach):
+    """The triangles of a shown mesh (V, F) that lie on CAD face `face` of body `meshes[index]`, for
+    highlighting the face the face menu acts on when the shown triangles carry no faces (a textured
+    or offset body): those whose centre is within `reach` mm of that body, lies straightest off that
+    face (`_straightest`), and is not closer to another body of the list. Sorted triangle numbers
+    (int64)."""
+    items = list(meshes) if isinstance(meshes, (list, tuple)) else [meshes]
+    mesh = items[index]
+    ids = cad_faces(mesh)
+    V, F = np.asarray(V), np.asarray(F)
+    if ids is None or not (ids == face).any() or len(F) == 0:
+        return np.zeros(0, dtype=np.int64)
+    Vb = np.ascontiguousarray(mesh.vertices, dtype=np.float64)
+    Fb = np.ascontiguousarray(mesh.faces, dtype=np.int64)
+    corners = Vb[np.unique(Fb[ids == face])]
+    lo, hi = corners.min(axis=0) - reach, corners.max(axis=0) + reach
+    near = np.all((V >= lo) & (V <= hi), axis=1)
+    rows = np.flatnonzero(near[F].any(axis=1))
+    if not len(rows):
+        return rows
+    centres = V[F[rows]].astype(np.float64).mean(axis=1)
+    sq, tri, closest = _face_tree(mesh).squared_distance(Vb, Fb, centres)
+    keep = (ids[_straightest(mesh, centres, tri, closest)] == face) & (sq <= reach * reach)
+    rows, centres, sq = rows[keep], centres[keep], sq[keep]
+    # where bodies of a list meet, a surface nearer to the other body is that body's
+    lo, hi = (centres.min(axis=0) - reach, centres.max(axis=0) + reach) if len(rows) else (hi, lo)
+    for k, other in enumerate(items):
+        box = other.bounds if k != index and cad_faces(other) is not None and len(other.faces) else None
+        if not len(rows) or box is None or np.any(box[0] > hi) or np.any(box[1] < lo):
+            continue
+        mine = sq <= _face_tree(other).squared_distance(
+            np.ascontiguousarray(other.vertices, dtype=np.float64), np.ascontiguousarray(other.faces, dtype=np.int64),
+            centres)[0]
+        rows, centres, sq = rows[mine], centres[mine], sq[mine]
+    return rows
+
+
+def _straightest(mesh, points, tri, closest):
+    """The triangle of `mesh` each point lies straightest off: of the triangles through its closest
+    point (`closest`, found on triangle `tri`), the one whose plane is farthest from the point. That is
+    `tri` unless the closest point is on an edge or a corner: around a convex edge an offset surface is
+    as close to both sides, and the nearest triangle alone picked either face at random (a speckled
+    band); this splits the rounding down its middle, and a rounded corner into thirds."""
+    Vb = np.asarray(mesh.vertices, dtype=np.float64)
+    Fb = np.asarray(mesh.faces, dtype=np.int64)
+    tri = np.asarray(tri, dtype=np.int64).copy()
+    # barycentric weights of the closest points: one is 0 on an edge, two at a corner
+    a, b, c = (Vb[Fb[tri, k]] for k in range(3))
+    e1, e2, w = b - a, c - a, closest - a
+    d11, d12, d22 = (e1 * e1).sum(1), (e1 * e2).sum(1), (e2 * e2).sum(1)
+    w1, w2 = (w * e1).sum(1), (w * e2).sum(1)
+    det = np.maximum(d11 * d22 - d12 * d12, 1e-300)
+    u, v = (d22 * w1 - d12 * w2) / det, (d11 * w2 - d12 * w1) / det
+    weights = np.column_stack([1 - u - v, u, v])
+    border = np.flatnonzero(weights.min(axis=1) < 1e-6)
+    if not len(border):
+        return tri
+    m = np.arange(len(border))
+    rank = np.argsort(-weights[border], axis=1)
+    corners = Fb[tri[border]]
+    first = corners[m, rank[:, 0]]                                     # the corner nearest the point
+    second = np.where(weights[border, rank[:, 1]] >= 1e-6, corners[m, rank[:, 1]], -1)   # on an edge: its other end
+    # the triangles around `first` (vertex -> triangle lists, CSR), holding `second` too on an edge
+    order = np.argsort(Fb.ravel(), kind="stable")
+    start = np.concatenate([[0], np.cumsum(np.bincount(Fb.ravel(), minlength=len(Vb)))])
+    count = start[first + 1] - start[first]
+    owner = np.repeat(m, count)
+    groups = np.concatenate([[0], np.cumsum(count)[:-1]])
+    cand = order[np.repeat(start[first] - groups, count) + np.arange(count.sum())] // 3
+    holds = (second[owner] < 0) | (Fb[cand] == second[owner][:, None]).any(axis=1)
+    away = points[border][owner] - closest[border][owner]
+    score = np.where(holds, np.abs(np.einsum("ij,ij->i", away, np.asarray(mesh.face_normals)[cand])), -1.0)
+    tri[border] = cand[np.lexsort((-score, owner))[groups]]
+    return tri
 
 
 def fade_range(fade, position):

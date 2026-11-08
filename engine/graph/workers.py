@@ -72,40 +72,65 @@ class StickyPool:
         self._current = ctx.Value("i", 0)  # token of the run workers should be doing
         self._tasks = [ctx.Queue() for _ in range(n)]
         self._results = ctx.Queue()
-        self._procs = [ctx.Process(target=_worker_main, daemon=True,
-                                   args=(q, self._results, threads, self._cache_cap, self._current))
-                       for q in self._tasks]
-        for p in self._procs:
-            p.start()
+        # each worker starts when it is first given work: runs limited to fewer (by free GPU memory, or
+        # memory) left the rest idle, ~0.3 GB each (the lamp: 4 of 8, 1.2 GB)
+        self._procs = [None] * n
+        self._new_worker = lambda w: ctx.Process(target=_worker_main, daemon=True, args=(
+            self._tasks[w], self._results, threads, self._cache_cap, self._current))
+        self._threads = threads
         self._token = 0
         self.busy = False  # True while map() is running
         self.gpu = False   # set by the evaluator: whether the workers were started with the GPU on
         self.gpu_contexts = 0  # workers 0..n-1 have used the GPU (each keeps a CUDA context)
 
+    def _start(self, proc):
+        # numpy and scipy each load their own OpenBLAS, which commits ~23 MB per thread at once, one
+        # thread per logical core: 1.5 GB of commit per worker that is never touched (a GPU worker
+        # committed 2.5 GB while 0.7 GB was resident, and 7 of them took 17 GB of the PC's commit
+        # limit). A worker gets its share of the cores, as libigl does. It is read when the worker
+        # loads numpy, so it goes in this process's environment while the worker starts.
+        old = os.environ.get("OPENBLAS_NUM_THREADS")
+        os.environ["OPENBLAS_NUM_THREADS"] = str(self._threads)
+        try:
+            proc.start()
+        finally:
+            if old is None:
+                os.environ.pop("OPENBLAS_NUM_THREADS", None)
+            else:
+                os.environ["OPENBLAS_NUM_THREADS"] = old
+
+    def started(self):
+        return [p for p in self._procs if p is not None]
+
     def alive(self):
-        return all(p.is_alive() for p in self._procs)
+        return all(p.is_alive() for p in self.started())
 
     def pids(self):
-        return [p.pid for p in self._procs if p.is_alive()]
+        return [p.pid for p in self.started() if p.is_alive()]
 
     def shrink_caches(self):
         """Halve the workers' RAM caches (applied before their next item)."""
         self._cache_cap.value = max(self._cache_cap.value // 2, 16 << 20)
 
-    def map(self, fn, arg_list, on_progress=None, should_stop=None, active=None, lines=None):
+    def map(self, fn, arg_list, on_progress=None, should_stop=None, active=None, lines=None, on_item=None):
         """Run fn(**args) for each item; returns results in order. Raises WorkerError if an item
         fails. `active` limits how many workers are used (item i goes to worker i % active).
         `should_stop()` is polled while waiting; when it returns True the remaining items are
         abandoned (workers stay alive, with their caches) and None is returned. The (text, level)
-        lines the items report (core.report_message) are added to `lines`."""
+        lines the items report (core.report_message) are added to `lines`. `on_item(index, result)`
+        gets each item's result as it comes back."""
         self.busy = True
         try:
-            return self._map(fn, arg_list, on_progress, should_stop, active, lines)
+            return self._map(fn, arg_list, on_progress, should_stop, active, lines, on_item)
         finally:
             self.busy = False
 
-    def _map(self, fn, arg_list, on_progress, should_stop, active, lines):
+    def _map(self, fn, arg_list, on_progress, should_stop, active, lines, on_item=None):
         active = max(1, min(self.n, active or self.n))
+        for w in range(min(active, len(arg_list))):
+            if self._procs[w] is None:
+                self._procs[w] = self._new_worker(w)
+                self._start(self._procs[w])
         self._token += 1
         token = self._token
         self._current.value = token
@@ -142,6 +167,8 @@ class StickyPool:
                 lines.extend(said)
             if ok:
                 results[index] = value
+                if on_item and failure is None:
+                    on_item(index, value)
             elif failure is None:
                 failure = value
             if on_progress:
@@ -151,11 +178,11 @@ class StickyPool:
         return results
 
     def terminate(self):
-        for p in self._procs:
+        for p in self.started():
             if p.is_alive():
                 p.terminate()
         deadline = time.time() + 2
-        for p in self._procs:
+        for p in self.started():
             p.join(max(0.0, deadline - time.time()))
         # Items still waiting for a worker sit in a feeder thread that blocks forever once the
         # worker is gone (this process holds the pipe's other end too, so it never breaks): their
@@ -174,12 +201,13 @@ class StickyPool:
         ARRAY_CACHE.set_limit(ram_cache_budget()[0])  # no workers: the main process gets it all
 
     def close(self):
-        for q in self._tasks:
+        for q, p in zip(self._tasks, self._procs):
             try:
-                q.put(None)
+                if p is not None:
+                    q.put(None)
             except Exception:
                 pass
         deadline = time.time() + 2
-        for p in self._procs:
+        for p in self.started():
             p.join(max(0.0, deadline - time.time()))
         self.terminate()

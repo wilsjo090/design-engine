@@ -1,6 +1,6 @@
 import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { create } from 'zustand'
-import { api, getJSON, postJSON, startRun } from '../api'
+import { api, getJSON, postJSON, startRun, stopRun } from '../api'
 import { useStore } from '../store'
 import { useBrowser } from './FileBrowser'
 import type { Quality, Recipe } from '../types'
@@ -28,16 +28,29 @@ export async function openRecipe(path: string) {
     s.addLog(`Could not open ${path}: ${(err as Error).message}`, 'error')
     return
   }
-  // changes kept by the autosave that never made it into the file?
+  await offerRecovery(path)
+}
+
+/** Offer the changes the autosave kept for `path` (null: a new recipe) that never made it into a file, when
+ *  they differ from what is open now. */
+async function offerRecovery(path: string | null) {
   try {
     const saved = await api.autosave(path)
     const now = useStore.getState().recipe()
-    if (saved.recipe && saved.time && JSON.stringify(saved.recipe) !== JSON.stringify(now)) {
-      useRecovery.setState({ offer: { path, time: saved.time, recipe: saved.recipe } })
-    } else {
-      useRecovery.setState({ offer: null })
-    }
-  } catch { /* no autosave */ }
+    useRecovery.setState({ offer: saved.recipe && saved.time && JSON.stringify(saved.recipe) !== JSON.stringify(now)
+      ? { path, time: saved.time, recipe: saved.recipe } : null })
+  } catch {
+    useRecovery.setState({ offer: null })
+  }
+}
+
+/** Whether the autosave may write `path`'s slot: not while the banner offers what it holds back (the first
+ *  edit after opening overwrote it, and the banner's copy in this page was all that was left). */
+const mayAutosave = (path: string | null) => useRecovery.getState().offer?.path !== path
+
+function autosaveNow() {
+  const now = useStore.getState()
+  if (now.dirty && mayAutosave(now.recipePath)) api.putAutosave(now.recipePath, now.recipe()).catch(() => {})
 }
 
 export async function saveRecipe(saveAs = false) {
@@ -68,7 +81,7 @@ const confirmDiscard = () => {
   const s = useStore.getState()
   if (!s.dirty) return true
   if (!confirm('Discard unsaved changes?')) return false
-  api.dropAutosave(s.recipePath)
+  if (mayAutosave(s.recipePath)) api.dropAutosave(s.recipePath)   // (else it holds the changes still offered)
   return true
 }
 
@@ -81,10 +94,7 @@ export function useAutosave() {
         s.selections !== prev.selections || s.visible !== prev.visible
       if (!changed || !s.dirty) return
       if (timer) clearTimeout(timer)
-      timer = setTimeout(() => {
-        const now = useStore.getState()
-        if (now.dirty) api.putAutosave(now.recipePath, now.recipe()).catch(() => {})
-      }, 2000)
+      timer = setTimeout(autosaveNow, 2000)
     })
     return () => { unsubscribe(); if (timer) clearTimeout(timer) }
   }, [])
@@ -92,20 +102,27 @@ export function useAutosave() {
 
 export function RecoveryBanner() {
   const offer = useRecovery((s) => s.offer)
+  const edited = useStore((s) => s.dirty)
   if (!offer) return null
   const name = offer.path ? offer.path.split(/[\\/]/).pop()!.replace(/\.json$/i, '') : 'a new recipe'
   const when = new Date(offer.time * 1000)
   const sameDay = when.toDateString() === new Date().toDateString()
+  const time = `${sameDay ? '' : `${when.toLocaleDateString()} `}${when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
   return (
     <div className="recovery-banner">
-      <span>Unsaved changes to <b>{name}</b> from {sameDay ? '' : `${when.toLocaleDateString()} `}
-        {when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} were kept (the editor closed before saving).</span>
+      <span>Unsaved changes to <b>{name}</b> from {time} were kept (the editor closed before saving).
+        {edited && ' Your edits since are kept once you choose.'}</span>
       <button className="primary" onClick={() => {
         useStore.getState().loadRecipe(offer.recipe, offer.path, true)
         useStore.getState().addLog('Restored the unsaved changes: save to keep them', 'success')
         useRecovery.setState({ offer: null })
       }}>Restore</button>
-      <button onClick={() => { api.dropAutosave(offer.path); useRecovery.setState({ offer: null }) }}>Discard</button>
+      <button onClick={() => {
+        if (!confirm(`Throw away the changes to ${name} from ${time}? They cannot be brought back.`)) return
+        api.dropAutosave(offer.path)
+        useRecovery.setState({ offer: null })
+        autosaveNow()   // (edits made while it was offered)
+      }}>Discard</button>
     </div>
   )
 }
@@ -171,13 +188,15 @@ function RunStatus() {
     // what the view shows (bodies kept from a finer run count as that); null: nothing depends on the quality
     const shown = run.shown === undefined ? level : run.shown ? QUALITY_LABEL[run.shown] : ''
     if (run.next) return line('', `${shown} shown · refining to ${QUALITY_LABEL[target]}…`)
+    // refined as far as the quality chosen in the toolbar (it is remembered): say so when a finer one exists
+    const ceiling = refine && run.mode === 'preview' && !!run.shown && run.shown !== 'final' &&
+      QUALITIES.indexOf(run.shown) >= QUALITIES.indexOf(target)
     const text = run.mode === 'detail' && run.voxel
       ? `${shown ? `${shown} · ` : ''}on screen ${Number(run.voxel.toPrecision(2))} mm · ${run.message ?? ''}`
-      : `${run.mode === 'preview' && shown ? `${shown} · ` : ''}${run.message ?? ''}`
-    // refined as far as asked: say so when a finer quality exists
-    const ceiling = refine && run.mode === 'preview' && run.shown && run.shown === target && target !== 'final'
-    return line(run.message === 'Failed' ? 'error' : '', text, false,
-      ceiling ? `${text}\nRefined up to ${QUALITY_LABEL[target]}, the quality chosen in the toolbar: pick Final to go further` : text)
+      : `${run.mode === 'preview' && shown ? `${shown} · ` : ''}${run.message ?? ''}` +
+        (ceiling ? ` · stops at ${QUALITY_LABEL[target]}: pick Final to refine further` : '')
+    return line(run.message === 'Failed' ? 'error' : ceiling ? 'stale' : '', text, false,
+      ceiling ? `${text}\nRefine goes up to the quality chosen in the toolbar (${QUALITY_LABEL[target]})` : text)
   }
   const active = Object.entries(status).find(([, st]) => st.state === 'running')
   let detail = run.phase ?? ''
@@ -195,9 +214,11 @@ function RunStatus() {
   const stopping = (run.mode === 'preview' || run.mode === 'detail') && requested && Date.now() - requested.at > 300
   const after = run.mode !== 'preview' && queue?.preview_waiting ? ' · the preview follows' : ''
   const secs = ((Date.now() - run.startedAt) / 1000).toFixed(1)
-  const text = (stopping ? `Stopping the last update to show your change${detail ? ` (${detail})` : ''}…`
+  const text = (run.stopping ? `Stopping${detail ? ` (${detail})` : ''}…`
+    : stopping ? `Stopping the last update to show your change${detail ? ` (${detail})` : ''}…`
     : `${verb}${detail ? `: ${detail}` : '…'}`) + ` · ${secs}s${after}`
-  return line('running', text, true, stopping ? `${text}\nThe step running now cannot be interrupted` : text)
+  return line('running', text, true, run.stopping ? `${text}\nIt ends at the next point where the step can stop`
+    : stopping ? `${text}\nThe step running now cannot be interrupted` : text)
 }
 
 /** GPU on/off. Only shown when the engine found a CUDA GPU. */
@@ -226,7 +247,7 @@ function GpuToggle() {
 function MemoryMeter() {
   const connected = useStore((s) => s.connected)
   const [mem, setMem] = useState<{
-    used: number; limit: number; free: number; ssd_cache: number; gpu_free: number; gpu_total: number
+    used: number; limit: number; free: number; commit_room?: number; ssd_cache: number; gpu_free: number; gpu_total: number
   } | null>(null)
   useEffect(() => {
     if (!connected) return
@@ -241,8 +262,9 @@ function MemoryMeter() {
   const share = mem.used / mem.limit
   return (
     <span className={`memory-meter ${share > 0.85 ? 'high' : share > 0.6 ? 'mid' : ''}`}
-      title={`Engine memory ${gb(mem.used)} GB of its ${gb(mem.limit)} GB limit · ${gb(mem.free)} GB free on the PC · ` +
-        `SSD cache ${gb(mem.ssd_cache)} GB` +
+      title={`Engine memory ${gb(mem.used)} GB of its ${gb(mem.limit)} GB limit · ${gb(mem.free)} GB of RAM free on the PC` +
+        (mem.commit_room != null ? ` · the PC can give out ${gb(mem.commit_room)} GB more (RAM and page file)` : '') +
+        ` · SSD cache ${gb(mem.ssd_cache)} GB` +
         (mem.gpu_total ? ` · GPU memory ${gb(mem.gpu_total - mem.gpu_free)} of ${gb(mem.gpu_total)} GB in use (all programs)` : '')}>
       <span className="memory-bar"><span style={{ width: `${Math.min(100, share * 100)}%` }} /></span>
       <span className="memory-text">{gb(mem.used)} / {gb(mem.limit)} GB</span>
@@ -260,6 +282,7 @@ export function Toolbar({ onAddNode }: { onAddNode: () => void }) {
   const autoRun = useStore((s) => s.autoRun)
   const setAutoRun = useStore((s) => s.setAutoRun)
   const running = useStore((s) => s.run?.running ?? false)
+  const stopping = useStore((s) => !!s.run?.stopping)
   const [recipes, setRecipes] = useState<{ name: string; path: string }[]>([])
   const bar = useRef<HTMLDivElement>(null)
   useToolbarFit(bar)
@@ -281,6 +304,7 @@ export function Toolbar({ onAddNode }: { onAddNode: () => void }) {
         <button title="New recipe" onClick={() => {
           if (!confirmDiscard()) return
           useStore.getState().loadRecipe(STARTER, null)
+          offerRecovery(null)   // (a new recipe that was never saved)
         }}>New</button>
         <button title="Open a recipe file" onClick={async () => {
           if (!confirmDiscard()) return
@@ -312,8 +336,9 @@ export function Toolbar({ onAddNode }: { onAddNode: () => void }) {
           <input type="checkbox" checked={refine} onChange={(e) => setRefine(e.target.checked)} /> Refine
         </label>
         {running
-          ? <button className="danger" onClick={() => api.cancel()} title="Stop what is running now (queued exports still follow)">
-              ■<span className="tb-label"> Cancel</span></button>
+          ? <button className="danger" onClick={() => stopRun()} disabled={stopping}
+              title={stopping ? 'Stopping: the run ends at its next stopping point' : 'Stop what is running now (queued exports still follow)'}>
+              ■<span className="tb-label">{stopping ? ' Stopping…' : ' Cancel'}</span></button>
           : <button title="Update the preview (Ctrl+Enter)" onClick={() => startRun('preview')}>▶<span className="tb-label"> Update</span></button>}
         <button className="primary"
           title="Run at full resolution and write all export files. While something else runs it waits in the queue, and you can keep working."

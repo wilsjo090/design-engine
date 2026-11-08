@@ -80,11 +80,11 @@ def test_gpu_out_of_memory_falls_back_to_cpu(gpu, cad_part, monkeypatch):
     real = nodes._mesh_on
     used = []
 
-    def flaky(body, grid, xp, cut_hint):
+    def flaky(body, grid, xp, cut_hint, method="marching cubes"):
         used.append(xp.__name__)
         if xp is not np:
             raise gpu.cuda.memory.OutOfMemoryError(1 << 30, 0)   # as if another program took it
-        return real(body, grid, xp, cut_hint)
+        return real(body, grid, xp, cut_hint, method)
     monkeypatch.setattr(nodes, "_mesh_on", flaky)
     mesh = nodes._mesh(F.body_from_mesh(cad_part, 1.5), cad_part.bounds, 0.3, 1.5, 1.0)  # 2M voxels: GPU
     assert used == ["cupy", "numpy"] and mesh.is_watertight
@@ -204,6 +204,46 @@ def test_gpu_static_analysis_matches_cpu(gpu):
     assert on_gpu.report["imbalance"] < 1e-5
 
 
+def test_gpu_topology_surface_matches_cpu(gpu, monkeypatch):
+    # density_mesh's distance transforms, filters, labels and marching cubes on the GPU (a fine result's two
+    # smoothings took ~3 minutes on the CPU): thickened, a tip cut, a speck dropped, cropped, as on the CPU
+    from scipy.spatial import cKDTree
+    from engine.fea import topology as T
+    d = np.zeros((44, 30, 30), dtype=np.float32)
+    d[4:40, 12:18, 12:18] = 1.0          # a strut ...
+    d[20:24, 4:26, 14:16] = 1.0          # ... a thin plate across it (thickened)
+    d[30:32, 15:16, 18:27] = 1.0         # a needle off it (a tip, cut)
+    d[2:4, 2:4, 2:4] = 1.0               # a speck on its own (dropped)
+    phi = np.ones_like(d)
+    crop = F.X - 41.0                    # the design space ends before the strut does
+    meshes = {}
+    for name, xp in (("cpu", np), ("gpu", gpu)):
+        monkeypatch.setattr(T, "_smoothing_module", lambda samples, xp=xp: xp)
+        meshes[name] = T.density_mesh(d, phi, np.zeros(3), 1.0, blur=2.0, space=np.ones(d.shape, bool),
+                                      min_thickness=3.0, crop=crop)
+    cpu, on_gpu = meshes["cpu"], meshes["gpu"]
+    assert cpu.metadata["thickened"] > 0
+    for key in ("tips", "unreached"):
+        assert on_gpu.metadata[key] == cpu.metadata[key], key
+    assert on_gpu.metadata["thickened"] == pytest.approx(cpu.metadata["thickened"], rel=1e-3)
+    assert on_gpu.volume == pytest.approx(cpu.volume, rel=1e-4)
+    apart = max(cKDTree(cpu.vertices).query(on_gpu.vertices)[0].max(), cKDTree(on_gpu.vertices).query(cpu.vertices)[0].max())
+    assert apart < 1e-3, apart     # (mm; samples 0.5 mm apart)
+    # thin tips (thickening grows the needle above, so here directly): a needle off a block goes, a strut
+    # between two blocks and a plate stay (tests/test_topology.py), on the GPU as on the CPU
+    from scipy import ndimage
+    v = 0.25
+    solid = np.zeros((120, 110, 40), dtype=bool)
+    solid[10:50, 10:70, 10:30] = solid[80:110, 10:40, 10:30] = True
+    solid[50:80, 20:24, 18:22] = solid[50:90, 56:60, 18:22] = solid[10:50, 70:105, 18:22] = True
+    values = ((ndimage.distance_transform_edt(solid) - ndimage.distance_transform_edt(~solid)) * v).astype(np.float32)
+    inside = np.ones(solid.shape, dtype=bool)
+    out, tips = T.cut_tips(values, 0.0, inside, v, 2.0)
+    out_gpu, tips_gpu = T.cut_tips(gpu.asarray(values), 0.0, gpu.asarray(inside), v, 2.0)
+    assert tips == tips_gpu == 1
+    assert np.allclose(backend.to_host(out_gpu), out, atol=1e-5)
+
+
 @pytest.mark.parametrize("radius", [3, 10])   # direct and by FFT (topology's big struts-only filters)
 def test_gpu_topology_filter_matches_cpu(gpu, radius):
     from engine.fea import topology as T
@@ -247,9 +287,231 @@ def test_gpu_topology_outline_and_symmetry_match_cpu(gpu):
     assert np.allclose(mirrored_gpu, mirrored, atol=1e-6)
 
 
-@pytest.mark.parametrize("kind, joints", [("round", "fillet"), ("square tube", "fillet"), ("I", "ball"),
-                                          ("round tube", "plain")])
-def test_gpu_frame_bars_match_cpu(gpu, kind, joints):
+def test_gpu_max_section_matches_cpu(gpu):
+    # Max thickness and Max section pooled, their gradient and the move limits, in float32 on the GPU
+    from engine.fea import topology as T
+    rng = np.random.default_rng(4)
+    shape = (30, 20, 16)
+    xb = rng.random(shape)
+    domain = np.ones(shape)
+    domain[:, :, 12:] = 0.0
+    solid = np.zeros(shape, dtype=bool)
+    solid[:2] = True
+    free = (domain > 0) & ~solid
+    phi = domain * rng.uniform(0.7, 1.0, shape)
+    steps = rng.uniform(-0.1, 0.1, (2,) + shape)
+    found = []
+    for xp, dtype in ((np, np.float64), (gpu, np.float32)):
+        D = xp.asarray(domain, dtype=dtype)
+        p = T.Problem(None, xp.asarray(phi, dtype=dtype), xp.asarray(solid), xp.asarray(free), None, None,
+                      xp.asarray(np.ones((1, 1, 1)), dtype=dtype), D, D, float(phi.sum()), 0.3, 2.0, None, xp, dtype,
+                      local_sigma=1.5, section_sigma=3.0, section_share=0.15)
+        opt = object.__new__(T.Optimizer)   # (no solve: only the constraint)
+        opt.p, opt.local_scale, opt.moves, opt.last_step = p, 0.0, None, None
+        g, dg = opt._local_constraint(xp.asarray(xb, dtype=dtype))
+        for step in steps:
+            opt._track_moves(xp.asarray(step, dtype=dtype))
+        found.append((g, opt.section_max, opt.local_max, backend.to_host(dg), backend.to_host(opt.moves)))
+    (g, section, local, dg, moves), (g_gpu, section_gpu, local_gpu, dg_gpu, moves_gpu) = found
+    assert g_gpu == pytest.approx(g, rel=1e-3)
+    assert section_gpu == pytest.approx(section, rel=1e-3)
+    assert local_gpu == pytest.approx(local, rel=1e-3)
+    assert np.allclose(dg_gpu, dg, atol=1e-3 * np.abs(dg).max())
+    assert np.allclose(moves_gpu, moves, atol=1e-6)
+
+
+def test_gpu_solver_kernels_match_cupy_and_cpu(gpu, monkeypatch):
+    # the fused Warp kernels (engine/fea/gpu.py) against the CuPy code they replace, on every kind of
+    # level (an L-shaped part: its fine and first coarse levels go element by element), and the solve
+    # against the CPU in float64
+    from engine.fea import solver as S
+    from engine.fea.element import stiffness
+    shape = (24, 12, 16)
+    rng = np.random.default_rng(4)
+    scale = rng.uniform(0.5, 1.0, shape)
+    scale[6:, :, 4:] = 0.0                         # an L: 44% of the box
+    scale[4:6, 4:8, :] = 1e-6                      # and a nearly empty slot (stiff next to soft)
+    fixed = np.zeros(S.node_shape(shape) + (3,), dtype=bool)
+    fixed[0] = True
+    force = np.zeros(S.node_shape(shape) + (3,))
+    force[-1, :, :5, 2] = -1.0
+    H = S.Hierarchy(gpu.asarray(scale, dtype=np.float32), stiffness(0.3), fixed, (3, 2, 3), gpu, np.float32)
+    assert H.levels[0].cells is not None and [lv.kind for lv in H.levels] == ["fine", "children", "stored", "stored"]
+
+    def both(fn):
+        monkeypatch.setattr(S, "GPU_KERNELS", False)
+        a = backend.to_host(fn())
+        monkeypatch.setattr(S, "GPU_KERNELS", True)
+        return a, backend.to_host(fn())
+
+    def close(a, b, rel=1e-5):
+        return np.abs(a - b).max() <= rel * np.abs(a).max()
+    for level in H.levels:
+        u = gpu.asarray(rng.standard_normal(level.nodes + (3,)), dtype=np.float32)
+        assert close(*both(lambda: level.apply(u))), level.kind
+        assert close(*both(lambda: level.apply(u, masked=False))), level.kind
+        if level.direct is None:
+            r = u * level.free
+            x = gpu.asarray(rng.standard_normal(level.nodes + (3,)), dtype=np.float32) * level.free
+            assert close(*both(lambda: level.smooth(r))), level.kind
+            assert close(*both(lambda: level.smooth(r, x.copy()))), level.kind
+    u = gpu.asarray(rng.standard_normal(H.exact.nodes + (3,)))
+    assert close(*both(lambda: H.exact.apply(u)), 1e-12)
+    r = gpu.asarray(rng.standard_normal(H.levels[0].nodes + (3,)), dtype=np.float32) * H.free
+    assert close(*both(lambda: H.precondition(r)))
+    on_gpu, its, _ = H.solve(force, tol=1e-8)
+    cpu, its_cpu, _ = S.Hierarchy(scale, stiffness(0.3), fixed, (3, 2, 3)).solve(force, tol=1e-8)
+    assert close(cpu, backend.to_host(on_gpu), 1e-6)
+    assert abs(its - its_cpu) <= 2
+
+
+@pytest.mark.parametrize("shape, coarsenings", [((32, 32, 2), (3, 3, 0)), ((64, 3, 3), (4, 0, 0)), ((3, 24, 16), (0, 3, 3))])
+def test_gpu_solver_kernels_on_grids_not_halved_along_every_axis(gpu, monkeypatch, shape, coarsenings):
+    # a sheet or a bar: the level under the fine one has 4 or 2 children per element, not 8. The kernels took 8
+    # as given and read past each element's row: a plain 200 x 200 x 1 sheet gave nan on the GPU, also in Static
+    # Analysis, while the CPU solved it
+    from engine.fea import solver as S
+    from engine.fea.element import stiffness
+    rng = np.random.default_rng(5)
+    scale = rng.uniform(0.5, 1.0, shape)
+    fixed = np.zeros(S.node_shape(shape) + (3,), dtype=bool)
+    axis = int(np.argmax(shape))
+    fixed[(slice(None),) * axis + (0,)] = True
+    force = np.zeros(S.node_shape(shape) + (3,))
+    force[(slice(None),) * axis + (-1,) + (slice(None),) * (2 - axis) + (2 if axis != 2 else 0,)] = -1.0
+    H = S.Hierarchy(gpu.asarray(scale, dtype=np.float32), stiffness(0.3), fixed, coarsenings, gpu, np.float32)
+    assert H.levels[1].kind == "children" and H.levels[1].const.shape[0] == 2 ** sum(k > 0 for k in coarsenings)
+
+    def both(fn):
+        monkeypatch.setattr(S, "GPU_KERNELS", False)
+        a = backend.to_host(fn())
+        monkeypatch.setattr(S, "GPU_KERNELS", True)
+        return a, backend.to_host(fn())
+
+    def close(a, b, rel=1e-5):
+        return np.abs(a - b).max() <= rel * np.abs(a).max()
+    level = H.levels[1]
+    u = gpu.asarray(rng.standard_normal(level.nodes + (3,)), dtype=np.float32)
+    assert close(*both(lambda: level.apply(u)))
+    assert close(*both(lambda: level.apply(u, masked=False)))
+    r = gpu.asarray(rng.standard_normal(H.levels[0].nodes + (3,)), dtype=np.float32) * H.free
+    assert close(*both(lambda: H.precondition(r)))
+    on_gpu, its, _ = H.solve(force, tol=1e-8)
+    cpu, its_cpu, _ = S.Hierarchy(scale, stiffness(0.3), fixed, coarsenings).solve(force, tol=1e-8)
+    assert close(cpu, backend.to_host(on_gpu), 1e-6)
+    assert abs(its - its_cpu) <= 3
+
+
+def test_gpu_topology_runs_on_a_sheet_and_a_slender_bar(gpu, tmp_path):
+    # both stopped with "the solver did not converge" on the GPU: the kernels' children, then float32 rounding
+    # beside soft elements (the sheet at iteration 1, the bar at 50), which float64 takes over from
+    from engine import fields as F
+    from engine.fea import topology as T
+    from engine.fea.materials import PRESETS
+    from engine.fea.model import Condition, Conditions
+    from engine.graph.nodes import import_step
+    from test_fea import _box_step, _face_id
+    for size, iterations in (((200, 200, 1), 8), ((500, 5, 5), 60)):
+        mesh = import_step(_box_step(tmp_path / f"{size[0]}.step", size), 0.01, 1, 0.5)[0]
+        ids = mesh.face_attributes["cad_face"]
+        end = lambda at: mesh.triangles[ids == _face_id(mesh, 0, at)]
+        conds = Conditions((Condition("fixed", end(0.0)), Condition("load", end(float(size[0])), amount=50.0, direction="-Z")))
+        p = T.prepare(F.body_from_mesh(mesh, 2.0), conds, PRESETS["PLA"], keep=30.0, skin=0.25, detail="draft", xp=gpu)
+        opt = T.Optimizer(p, max_iterations=iterations).run()
+        assert opt.iteration == iterations and np.isfinite(backend.to_host(opt.x)).all()
+        assert opt.history[-1][1] == pytest.approx(0.3, abs=0.01)
+
+
+def test_gpu_solver_kernels_let_their_hierarchy_go(gpu):
+    # the kernels' data refers to its level weakly: a reference back kept every topology iteration's
+    # hierarchy (GPU memory) until Python's cycle collector ran, and a fine result's check no longer fit;
+    # the coarsest level's direct solver must not refer to its level either
+    import gc
+    import weakref
+    from engine.fea import solver as S
+    from engine.fea.element import stiffness
+    shape = (16, 8, 8)
+    fixed = np.zeros(S.node_shape(shape) + (3,), dtype=bool)
+    fixed[0] = True
+    force = np.zeros(S.node_shape(shape) + (3,))
+    force[-1, :, :, 2] = -1.0
+    H = S.Hierarchy(gpu.ones(shape, dtype=np.float32), stiffness(0.3), fixed, (2, 1, 1), gpu, np.float32)
+    H.solve(force)
+    assert all(level._gpu is not None for level in H.levels[:-1])
+    levels = [weakref.ref(level) for level in H.levels] + [weakref.ref(H.exact)]
+    gc.disable()
+    try:
+        del H
+        assert all(r() is None for r in levels)
+    finally:
+        gc.enable()
+
+
+def test_gpu_meshes_are_bounded_by_size(gpu, monkeypatch):
+    # every new shape is a new key: the GPU mesh cache keeps at most MAX_MESH_BYTES, the newest always
+    from collections import OrderedDict
+
+    from engine import sdf_gpu
+    meshes = [trimesh.creation.icosphere(subdivisions=3, radius=r) for r in (1.0, 2.0, 3.0)]
+    monkeypatch.setattr(sdf_gpu, "_MESHES", OrderedDict())
+    one = sdf_gpu._mesh(meshes[0].vertices, meshes[0].faces, None).nbytes
+    assert one > 0
+    monkeypatch.setattr(sdf_gpu, "MAX_MESH_BYTES", int(2.5 * one))
+    for i, m in enumerate(meshes):
+        sdf_gpu._mesh(m.vertices, m.faces, f"shape {i}")
+    assert list(sdf_gpu._MESHES) == ["shape 1", "shape 2"]
+    monkeypatch.setattr(sdf_gpu, "MAX_MESH_BYTES", 1)
+    sdf_gpu._mesh(meshes[0].vertices, meshes[0].faces, "big")
+    assert list(sdf_gpu._MESHES) == ["big"]
+
+
+@pytest.mark.parametrize("radius", [2, 6])   # the volume kernel convolves, or the filter goes by FFT
+def test_gpu_fused_oc_update_matches_cupy(gpu, monkeypatch, radius):
+    # the optimality criteria's root finding in fused kernels (gpu.Volume), with and without Max thickness
+    from engine.fea import solver as S
+    from engine.fea import topology as T
+    rng = np.random.default_rng(5)
+    shape = (30, 20, 16)
+    domain = np.ones(shape)
+    domain[:, :, 12:] = 0.0
+    solid = np.zeros(shape, dtype=bool)
+    solid[:2] = True
+    free = (domain > 0) & ~solid
+    phi = domain * rng.uniform(0.7, 1.0, shape)
+    o = np.arange(-radius, radius + 1)
+    kernel = np.maximum(radius + 0.5 - np.sqrt(o[:, None, None] ** 2 + o[None, :, None] ** 2 + o[None, None, :] ** 2), 0)
+    assert (kernel.size >= T.FFT_TAPS) == (radius == 6)
+    D, K = gpu.asarray(domain, dtype=np.float32), gpu.asarray(kernel, dtype=np.float32)
+    N = T._convolve(gpu, K.size)(D, K)
+    norm = gpu.where(N > 1e-4, 1.0 / gpu.where(N > 1e-4, N, 1.0), 0.0).astype(np.float32)
+    p = T.Problem(None, gpu.asarray(phi, dtype=np.float32), gpu.asarray(solid), gpu.asarray(free), None, None, K, norm,
+                  D, float(phi.sum()), 0.3, float(radius), None, gpu, np.float32)
+    opt = object.__new__(T.Optimizer)
+    opt.p, opt.beta, opt.local_scale, opt.pruned, opt.moves = p, 4.0, 0.0, None, None
+    f32 = lambda a: gpu.asarray(a, dtype=np.float32)
+    x = f32(np.where(solid, 1.0, rng.uniform(0.1, 0.6, shape)) * domain)
+    dc, dv, dg = f32(-rng.random(shape)), f32(rng.uniform(0.5, 1.0, shape)), f32(rng.random(shape) * 1e-3)
+    moves = f32(rng.uniform(0.01, 0.2, shape))
+
+    def limited():   # (Max section's move limits, per design variable)
+        opt.moves = moves
+        try:
+            return opt._update_two(x, dc, dv, dg, 0.3, 0.02)
+        finally:
+            opt.moves = None
+
+    for update in (lambda: opt._update(x, dc, dv), lambda: opt._update_two(x, dc, dv, dg, 0.3, 0.02), limited):
+        monkeypatch.setattr(S, "GPU_KERNELS", False)
+        a = update()
+        monkeypatch.setattr(S, "GPU_KERNELS", True)
+        b = update()
+        assert float(gpu.abs(a - b)[p.free].max()) < 1e-4
+        assert p.volume(opt.physical(b)[1]) == pytest.approx(p.volume(opt.physical(a)[1]), abs=1e-5)
+
+
+@pytest.mark.parametrize("kind, joints, continuity", [("round", "fillet", "G1"), ("square tube", "fillet", "G2"),
+                                                      ("I", "ball", "G3"), ("round tube", "plain", "G1")])
+def test_gpu_frame_bars_match_cpu(gpu, kind, joints, continuity):
     # the frame kernel (profiles, mitres, fillets between different bars) on the GPU and on Warp's CPU
     from engine.frame import curves as CV
     from engine.frame.geometry import frame_solid
@@ -259,7 +521,8 @@ def test_gpu_frame_bars_match_cpu(gpu, kind, joints):
     fixed = np.zeros((4, 3), dtype=bool)
     n2, b2, _, c2, _, _ = CV.smooth_bars(nodes, bars, np.ones(5), np.arange(5), fixed, np.zeros((4, 3)), 1.0)
     sizes = np.linspace(3.0, 6.0, int(c2.max()) + 1)
-    body = frame_solid(n2, b2, c2, sizes, Profile(kind, ratio=1.5 if kind == "I" else 1.0), joints, f"gpu-{kind}")
+    body = frame_solid(n2, b2, c2, sizes, Profile(kind, ratio=1.5 if kind == "I" else 1.0), joints, f"gpu-{kind}",
+                       continuity=continuity)
     grid = Grid((-6, -6, -6), (52, 27, 27), 0.4)
     cpu = F.Context(grid, None, np).eval_full(body)
     on_gpu = backend.to_host(F.Context(grid, None, gpu).eval_full(body))

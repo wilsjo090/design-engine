@@ -122,6 +122,33 @@ def test_multigrid_converges_with_holes_and_a_million_to_one_contrast():
     assert np.linalg.norm(r) <= 1.01e-6 * np.linalg.norm(force * H.free)
 
 
+def test_a_strut_web_gets_as_fine_a_coarsest_level_as_the_fill_budget_allows():
+    # a topology result of thin struts took 154 iterations with its grid's 4 coarse levels, whose elements grow
+    # wider than the struts, and 28 with level 1 factorized directly (SuperLU without pivots: 1.2 s for 86k unknowns)
+    from engine.fea import solver as S
+    x, y, z = np.mgrid[0:32, 0:32, 0:32] % 8 < 2
+    scale = ((y & z) | (x & z) | (x & y)).astype(float)   # a cubic lattice of struts 2 elements thick
+    fixed = np.zeros((33, 33, 33, 3), dtype=bool)
+    fixed[0] = True
+    force = np.zeros((33, 33, 33, 3))
+    force[-1, :, :, 2] = -1.0
+    ks = plan_coarsenings((32, 32, 32))[0]
+    old = Hierarchy(scale, EL.stiffness(0.3), fixed, ks)
+    u_old, its_old, _ = old.solve(force, tol=1e-6)
+    same = Hierarchy(scale, EL.stiffness(0.3), fixed, ks, direct_fill=1)    # (the coarsest is always factorized)
+    assert len(same.levels) == len(old.levels)
+    fewer = Hierarchy(scale, EL.stiffness(0.3), fixed, ks, direct_fill=300_000)
+    u, its, _ = fewer.solve(force, tol=1e-6)
+    assert 1 < len(fewer.levels) < len(old.levels) and its < its_old, (len(fewer.levels), its, its_old)
+    assert np.abs(u - u_old).max() <= 1e-5 * np.abs(u_old).max()
+    whole = Hierarchy(scale, EL.stiffness(0.3), fixed, ks, direct_fill=10**12)  # small enough to factorize whole
+    u, its, _ = whole.solve(force, tol=1e-6)
+    assert len(whole.levels) == 1 and its <= 3 and np.abs(u - u_old).max() <= 1e-5 * np.abs(u_old).max()
+    A, free = S._assemble(old.levels[-1])   # without pivots, as with them
+    b = np.random.default_rng(0).standard_normal(A.shape[0])
+    assert np.allclose(S._factorize(A, symmetric=True).solve(b), S._factorize(A).solve(b), rtol=1e-8, atol=1e-12)
+
+
 def test_a_float32_multigrid_stays_float32_and_cg_stops_when_converged(monkeypatch):
     # lmax was a NumPy float64 scalar, which turns float32 arrays into float64 ones (NumPy 2, CuPy
     # 14): the GPU's float32 preconditioner ran in float64
@@ -218,6 +245,14 @@ def test_a_bearing_load_presses_only_on_the_contact_side():
     assert sizes[low] < 0.5 < sizes.max() <= 1.0                                  # a short arrow
     with pytest.raises(ConditionError, match="needs a direction"):
         Condition("load", hole.triangles, load="bearing", amount=1.0, direction="into the face").traction(normals)
+    # along the hole (its axis is Y) nothing presses: scaling the rounding noise up to 600 N gave 1.2e18 N sideways,
+    # and the optimizer then left the part's real loads hanging in the air. 5 degrees off the axis is 11 x the force
+    along = {"direction": "custom", "vector": (0.0, 1.0, -0.0875)}
+    for settings in ({"direction": "+Y"}, {"direction": "-Y"}, along):
+        with pytest.raises(ConditionError, match="along the hole"):
+            Condition("load", hole.triangles, load="bearing", amount=600.0, **settings).check()
+    Condition("load", hole.triangles, load="bearing", amount=600.0, direction="custom", vector=(0.0, 1.0, -1.0)).check()
+    Condition("load", hole.triangles, load="force", amount=600.0, direction="+Y").check()   # what it should be
 
 
 def test_markers_tell_which_cad_face_and_body_each_point_is_on():
@@ -437,6 +472,52 @@ def test_the_safety_factor_colours_on_a_fixed_scale(beam):
     assert lo == pytest.approx(failing.report["min_safety"]) and lo < 1.0 and hi == 10.0
 
 
+def test_load_cases_act_apart_and_the_worst_counts(beam):
+    # a cantilever pushed down in one case and sideways in the other: each case is solved on its own (as
+    # if it were alone), the report has both, and the result is the worst of them everywhere
+    import dataclasses
+    pla = PRESETS["PLA"]
+    part = F.body_from_mesh(beam, 2.0)
+    fixed = Condition("fixed", _face_triangles(beam, 0, 0.0))
+    down = Condition("load", _face_triangles(beam, 0, 100.0), amount=100.0, direction="-Z")
+    side = Condition("load", _face_triangles(beam, 0, 100.0), amount=50.0, direction="+Y")
+    alone = [static_analysis(part, Conditions((fixed, c)), pla, h=2.0).report for c in (down, side)]
+    both = Conditions((fixed, dataclasses.replace(down, case="Case 1"), dataclasses.replace(side, case="Case 2")))
+    result = static_analysis(part, both, pla, h=2.0)
+    r = result.report
+    assert [c["name"] for c in r["cases"]] == ["Case 1", "Case 2"] and "Case 2: max stress" in result.summary()
+    for c, a in zip(r["cases"], alone):
+        assert c["max_displacement"] == pytest.approx(a["max_displacement"], rel=1e-6)
+        assert c["max_away"] == pytest.approx(a["max_away"], rel=1e-6)
+    assert r["max_displacement"] == pytest.approx(max(a["max_displacement"] for a in alone), rel=1e-6)
+    assert r["min_safety"] == pytest.approx(min(a["min_safety"] for a in alone), rel=1e-6)
+    # without cases both act at once: it bends more than in either case
+    assert static_analysis(part, Conditions((fixed, down, side)), pla, h=2.0).report["max_displacement"] > \
+        r["max_displacement"]
+
+
+def test_load_case_nodes_tag_their_loads_and_share_the_supports(beam):
+    from engine.graph.core import GraphError
+    from engine.graph.nodes_fea import load_case
+    end, tip = _face_triangles(beam, 0, 0.0), _face_triangles(beam, 0, 100.0)
+    fixed = Condition("fixed", end)
+    a = Condition("load", tip, amount=10.0, direction="-Z")
+    b = Condition("load", tip, amount=20.0, direction="+Y")
+    c = Condition("load", tip, amount=5.0, direction="+X")      # in no case: acts in every case
+    first = load_case(Conditions((fixed, a)), "Case 10", Conditions((fixed, c)))
+    both = load_case(Conditions((b,)), "Case 9", first)
+    assert [x.case for x in both] == [None, None, "Case 10", "Case 9"]   # the support once
+    cases = both.cases()
+    assert [n for n, _ in cases] == ["Case 9", "Case 10"]              # natural order
+    assert [[x.amount for x in subset] for _, subset in cases] == [[0.0, 5.0, 20.0], [0.0, 5.0, 10.0]]
+    merged = load_case(Conditions((b,)), "Case 10", first)             # the same name: one case
+    assert [n for n, _ in merged.cases()] == ["Case 10"] and len(merged.cases()[0][1]) == 4
+    assert Conditions((fixed, a)).cases() == [(None, Conditions((fixed, a)))]
+    assert Conditions((fixed, a)).key != first.key                       # a case is in the key
+    with pytest.raises(GraphError, match="connect this case's loads"):
+        load_case(Conditions((fixed,)), "Case 1", None)
+
+
 def test_a_part_without_support_is_refused(beam):
     part = F.body_from_mesh(beam, 2.0)
     conds = Conditions((Condition("load", _face_triangles(beam, 0, 100.0), amount=10.0, direction="-Z"),))
@@ -507,6 +588,26 @@ def test_the_nodes_analyse_a_part_and_report(beam_step, beam):
     assert set(load_markers[0]["faces"]) == {_face_id(beam, 0, 100.0)}
 
 
+def test_load_case_nodes_feed_an_analysis(beam_step, beam):
+    # the down load in its own case, a sideways one in another: the log has a line per case and the worst
+    from engine.graph import Evaluator, Graph
+    link = lambda ref: {"link": ref}
+    recipe = _recipe(beam_step, beam)
+    nodes = recipe["nodes"]
+    nodes["down"] = nodes.pop("load")
+    nodes["side"] = {"type": "sim.load", "inputs": {"cad": link("body.body"), "faces": str(_face_id(beam, 0, 100.0)),
+                                                    "amount": 50.0, "direction": "+Y"}}
+    nodes["case_a"] = {"type": "sim.load_case", "inputs": {"loads": link("down.conditions"), "name": "Down"}}
+    nodes["case_b"] = {"type": "sim.load_case", "inputs": {"loads": link("side.conditions"), "name": "Side",
+                                                           "add_to": link("case_a.conditions")}}
+    nodes["static"]["inputs"]["conditions"] = link("case_b.conditions")
+    events = []
+    Evaluator(Graph.from_dict(recipe), workers=1, log=None, on_event=events.append).run(["static"])
+    lines = [e["text"] for e in events if e["type"] == "message"]
+    assert any("(the worst of 2 load cases)" in t for t in lines), lines
+    assert any(t.startswith("Down: max stress") for t in lines) and any(t.startswith("Side: max stress") for t in lines)
+
+
 def test_previews_show_supports_and_colour_the_analysed_part(beam_step, beam):
     from engine.server import build_run_graph
     _, targets, views, _ = build_run_graph(_recipe(beam_step, beam), "preview", "draft", ["static"])
@@ -516,3 +617,102 @@ def test_previews_show_supports_and_colour_the_analysed_part(beam_step, beam):
     del half_wired["nodes"]["fixed"]["inputs"]["cad"]
     _, targets, _, _ = build_run_graph(half_wired, "preview", "draft", [])
     assert "fixed" not in targets and "load" not in targets         # would fail the run
+
+
+def test_analysis_stops_idle_workers_when_it_does_not_fit(monkeypatch):
+    # a Final preview's idle workers held the RAM (and GPU memory) an optimized part's check needed:
+    # the analysis stops them, says so in the log, and decides again
+    from engine.graph import core, nodes_fea
+    gb = 2 ** 30
+
+    class Run:   # the evaluator, as a node running in the main process sees it
+        def __init__(self, workers):
+            self.workers, self.lines = workers, []
+
+        def _stop_idle_workers(self):
+            stopped, self.workers = self.workers, False
+            if stopped:
+                room[0] += 4 * gb   # their memory comes back
+            return stopped
+
+        def _message(self, node_id, text, level):
+            self.lines.append(text)
+    room = [1.5 * gb]
+    monkeypatch.setattr(nodes_fea, "memory_room", lambda: room[0])
+    monkeypatch.setattr(nodes_fea, "memory_limit", lambda: 7 * gb)
+    monkeypatch.setattr(nodes_fea.backend, "gpu_enabled", lambda: False)
+    elements = int(4 * gb / nodes_fea.CPU_BYTES_PER_ELEMENT)   # 4 GB: 1.5 GB of room, 5.5 after
+    for workers, fits in ((True, True), (False, False)):
+        run = Run(workers)
+        room[0] = 1.5 * gb
+        monkeypatch.setattr(core._current, "ctx", (run, "check"), raising=False)
+        if fits:
+            assert nodes_fea._array_module(elements) is np
+            assert not run.workers and len(run.lines) == 1 and "stopped the idle worker" in run.lines[0]
+        else:
+            with pytest.raises(nodes_fea.GraphError):
+                nodes_fea._array_module(elements)
+            assert run.lines == []
+    run = Run(True)   # fits as it is: the workers stay
+    room[0] = 8.5 * gb
+    monkeypatch.setattr(core._current, "ctx", (run, "check"), raising=False)
+    assert nodes_fea._array_module(elements) is np and run.workers and run.lines == []
+
+
+def test_analysis_makes_room_on_the_gpu_cheapest_first(monkeypatch):
+    # a fine topology result's check went to the CPU (10 minutes) with 0.2 GB of GPU memory short: this process's
+    # Warp meshes go first, then the idle workers; what still does not fit says so in the log
+    from engine.graph import core, nodes_fea
+    gb = 2 ** 30
+    gpu = {"free": 0.0, "caches": 0.0, "workers": 0.0}
+
+    class Run:
+        def __init__(self):
+            self.lines, self.stopped = [], False
+
+        def _stop_idle_workers(self):
+            self.stopped, freed = True, gpu["workers"] > 0
+            gpu["free"], gpu["workers"] = gpu["free"] + gpu["workers"], 0.0
+            return freed
+
+        def _message(self, node_id, text, level):
+            self.lines.append(text)
+
+    def drop_caches():
+        freed = gpu["caches"] > 0
+        gpu["free"], gpu["caches"] = gpu["free"] + gpu["caches"], 0.0
+        return freed
+    monkeypatch.setattr(nodes_fea.backend, "gpu_enabled", lambda: True)
+    monkeypatch.setattr(nodes_fea.backend, "cupy", lambda: "cupy")
+    monkeypatch.setattr(nodes_fea.backend, "release_gpu_memory", lambda: None)
+    monkeypatch.setattr(nodes_fea.backend, "release_gpu_caches", drop_caches)
+    monkeypatch.setattr(nodes_fea.backend, "gpu_memory", lambda: (int(gpu["free"]), 12 * gb))
+    monkeypatch.setattr(nodes_fea, "memory_room", lambda: 20 * gb)
+    monkeypatch.setattr(nodes_fea, "memory_limit", lambda: 20 * gb)
+    elements = 4_000_000
+    need = nodes_fea.gpu_bytes(elements) + nodes_fea.backend.GPU_HEADROOM
+    for free, caches, workers, device, stopped in (
+            (need + gb, 0, 0, "cupy", False),          # fits as it is
+            (need - 0.2 * gb, 0.5 * gb, gb, "cupy", False),   # the meshes are enough: the workers stay
+            (need - gb, 0.5 * gb, gb, "cupy", True),   # both
+            (need - 3 * gb, 0.5 * gb, gb, np, True)):  # neither: the CPU, and the log says why
+        gpu.update(free=free, caches=caches, workers=workers)
+        run = Run()
+        monkeypatch.setattr(core._current, "ctx", (run, "check"), raising=False)
+        assert nodes_fea._array_module(elements) is device and run.stopped == stopped
+        assert any("runs on the CPU" in t for t in run.lines) == (device is np)
+    # the same before Topology Optimization smooths its result (it runs ~10x as long on the CPU)
+    monkeypatch.setattr(nodes_fea.backend, "use_gpu_for", lambda samples: True)
+    shape = (208, 88, 176)
+    need = nodes_fea.T.smoothing_samples(shape, 2.0) * nodes_fea.T.SMOOTH_GPU_BYTES + nodes_fea.backend.GPU_HEADROOM
+    for free, caches, workers, fits, stopped in (
+            (need + gb, gb, gb, True, False),          # fits as it is: nothing dropped or stopped
+            (need - 0.2 * gb, 0.5 * gb, gb, True, False),
+            (need - gb, 0.5 * gb, gb, True, True),
+            (need - 3 * gb, 0.5 * gb, gb, False, True)):
+        gpu.update(free=free, caches=caches, workers=workers)
+        run = Run()
+        monkeypatch.setattr(core._current, "ctx", (run, "smooth"), raising=False)
+        nodes_fea._room_for_smoothing(shape, 2.0)
+        assert run.stopped == stopped and (gpu["caches"] == caches) == (free > need)
+        assert any("smoothing the shape runs on the CPU" in t for t in run.lines) == (not fits)

@@ -33,9 +33,9 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from .graph import REGISTRY, Cancelled, Evaluator, Graph, GraphError, compatibility, node_catalog
-from .graph.core import FREE_TIGHT, GROUP_SEP
-from . import backend
-from .cache import available_memory, default_cache_dir, memory_limit
+from .graph.core import COMMIT_TIGHT, FREE_TIGHT, GROUP_SEP
+from . import backend, native_dialog
+from .cache import available_memory, commit_room, default_cache_dir, memory_limit
 from .slice import field_slice
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,7 +47,7 @@ DIST = ROOT / "frontend" / "dist"
 QUALITY = {"draft": (4.0, 128), "medium": (2.0, 256), "final": (1.0, 512)}
 LEVELS = list(QUALITY)  # coarse to fine
 # node types build_run_graph changes with the quality: what needs one shows more detail at a finer quality
-QUALITY_TYPES = ("mesh.from_implicit", "mesh.merge")
+QUALITY_TYPES = ("mesh.from_implicit", "mesh.merge", "mesh.reduce")
 DISPLAYABLE = ("mesh", "cad", "implicit")
 # simple shapes the editor draws itself (Viewport's guide shapes), so they follow a drag at once
 DRAWN_BY_VIEWPORT = ("implicit.ball", "implicit.bar", "implicit.box")
@@ -125,13 +125,14 @@ def _content_key(graph, inputs, src, port, extra=""):
     return hashlib.sha1(blob.encode()).hexdigest()[:20]
 
 
-def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0, have=None):
+def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0, have=None, only=None):
     """The graph actually evaluated: preview quality applied to mesh nodes, plus hidden
     `mesh.view` nodes for visible implicit bodies. Returns (graph, targets, views, slices) where
     views maps a visible node id to its ViewSpec and slices maps a visible field node to the
     (node id, port) of the field. A visible group node shows its first displayable output (or its
     field). `have`: {node: {key, level}} of the views the editor shows; one with the same key at
-    this quality or finer is kept (not computed again)."""
+    this quality or finer is kept (not computed again). `only`: an export writes just these Export
+    nodes (all of them when None), and makes no views: the editor keeps what it shows."""
     multiplier, cells = QUALITY[quality]
     graph = Graph.from_dict(copy.deepcopy(graph_dict))
     voxel_default = REGISTRY["mesh.from_implicit"].input("voxel").default
@@ -142,12 +143,16 @@ def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0, 
             voxel = inputs.get("voxel", voxel_default)
             if not _is_link(voxel):
                 inputs["voxel"] = float(voxel) * multiplier
+            elif multiplier != 1.0:  # from a Number or Math: the node scales it (a Draft at full detail took minutes)
+                inputs["coarser"] = multiplier
             if quality != "final":
                 inputs["keep"] = 1.0  # decimation only matters for the files you export
                 inputs["tolerance"] = 0.0
         elif spec.get("type") == "mesh.merge" and quality != "final":
             # looks the same unfused, and coarse draft meshes may not overlap enough to join
             spec.setdefault("inputs", {})["fuse"] = "no"
+        elif spec.get("type") == "mesh.reduce" and quality != "final":
+            spec.setdefault("inputs", {})["skip"] = 1   # (looks the same; only the files need it)
 
     _set_compute(graph, mode, optimize, stamp)
     if mode == "optimize":
@@ -155,8 +160,10 @@ def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0, 
             raise GraphError(f"no node '{optimize}' to optimize")
         return graph, [optimize], {}, {}
     targets, views, slices = [], {}, {}
-    if mode == "export":
-        targets = [n for n, s in graph.nodes.items() if s.get("type") in REGISTRY and REGISTRY[s["type"]].side_effect]
+    if mode == "export":  # (no views: they meshed every shown body again at 512 cells after the files)
+        targets = [n for n, s in graph.nodes.items() if s.get("type") in REGISTRY and REGISTRY[s["type"]].side_effect
+                   and (only is None or n in only)]
+        return graph, list(dict.fromkeys(targets)), views, slices
     else:  # supports and loads: their markers are drawn whether or not anything uses them yet
         targets = [n for n, s in graph.nodes.items() if s.get("type") in REGISTRY and REGISTRY[s["type"]].preview
                    and _wired(graph, n)]
@@ -179,10 +186,13 @@ def build_run_graph(graph_dict, mode, quality, visible, optimize=None, stamp=0, 
         if out is None:
             field_out = next((o for o in outputs if o[1] == "scalar"), None)
             if field_out is not None:  # a plain field: shown as a coloured slice plane
-                slices[node_id] = (field_out[2], field_out[3])
-                targets.append(field_out[2])
+                ref = f"{field_out[2]}.{field_out[3]}"
+                slices[node_id] = tuple(graph.bypassed.get(ref, ref).split(".", 1))
+                targets.append(slices[node_id][0])
             continue
         _, out_type, src, port = out
+        # a bypassed node shows what it passes on
+        src, port = graph.bypassed.get(f"{src}.{port}", f"{src}.{port}").split(".", 1)
         key = _content_key(graph, before, src, port, out_type)
         # a body meshed for the view, or coloured on a grid, gets finer with the quality
         exact = out_type != "implicit" and own_paint is None and not any(
@@ -213,8 +223,9 @@ def pack_slice(image):
 
 
 def display_arrays(value):
-    """(vertices float32, triangles uint32) of a mesh or a list of meshes, as shown in the 3D view
-    (decimated if too big to display)."""
+    """(vertices float32, triangles uint32, triangles per list item) of a mesh or a list of meshes, as
+    shown in the 3D view (decimated if too big to display). Each item's triangles follow the one's
+    before."""
     items = list(value) if isinstance(value, list) else [value]
     total = sum(len(m.faces) for m in items)
     keep = min(1.0, DISPLAY_MAX_FACES / total) if total else 1.0
@@ -227,14 +238,16 @@ def display_arrays(value):
         offset += len(m.vertices)
     V = np.concatenate(verts) if verts else np.zeros((0, 3), np.float32)
     F = np.concatenate(faces) if faces else np.zeros((0, 3), np.uint32)
-    return V, F
+    return V, F, [len(f) for f in faces]
 
 
-def pack_meshes(value):
-    """One binary blob for a mesh or a list of meshes. Returns (blob, vertices, triangles)."""
-    V, F = display_arrays(value)
+def pack_meshes(value, counts=False):
+    """One binary blob for a mesh or a list of meshes. Returns (blob, vertices, triangles), and with
+    `counts` the triangles of each list item (None for a single mesh)."""
+    V, F, per_item = display_arrays(value)
     header = np.array([len(V), len(F)], dtype=np.uint32)
-    return header.tobytes() + V.tobytes() + F.tobytes(), len(V), len(F)
+    packed = header.tobytes() + V.tobytes() + F.tobytes(), len(V), len(F)
+    return (*packed, per_item if isinstance(value, list) else None) if counts else packed
 
 
 def unpack_meshes(blob):
@@ -275,10 +288,12 @@ def view_voxel(value):
     return float(min(found)) if found and all(found) else None
 
 
-def detail_floor(graph, src, quality):
+def detail_floor(graph, src, quality, shown=None):
     """The finest voxel the editor's detail of a view made by `src` may use, or None when the view
     gets no detail: a body meshed for the view goes down to DETAIL_MIN_VOXEL, a Mesh from Implicit
-    Body to its own voxel (finer would show what its file will not have)."""
+    Body to its own voxel (finer would show what its file will not have; a linked voxel is known from
+    what the view was meshed with, `shown`); none for one meshed by dual contouring (details are
+    marching cubes, which would round off the edges it keeps)."""
     from .graph.nodes import DETAIL_MIN_VOXEL
     spec = graph.nodes.get(src) or {}
     inputs = spec.get("inputs", {})
@@ -286,9 +301,12 @@ def detail_floor(graph, src, quality):
         return None
     if spec.get("type") == "mesh.view":
         return DETAIL_MIN_VOXEL
-    if spec.get("type") == "mesh.from_implicit" and inputs.get("domain") is None:
+    method = inputs.get("method", REGISTRY["mesh.from_implicit"].input("method").default)
+    if spec.get("type") == "mesh.from_implicit" and inputs.get("domain") is None and method == "marching cubes":
         voxel = inputs.get("voxel", REGISTRY["mesh.from_implicit"].input("voxel").default)
-        return None if _is_link(voxel) else max(float(voxel) / QUALITY[quality][0], DETAIL_MIN_VOXEL)
+        if _is_link(voxel):
+            return None if shown is None else max(float(shown) / QUALITY[quality][0], DETAIL_MIN_VOXEL)
+        return max(float(voxel) / QUALITY[quality][0], DETAIL_MIN_VOXEL)
     return None
 
 
@@ -322,6 +340,7 @@ class Session:
         self.hub = hub
         workers = max(2, min(8, (os.cpu_count() or 4) // 2))
         self.evaluator = Evaluator(Graph(), workers=workers, log=None, on_event=self._on_event)
+        self._body_infos = {}  # /api/bodies answers by (node, port, its result's signature and object)
         self.thread = None
         self.current = None   # the job running (or last run)
         self.queue = []       # exports waiting
@@ -330,7 +349,7 @@ class Session:
         self.views = {}  # node id -> (version, bytes); also "slice:<node>" and "paint:<node>"
         self.view_faces = {}  # node id -> (version, CAD bodies shown, triangles shown, packed faces or None)
         self.face_infos = {}  # (node id, view version, body, face) -> /api/faceinfo answer (newest few)
-        self.view_sources = {}  # node id -> (version, graph of that run, node id, port, quality): what its view shows
+        self.view_sources = {}  # node id -> (version, graph of that run, node id, port, quality, detail floor): what its view shows
         self.view_version = 0
         self._job_ids = itertools.count(1)
         self._owners = {}     # node id inside a group -> group node (events are shown on the group)
@@ -340,6 +359,20 @@ class Session:
         self._start_lock = threading.Lock()
         self._requests = 0
         self.stamp = 0  # bumped after optimize/export jobs: previews then read optimization results again
+        # the editor tab using the engine (its client id): every tab gets every event, and views are kept by
+        # node id, so a second tab (an old one reconnecting after a restart) showed the other's parts under
+        # its own node names; the others pause (`claim`)
+        self.active = None
+        # this engine process, told to every tab that connects (`hello`): run ids and view versions start at 1
+        # in a new one, so a tab still showing an older engine's views makes them all again
+        self.engine = f"{os.getpid()}-{time.time_ns()}"
+
+    def claim(self, client):
+        """Editor tab `client` uses the engine from now on (any run, optimize or detail it asks for, or
+        its Use this tab): the other tabs are told, and show no other tab's results until used again."""
+        if client and client != self.active:
+            self.active = client
+            self.hub.publish({"type": "active", "client": client})
 
     def _on_event(self, event):
         node = event.get("node", "")
@@ -401,10 +434,11 @@ class Session:
 
     # --- runs and the export queue ------------------------------------------------------
     def start(self, graph_dict, mode, quality, visible, slice_settings=None, label=None, optimize=None, have=None,
-              tag=None):
+              tag=None, only=None):
         """Run (or queue) a job. `have`: {node: {key, level, version}} of the views the editor shows (a
         preview keeps those it would compute the same at this quality or coarser); `tag`: anything the
-        editor wants back with the job's run_start (it sends its graph version)."""
+        editor wants back with the job's run_start (it sends its graph version); `only`: the Export nodes
+        an export writes (all when None)."""
         if quality not in QUALITY:
             raise HTTPException(400, f"unknown quality '{quality}'")
         # only views the editor and this server still agree on (the server may have restarted)
@@ -412,7 +446,7 @@ class Session:
                 if isinstance(h, dict) and self.views.get(n, (None,))[0] == h.get("version")}
         try:
             graph, targets, views, slices = build_run_graph(graph_dict, mode, quality, visible, optimize, self.stamp,
-                                                            have)
+                                                            have, only)
         except Exception as err:
             raise HTTPException(400, f"bad graph: {err}")
         job = {"id": next(self._job_ids), "graph": graph, "targets": targets, "views": views, "slices": slices,
@@ -426,6 +460,10 @@ class Session:
         # only the newest preview of them runs. Exports are never dropped or cancelled by others.
         with self._start_lock:
             if self.exporting():
+                if mode == "optimize" and any(j["label"] == job["label"] and j.get("tag") == job["tag"]
+                                              for j in (self.current, *self.queue)):
+                    return self.run_id  # a second click while the first waited: Stop would just have started it
+                    # (the same tag, so the same recipe: a changed setting's click must not get lost)
                 if mode in LONG_JOBS:
                     self.queue.append(job)
                 else:
@@ -447,8 +485,7 @@ class Session:
             item = self.view_sources.get(node_id)
         if item is None or item[0] != version:
             raise HTTPException(409, f"the view of {node_id} has changed")
-        _, graph, src, _, quality = item
-        floor = detail_floor(graph, src, quality)
+        _, graph, src, _, quality, floor = item
         if floor is None:
             raise HTTPException(409, f"the view of {node_id} cannot be shown finer")
         try:
@@ -484,6 +521,7 @@ class Session:
 
     def _launch(self, job):
         graph = job["graph"]
+        self.evaluator.clear_stop()  # (the run before has ended: all callers joined it)
         with self._lock:
             self.run_id += 1
             run_id = self.run_id
@@ -538,14 +576,23 @@ class Session:
             self.evaluator.cancel()
             self.thread.join()
 
+    def request_stop(self):
+        """The Stop button: the run stops at its next stopping point, without waiting for it here (a
+        step that could not be interrupted kept the request hanging, and Stop seemed to do nothing);
+        the editor shows it is stopping until run_done."""
+        if self.thread is not None and self.thread.is_alive() and not (self.current or {}).get("done"):
+            self.evaluator.cancel()
+            self.hub.publish({"type": "stopping", "run": self.run_id})
+
     def watch_idle_memory(self, stop, interval=2.0):
         """While no run is going on, give memory back when the PC runs low because another
         program needs it: an idle editor once held ~9 GB while a test run filled the rest, and
-        the PC froze paging to a hard disk. (During runs the evaluator's watchdog does this.)"""
+        the PC froze paging to a hard disk. Low on RAM (other programs then get paged out) or on
+        commit (their allocations then fail). (During runs the evaluator's watchdog does this.)"""
         from .graph.nodes import ARRAY_CACHE
         released = False
         while not stop.wait(interval):
-            low = available_memory() < FREE_TIGHT
+            low = available_memory() < FREE_TIGHT or commit_room() < COMMIT_TIGHT
             if not low:
                 released = False
                 continue
@@ -571,12 +618,27 @@ class Session:
             if job["mode"] in LONG_JOBS:
                 self.stamp += 1
                 if job["mode"] == "optimize":
-                    self.hub.publish({"type": "optimized", "run": run_id})  # the editor updates its preview
+                    # the editor (the tab that asked: its tag) updates its preview
+                    self.hub.publish({"type": "optimized", "run": run_id, "tag": job.get("tag")})
             job["done"] = True  # the thread is still alive for a moment: the queue must not show it
             if self.queue or self.pending is not None:
                 threading.Thread(target=self._advance, args=(threading.current_thread(),), daemon=True).start()
             elif job["mode"] == "export":
                 self._publish_queue()
+
+    def _forget_views(self, shown):
+        """Drop what is kept for views of nodes not in `shown` (hidden or deleted nodes, a closed recipe):
+        packed meshes, their colours, slices and details, and the CAD meshes and run graphs kept for
+        picking. They stayed for the life of the server before."""
+        with self._lock:
+            for key in list(self.views):
+                kind, _, rest = key.partition(":")
+                node = rest.partition(":")[2] if kind == "part" else rest if kind in ("paint", "slice", "detail") else key
+                if node not in shown:
+                    del self.views[key]
+            for table in (self.view_faces, self.view_sources):
+                for node in [n for n in table if n not in shown]:
+                    del table[node]
 
     def _shown_id(self, node_id):
         """A node as the editor knows it: hidden view meshers as the node they show, nodes inside a
@@ -598,6 +660,10 @@ class Session:
                 keep_status=keep_status)
         if mode != "detail":  # (a detail runs the graph of the run that made its view, maybe not the newest)
             publish(type="problems", problems=self._problems(graph.problems()))
+        if mode == "preview":  # a preview has the whole recipe and every shown view (exports and optimizations
+            # have no view nodes, a detail an older graph): forget deleted nodes and closed recipes
+            self.evaluator.forget(graph.nodes)
+            self._forget_views(set(views) | set(job["slices"]))
         # the coarsest quality of what the editor shows after this run (bodies meshed or coloured for the
         # view, field slices and colours; None: nothing that changes with the quality): finer runs up to
         # it would change nothing, so refining goes on from there
@@ -607,10 +673,45 @@ class Session:
             levels.append(LEVELS.index(quality))
         shown = LEVELS[min(levels)] if levels else None
         sharper = shown is not None and shown != LEVELS[-1]  # would a finer quality show more?
+        with self._lock:  # pieces of an earlier run's lists (one that was stopped)
+            for key in [k for k in self.views if k.startswith("part:")]:
+                del self.views[key]
         if not targets:
             publish(type="run_done", ok=True, time=0.0, files={}, sharper=sharper, shown=shown)
             return
+        settings = job["slice"]
+        surface = settings.get("mode") == "surface"
+        # views shown as soon as their node is done (a run of many bodies showed nothing until its last);
+        # coloured ones wait for their colours at the end. Their lists are shown item by item while they
+        # are made (the lamp's 144 petals took 13-24 s at Final): the editor draws each item's piece
+        # instead of that item in the view it shows
+        early = {}  # node computed -> [(node shown, view)]
+        for node_id, view in views.items():
+            if not view.kept and view.paint is None and not (surface and job["slices"]):
+                early.setdefault(view.src, []).append((node_id, view))
+        published = {}  # node shown -> (version, packed view)
+
+        def on_result(node_id, outputs):
+            for shown_id, view in early.get(node_id, ()):
+                value = outputs.get(view.port)
+                if value is not None:
+                    published[shown_id] = self._publish_view(publish, graph, shown_id, view, value, quality)
+
+        def on_item(node_id, index, total, outputs):
+            for shown_id, view in early.get(node_id, ()):
+                piece = outputs.get(view.port)
+                if total < 2 or view.type == "cad" or not hasattr(piece, "faces"):
+                    continue
+                data, _, nf = pack_meshes(piece)
+                with self._lock:
+                    self.view_version += 1
+                    self.views[f"part:{index}:{shown_id}"] = (self.view_version, data)
+                    version = self.view_version
+                publish(type="view_part", node=shown_id, index=index, total=total, version=version, kind=view.type,
+                        faces=nf)
+
         self.evaluator.graph = graph
+        self.evaluator.on_result, self.evaluator.on_item = (on_result, on_item) if early else (None, None)
         try:  # previews show what still works when a node fails (exports and optimizations stop)
             results = self.evaluator.run(targets, keep_going=mode == "preview")
         except Cancelled:
@@ -625,6 +726,8 @@ class Session:
             publish(type="run_done", ok=False, error=f"{type(err).__name__}: {err}",
                     time=time.perf_counter() - t0)
             return
+        finally:
+            self.evaluator.on_result = self.evaluator.on_item = None
 
         if job.get("detail"):
             d = job["detail"]
@@ -640,8 +743,6 @@ class Session:
                     voxel=float(mesh.metadata.get("voxel", 0.0)))
             return
 
-        settings = job["slice"]
-        surface = settings.get("mode") == "surface"
         paint = None  # (field node, field value): coloured onto every visible body
         paint_key = None
         if surface and job["slices"]:
@@ -661,27 +762,13 @@ class Session:
                     publish(type="phase", text=f"colouring {node_id}")
                     self._paint(publish, node_id, item[0], item[1], paint, quality, key=paint_key)
                 continue
+            if node_id in published:  # shown when its node was done
+                continue
             value = results.get(view.src, {}).get(view.port)
             if value is None:
                 continue
             publish(type="phase", text=f"preparing the view of {node_id}")
-            data, nv, nf = pack_meshes(value)
-            with self._lock:
-                self.view_version += 1
-                self.views[node_id] = (self.view_version, data)
-                version = self.view_version
-                # for /api/face_at, /api/node_at and /api/detail
-                self.view_sources[node_id] = (version, graph, view.src, view.port, quality)
-                # CAD bodies: kept so the editor can ask which face each triangle is (face picking)
-                if view.type == "cad":
-                    self.view_faces[node_id] = (version, value, nf, None)
-                else:
-                    self.view_faces.pop(node_id, None)
-            # voxel: what the view was meshed with; floor: how fine a detail of it may go (None: no detail)
-            publish(type="view_ready", node=node_id, version=version, verts=nv, faces=nf, kind=view.type,
-                    key=view.key, level=LEVELS[-1] if view.exact else quality, exact=view.exact,
-                    voxel=None if view.exact else view_voxel(value),
-                    floor=None if view.exact else detail_floor(graph, view.src, quality))
+            version, data = self._publish_view(publish, graph, node_id, view, value, quality)
             own = results.get(view.paint[0], {}).get(view.paint[1]) if view.paint else None
             if own is not None:  # a result coloured onto the node's own body (Static Analysis)
                 publish(type="phase", text=f"colouring {node_id}")
@@ -735,6 +822,32 @@ class Session:
         results = None
         gc.collect()
 
+    def _publish_view(self, publish, graph, node_id, view, value, quality):
+        """Keep `value` (a run's result) packed as the view of `node_id` and tell the editor (view_ready, with
+        the triangles of each list item, `parts`, so it can draw a later run's items over it as they come).
+        Returns (version, packed)."""
+        data, nv, nf, counts = pack_meshes(value, counts=True)
+        # voxel: what the view was meshed with; floor: how fine a detail of it may go (None: no detail)
+        voxel = None if view.exact else view_voxel(value)
+        floor = None if view.exact else detail_floor(graph, view.src, quality, voxel)
+        with self._lock:
+            self.view_version += 1
+            self.views[node_id] = (self.view_version, data)
+            version = self.view_version
+            # for /api/face_at, /api/node_at and /api/detail
+            self.view_sources[node_id] = (version, graph, view.src, view.port, quality, floor)
+            # CAD bodies: kept so the editor can ask which face each triangle is (face picking)
+            if view.type == "cad":
+                self.view_faces[node_id] = (version, value, nf, None)
+            else:
+                self.view_faces.pop(node_id, None)
+            for key in [k for k in self.views if k.startswith("part:") and k.split(":", 2)[2] == node_id]:
+                del self.views[key]  # its items' pieces: the whole view is here
+        publish(type="view_ready", node=node_id, version=version, verts=nv, faces=nf, kind=view.type,
+                key=view.key, level=LEVELS[-1] if view.exact else quality, exact=view.exact,
+                voxel=voxel, floor=floor, parts=counts if counts and len(counts) > 1 else None)
+        return version, data
+
     def _paint(self, publish, node_id, view_version, data, paint, quality, source="field", key=None):
         """Colour a view by a field: the field's value at every vertex. source "result": the node's
         own result (labelled with the field's name and unit; reversed colours for a safety factor,
@@ -786,15 +899,16 @@ class Session:
             report["paint"] = {"version": version, "view_version": view_version, "min": lo, "max": hi}
         return report
 
-    def face_at(self, node_id, point):
-        """See /api/face_at: the CAD face nearest to `point` among the bodies the view of `node_id`
-        is built from (their results from the last run, kept by the evaluator)."""
-        from .facemask import cad_faces, face_info, nearest_face, same_part
+    def _nearest_cad_face(self, node_id, point):
+        """The CAD face nearest to `point` among the bodies the view of `node_id` is built from (their
+        results from the last run, kept by the evaluator): (source, port, bodies, (face, body, distance,
+        list index))."""
+        from .facemask import nearest_face
         with self._lock:
             item = self.view_sources.get(node_id)
         if item is None:
             raise HTTPException(404, f"{node_id} is not shown in the 3D view")
-        _, graph, src_id, port, _ = item
+        _, graph, src_id, port, *_ = item
         best, within = None, np.inf
         for source, out in cad_sources(graph, src_id, port):
             cached = self.evaluator._cache.get(source)
@@ -802,16 +916,148 @@ class Session:
             if value is None:
                 continue
             items = list(value) if isinstance(value, list) else [value]
-            hit = nearest_face(items, point, within)
+            hit = nearest_face(items, point, within, index=True)
             if hit is not None:
                 best, within = (source, out, items, hit), hit[2]
         if best is None:
             raise HTTPException(404, f"no CAD body with faces behind {node_id}")
-        source, out, items, (face, body, distance) = best
+        return best
+
+    def face_at(self, node_id, point):
+        """See /api/face_at."""
+        from .facemask import cad_faces, face_info, same_part
+        source, out, items, (face, body, distance, _) = self._nearest_cad_face(node_id, point)
         ids = [cad_faces(m) for m in items]
         return {"source": source, "port": out, "face": face, "body": body, "distance": distance,
                 "same": len(items) == 1 or (all(i is not None for i in ids) and same_part(items, ids)),
                 "bodies": len(items), "info": face_info(items, body, face)}
+
+    def bodies(self, node_id, input_name, source=None, port=None, names=False):
+        """See /api/bodies: the bodies on input `input_name` of `node_id` in the last run (its link there,
+        after groups and bypasses; else `source.port`, for a node added since)."""
+        graph = self.evaluator.graph
+        link = ((graph.nodes.get(node_id) or {}).get("inputs") or {}).get(input_name)
+        if _is_link(link):
+            source, port = link["link"].partition(".")[::2]
+        cached = self.evaluator._cache.get(source) if source else None
+        value = cached[1].get(port) if cached else None
+        if value is None:
+            return {"bodies": None, "source": source}
+        # every card with a body input asks after every run: the same result's list is worked out once
+        key = (source, port, cached[0], id(value))
+        if not names and key in self._body_infos:
+            return self._body_infos[key]
+        items = [m for m in (value if isinstance(value, list) else [value]) if hasattr(m, "vertices")]
+        unnamed = [m for m in items if "cad_name" not in m.metadata]
+        step = self._step_behind(graph, source) if unnamed else None
+        if step and names:
+            from .graph.nodes import step_names
+            found = step_names(*step)
+            for m in unnamed:  # copies (Pattern Bodies, Mirror) keep their solid's number
+                solid = m.metadata.get("cad_solid")
+                if isinstance(solid, int) and 0 <= solid < len(found):
+                    m.metadata["cad_name"] = found[solid]
+            self._body_infos.clear()  # other lists may hold these bodies too
+        out = []
+        for i, m in enumerate(items):
+            V = np.asarray(m.vertices)
+            faces = m.face_attributes.get("cad_face") if hasattr(m, "face_attributes") else None
+            lo, hi = (V.min(axis=0), V.max(axis=0)) if len(V) else (np.zeros(3), np.zeros(3))
+            out.append({"index": i, "name": m.metadata.get("cad_name"), "lo": np.round(lo, 3).tolist(),
+                        "hi": np.round(hi, 3).tolist(), "triangles": int(len(m.faces)),
+                        "faces": int(faces.max()) + 1 if faces is not None and len(faces) else None})
+        answer = {"bodies": out, "source": source, "names_unread": bool(step and not names)}
+        if len(self._body_infos) >= 64:
+            self._body_infos.clear()
+        self._body_infos[key] = answer
+        return answer
+
+    def _step_behind(self, graph, node_id):
+        """(path, tolerance, angle) of the Import STEP the bodies of `node_id` come from (up its links), or None."""
+        todo, seen = [node_id], set()
+        while todo:
+            n = todo.pop(0)
+            if n in seen:
+                continue
+            seen.add(n)
+            spec = graph.nodes.get(n) or {}
+            inputs = spec.get("inputs") or {}
+            if spec.get("type") == "input.import_step":
+                values = []
+                for name in ("path", "tolerance", "angle"):
+                    v = inputs.get(name, REGISTRY["input.import_step"].input(name).default)
+                    if _is_link(v):  # a Number node: its value in the last run
+                        src, out = v["link"].partition(".")[::2]
+                        cached = self.evaluator._cache.get(src)
+                        v = cached[1].get(out) if cached else None
+                    values.append(v)
+                return tuple(values) if values[0] and None not in values else None
+            todo += [v["link"].partition(".")[0] for v in inputs.values() if _is_link(v)]
+        return None
+
+    def similar_faces(self, node_id, body, face, mode, source=None, port=None):
+        """See /api/similar_faces: the CAD bodies are those of the CAD view of `node_id`, or with
+        `source`, that CAD output behind the view of `node_id` (as /api/face_at names it)."""
+        from .facemask import similar_faces
+        with self._lock:
+            item = self.view_sources.get(node_id) if source else self.view_faces.get(node_id)
+        if item is None:
+            raise HTTPException(404, f"no {'view' if source else 'CAD view'} for {node_id}")
+        if source:
+            _, graph, src_id, src_port, *_ = item
+            if (source, port) not in cad_sources(graph, src_id, src_port):
+                raise HTTPException(404, f"{node_id} is not built from {source}.{port}")
+            cached = self.evaluator._cache.get(source)
+            value = cached[1].get(port) if cached else None
+            if value is None:
+                raise HTTPException(404, f"no result of {source} (run a preview first)")
+        else:
+            value = item[1]
+        try:
+            faces = similar_faces(value, body, face, mode)
+        except ValueError as err:
+            raise HTTPException(422, str(err)) from None
+        if faces is None:
+            raise HTTPException(404, f"face {face} of body {body} is not in {source or node_id}")
+        return {"faces": faces}
+
+    def thickness_at(self, node_id, point, normal):
+        """See /api/thickness: the wall thickness under a point of the view of `node_id`, straight
+        in along -normal (None when the ray finds no opposite wall within 1 m)."""
+        from .checks import ray_thickness
+        item = self.views.get(node_id)
+        if item is None:
+            raise HTTPException(404, f"{node_id} is not shown in the 3D view")
+        V, F = unpack_meshes(item[1])
+        n = np.asarray(normal, dtype=np.float64)
+        if not len(F) or not np.linalg.norm(n) > 0:
+            return {"thickness": None}
+        t = float(ray_thickness(V, F, np.array([point], dtype=np.float32), (n / np.linalg.norm(n))[None], 1000.0)[0])
+        return {"thickness": t if np.isfinite(t) else None}
+
+    def section_at(self, node_id, point, normal):
+        """See /api/section: the cross-section of the member under a point of the view of `node_id`."""
+        from .checks import member_section
+        item = self.views.get(node_id)
+        if item is None:
+            raise HTTPException(404, f"{node_id} is not shown in the 3D view")
+        V, F = unpack_meshes(item[1])
+        return {"section": member_section(V, F, point, normal)}
+
+    def face_region(self, node_id, point, edge=0.0, detail=False):
+        """See /api/face_region: (mesh version, triangle numbers as uint32 bytes)."""
+        from .facemask import face_region
+        _, _, items, (face, _, distance, index) = self._nearest_cad_face(node_id, point)
+        item = self.views.get(f"detail:{node_id}" if detail else node_id)
+        if item is None:
+            raise HTTPException(404, f"{node_id} has no {'detail' if detail else 'view'}")
+        version, data = item
+        V, F = unpack_meshes(data)
+        # as far from the CAD face as the clicked surface (an offset), its mesh's resolution, or a
+        # texture's bumps (a twentieth of the body)
+        reach = max(3 * distance, 2 * edge, 0.05 * float(np.linalg.norm(np.ptp(items[index].bounds, axis=0))))
+        rows = face_region(items, index, face, V, F, reach)
+        return version, rows.astype(np.uint32).tobytes()
 
     def node_at(self, node_id, point, tol):
         """See /api/node_at: the node that made the surface at `point` of the view of `node_id`. Reads
@@ -821,7 +1067,7 @@ class Session:
             item = self.view_sources.get(node_id)
         if item is None:
             raise HTTPException(404, f"{node_id} is not shown in the 3D view")
-        _, graph, src_id, port, _ = item
+        _, graph, src_id, port, *_ = item
         cache = self.evaluator._cache
         creator, visited = find_creator(graph, lambda n: (cache.get(n) or (None, None))[1], src_id, port, point, tol)
         shown = lambda n: graph.owners.get(n, n)   # a node inside a group is the group, for the editor
@@ -984,11 +1230,32 @@ def create_app():
         parent = str(p.parent) if p.parent != p else ""
         return {"path": str(p), "parent": parent, "entries": entries}
 
+    @app.post("/api/file_dialog")
+    def file_dialog(body: dict = Body(...)):
+        """Windows' own Open / Save dialog on this PC (engine/native_dialog.py), waited for in a worker thread:
+        {mode, title, exts, dir, name} -> {path} (None: cancelled), {busy: true} while one is open, or
+        {unavailable: why}, when the editor shows its own dialog (/api/browse) instead."""
+        try:
+            return {"path": native_dialog.ask(body.get("mode"), body.get("title"), body.get("exts") or [],
+                                              body.get("dir"), body.get("name"))}
+        except native_dialog.Busy:
+            return {"busy": True}
+        except native_dialog.Unavailable as e:
+            return {"unavailable": str(e)}
+
+    @app.post("/api/claim")
+    def claim(body: dict = Body(...)):
+        """This editor tab uses the engine from now on ({client}); see Session.claim."""
+        session.claim(str(body.get("client") or ""))
+        return {"active": session.active}
+
     @app.post("/api/run")
     def run(body: dict = Body(...)):
+        session.claim(str(body.get("client") or ""))
         run_id = session.start(body.get("graph") or {"version": 1, "nodes": {}}, body.get("mode", "preview"),
                                body.get("quality", "draft"), body.get("visible", []), body.get("slice"),
-                               body.get("label"), have=body.get("have"), tag=body.get("tag"))
+                               body.get("label"), have=body.get("have"), tag=body.get("tag"),
+                               only=[str(n) for n in body["only"]] if isinstance(body.get("only"), list) else None)
         return {"run": run_id}
 
     @app.post("/api/optimize")
@@ -996,6 +1263,7 @@ def create_app():
         node = body.get("node")
         if not node:
             raise HTTPException(400, "which node to optimize?")
+        session.claim(str(body.get("client") or ""))
         run_id = session.start(body.get("graph") or {"version": 1, "nodes": {}}, "optimize",
                                body.get("quality", "draft"), body.get("visible", []), body.get("slice"),
                                f"optimize {node}", optimize=node, tag=body.get("tag"))
@@ -1010,6 +1278,7 @@ def create_app():
             voxel = float(body.get("voxel", 0))
         except (TypeError, ValueError):
             raise HTTPException(422, "voxel must be a number")
+        session.claim(str(body.get("client") or ""))
         return session.detail(str(body.get("node", "")), body.get("version"), body.get("lo"), body.get("hi"),
                               voxel, body.get("tag"))
 
@@ -1033,7 +1302,7 @@ def create_app():
         disk = ARRAY_CACHE.disk
         gpu_free, gpu_total = backend.gpu_memory() if backend.gpu_enabled() else (0, 0)
         return {"used": session.evaluator.memory_in_use(), "limit": memory_limit(), "free": available_memory(),
-                "ssd_cache": disk.size() if disk is not None else 0,
+                "commit_room": commit_room(), "ssd_cache": disk.size() if disk is not None else 0,
                 "gpu_free": gpu_free, "gpu_total": gpu_total}
 
     @app.get("/api/settings")
@@ -1049,7 +1318,7 @@ def create_app():
 
     @app.post("/api/cancel")
     def cancel():
-        session.cancel()
+        session.request_stop()
         return {"ok": True}
 
     @app.get("/api/view/{node_id}")
@@ -1079,6 +1348,39 @@ def create_app():
             raise HTTPException(409, "faces cannot be picked here (not CAD faces, or too many triangles to show)")
         return Response(packed, media_type="application/octet-stream", headers={"X-View-Version": str(version)})
 
+    @app.post("/api/reveal")
+    def reveal(body: dict = Body(...)):
+        """Show a file in Windows Explorer, selected in its folder (a path input's folder button): a relative
+        path is in the project folder, one not there yet (an export not written) opens its nearest folder."""
+        import subprocess
+        import sys
+        path = Path(str(body.get("path") or "").strip().strip('"'))
+        if not str(path) or str(path) == ".":
+            raise HTTPException(400, "no file")
+        target = path if path.is_absolute() else ROOT / path
+        while not target.exists() and target.parent != target:
+            target = target.parent
+        if not target.exists():
+            raise HTTPException(404, f"neither {path} nor a folder of it exists")
+        if sys.platform != "win32":
+            raise HTTPException(501, "showing files is only done on Windows")
+        subprocess.Popen(["explorer", f"/select,{target}"] if target.is_file() else ["explorer", str(target)])
+        return {"shown": str(target)}
+
+    @app.get("/api/fonts")
+    def fonts():
+        """The installed fonts for Text's Font (picture.font_list): [{value, family, style}]."""
+        from .picture import font_list
+        return {"fonts": font_list()}
+
+    @app.get("/api/bodies/{node_id}")
+    def bodies(node_id: str, input: str, source: str = "", port: str = "", names: bool = False):
+        """For an input's body list (Port pick "body", Pick Body's Index): the bodies on input `input` of the
+        node in the last run, [{index, name (the STEP file's, or null), lo, hi (box, mm), faces, triangles}],
+        or null when the bodies were not made yet (nothing shown needs them). names_unread: an import kept
+        before names were has them in the file; ask again with names=true to read them (seconds)."""
+        return session.bodies(node_id, input, source or None, port or None, names)
+
     @app.get("/api/face_at/{node_id}")
     def face_at(node_id: str, x: float, y: float, z: float):
         """For the face menu on bodies whose triangles carry no faces (a textured, implicit body, a
@@ -1090,6 +1392,17 @@ def create_app():
         if not all(np.isfinite([x, y, z])):
             raise HTTPException(422, "x, y and z must be finite numbers")
         return session.face_at(node_id, (x, y, z))
+
+    @app.get("/api/face_region/{node_id}")
+    def face_region(node_id: str, x: float, y: float, z: float, edge: float = 0.0, detail: bool = False):
+        """For highlighting the face of /api/face_at on the view of the node (detail: on its detail,
+        /api/view/detail:<node>): which of its triangles lie on that CAD face (facemask.face_region).
+        edge: the view's triangle size at the point, mm. uint32 triangle numbers; X-View-Version: the
+        version of the mesh they belong to."""
+        if not all(np.isfinite([x, y, z, edge])):
+            raise HTTPException(422, "x, y, z and edge must be finite numbers")
+        version, data = session.face_region(node_id, (x, y, z), max(edge, 0.0), detail)
+        return Response(data, media_type="application/octet-stream", headers={"X-View-Version": str(version)})
 
     @app.get("/api/node_at/{node_id}")
     def node_at(node_id: str, x: float, y: float, z: float, tol: float = 0.05):
@@ -1126,10 +1439,41 @@ def create_app():
                     session.face_infos.pop(next(iter(session.face_infos)))
         return info
 
+    @app.get("/api/similar_faces/{node_id}")
+    def similar_faces(node_id: str, body: int, face: int, mode: str = "size", source: str = "", port: str = ""):
+        """For Select similar in the 3D view: {faces}, the face numbers of body `body` like its face
+        `face` (facemask.similar_faces; mode size, plane or type). The bodies are those of the CAD view
+        of the node, or with `source` and `port`, that CAD output behind the node's view (as
+        /api/face_at names it)."""
+        return session.similar_faces(node_id, body, face, mode, source or None, port or None)
+
+    @app.get("/api/thickness/{node_id}")
+    def thickness(node_id: str, x: float, y: float, z: float, nx: float, ny: float, nz: float):
+        """For measuring in the 3D view: {thickness}, the wall thickness (mm) of the node's shown mesh
+        under the point (x, y, z) on its surface, along the inward normal -(nx, ny, nz); null when
+        there is no opposite wall."""
+        if not all(np.isfinite([x, y, z, nx, ny, nz])):
+            raise HTTPException(422, "x, y, z and the normal must be finite numbers")
+        return session.thickness_at(node_id, (x, y, z), (nx, ny, nz))
+
+    @app.get("/api/section/{node_id}")
+    def section(node_id: str, x: float, y: float, z: float, nx: float, ny: float, nz: float):
+        """For measuring in the 3D view: {section}, the cross-section of the member of the node's shown
+        mesh under the point (x, y, z) on its surface with outward normal (nx, ny, nz): the smallest
+        closed cut through the member's middle (`checks.member_section`: area, diameter of a round
+        member as large, narrowest and widest across, the cut's centre, normal and outline); null when
+        there is no opposite wall, {open: true} on a wall or plate."""
+        if not all(np.isfinite([x, y, z, nx, ny, nz])):
+            raise HTTPException(422, "x, y, z and the normal must be finite numbers")
+        return session.section_at(node_id, (x, y, z), (nx, ny, nz))
+
     @app.websocket("/ws")
     async def events(ws: WebSocket):
         await ws.accept()
         queue = asyncio.Queue()
+        # which engine process this is: a tab that reconnects to another one (a restart) makes everything again
+        queue.put_nowait({"type": "hello", "engine": session.engine})
+        queue.put_nowait({"type": "active", "client": session.active})   # (which tab uses the engine)
         hub.clients.add(queue)
         try:
             while True:

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
-import { api, connectEvents, startRun } from './api'
+import { api, claimEngine, connectEvents, startRun } from './api'
 import { useStore } from './store'
 import { FileBrowser } from './components/FileBrowser'
 import { LogPanel } from './components/LogPanel'
@@ -19,6 +19,20 @@ function useAutoRun() {
     const t = setTimeout(() => startRun('preview'), 450)
     return () => clearTimeout(t)
   }, [graphVersion, autoRun, ready])
+}
+
+/** Another tab uses the engine (an old tab after a restart, which opens a new one): this one runs
+ *  nothing and shows no results until it is used here again. */
+function InactiveBanner() {
+  const inactive = useStore((s) => s.inactive)
+  if (!inactive) return null
+  return (
+    <div className="recovery-banner engine-elsewhere">
+      <span><b>The editor is open in another tab</b>, which uses the engine now: this tab shows no results and
+        runs nothing.</span>
+      <button className="primary" onClick={() => claimEngine(true)}>Use this tab</button>
+    </div>
+  )
 }
 
 /** A pause before each finer preview: a change made meanwhile starts from Draft again instead of
@@ -129,6 +143,7 @@ export default function App() {
           <div className="viewport-pane"><Viewport /></div>
         </div>
         <RecoveryBanner />
+        <InactiveBanner />
         <FileBrowser />
       </div>
     </ReactFlowProvider>

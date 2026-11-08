@@ -1,14 +1,19 @@
-import { memo, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { useShallow } from 'zustand/react/shallow'
-import { api, startOptimize } from '../api'
+import { api, startOptimize, stopRun } from '../api'
+import { LOAD_CASE, loadCases } from '../loadCases'
 import { isFieldNode, useStore } from '../store'
 import { useBrowser } from './FileBrowser'
 import { PLACE_PORTS } from './Guides'
+import { BodyChip, BodyPick, FontPick, IntSwitch, SeedInput } from './PickLists'
+import { ChoiceInput, NumberInput, ScrubLabel, Vec3Input, fmt, isVec3, parseVec3 } from './PortInputs'
 import type { EngineNode, PortSpec } from '../types'
-import { CATEGORY_COLORS, DISPLAYABLE, GROUP_PREFIX, TYPE_COLORS, parseFaceKeys, resolveFaces } from '../types'
-
-const fmt = (v: unknown) => (v === undefined || v === null ? '' : String(v))
+import {
+  CATEGORY_COLORS, DISPLAYABLE, GROUP_PREFIX, SETTING_TYPE, TYPE_COLORS, changedFromDefault, parseFaceKeys, portApplies,
+  resolveFaces, unitOf,
+} from '../types'
+import { hoverWires, pickUpWire, useWires, wireLabels } from '../wires'
 
 /** 0.6000000238 -> "0.6", 3.14159 -> "3.14" */
 const fmtNum = (v: number) => String(Number(v.toPrecision(3)))
@@ -23,84 +28,26 @@ const NUMERIC = ['number', 'scalar', 'int']
 /** How long a node's card keeps its flash class (the animation itself is 1.4 s). */
 const FLASH_MS = 1500
 
-/** Number field: accepts "0,35" as well as "0.35"; arrow keys nudge (Shift = x10). */
-function NumberInput({ value, integer, onCommit }: { value: unknown; integer?: boolean; onCommit: (v: number) => void }) {
-  const [text, setText] = useState(fmt(value))
-  useEffect(() => {
-    // Don't overwrite while mid-typing (e.g. "0." or "0,3") a text that already means this value.
-    if (Number(text.replace(',', '.')) !== value) setText(fmt(value))
-  }, [value]) // eslint-disable-line react-hooks/exhaustive-deps
-  const commit = (raw: string) => {
-    const v = Number(raw.replace(',', '.'))
-    if (raw.trim() !== '' && Number.isFinite(v)) onCommit(integer ? Math.round(v) : v)
-  }
-  const nudge = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
-    e.preventDefault()
-    const current = Number(text.replace(',', '.')) || 0
-    const decimals = (text.split(/[.,]/)[1] ?? '').length
-    let step = integer ? 1 : Math.pow(10, -Math.max(decimals, 1))
-    if (e.shiftKey) step *= 10
-    const next = +(current + (e.key === 'ArrowUp' ? step : -step)).toFixed(integer ? 0 : Math.max(decimals, 1))
-    setText(String(next))
-    onCommit(next)
-  }
-  return (
-    <input className="nodrag nowheel value-input" value={text} inputMode="decimal"
-      onChange={(e) => { setText(e.target.value); commit(e.target.value) }} onKeyDown={nudge} />
-  )
-}
-
-/** Step per few pixels when dragging a value: about 1% of its size (140 -> 1, 0.63 -> 0.001). */
-function scrubStep(v: number, integer?: boolean) {
-  if (integer) return 1
-  return Math.pow(10, Math.floor(Math.log10(Math.abs(v) || 1)) - 2)
-}
-
-/** A port label you can drag left/right to change its number (Shift = 10x faster, Alt = finer). */
-function ScrubLabel({ label, value, integer, onChange }: {
-  label: string; value: unknown; integer?: boolean; onChange: (v: number) => void
+/** `end`: show the end of a long text while not typing in it (a path's file name, not its C:\Users\…). */
+function TextInput({ value, onCommit, placeholder, end }: {
+  value: unknown; onCommit: (v: string) => void; placeholder?: string; end?: boolean
 }) {
-  const start = useRef<{ x: number; v: number; step: number } | null>(null)
-  const down = (e: PointerEvent<HTMLSpanElement>) => {
-    if (e.button !== 0) return
-    e.preventDefault()
-    e.currentTarget.setPointerCapture(e.pointerId)
-    const v = Number(value) || 0
-    start.current = { x: e.clientX, v, step: scrubStep(v, integer) }
-    document.body.classList.add('scrubbing')
-  }
-  const move = (e: PointerEvent<HTMLSpanElement>) => {
-    const s = start.current
-    if (!s) return
-    const factor = e.shiftKey ? 10 : e.altKey ? 0.1 : 1
-    const steps = Math.round((e.clientX - s.x) / (integer ? 8 : 3))
-    const step = s.step * factor
-    const decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9))
-    const next = Number((s.v + steps * step).toFixed(decimals))
-    if (next !== Number(value)) onChange(integer ? Math.round(next) : next)
-  }
-  const up = (e: PointerEvent<HTMLSpanElement>) => {
-    if (!start.current) return
-    start.current = null
-    e.currentTarget.releasePointerCapture(e.pointerId)
-    document.body.classList.remove('scrubbing')
-  }
-  return (
-    <span className="port-label scrub nodrag" title="Drag left/right to change (Shift = faster, Alt = finer)"
-      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
-      {label}
-    </span>
-  )
-}
-
-function TextInput({ value, onCommit, placeholder }: { value: unknown; onCommit: (v: string) => void; placeholder?: string }) {
   const [text, setText] = useState(fmt(value))
+  const ref = useRef<HTMLInputElement>(null)
   useEffect(() => setText(fmt(value)), [value])
+  useEffect(() => {
+    const el = ref.current
+    if (end && el && document.activeElement !== el) el.scrollLeft = el.scrollWidth
+  }, [end, text])
   return (
-    <input className="nodrag nowheel value-input" value={text} placeholder={placeholder}
+    <input ref={ref} className="nodrag nowheel value-input" value={text} placeholder={placeholder}
+      title={end && text ? text : undefined}
       onChange={(e) => setText(e.target.value)}
-      onBlur={() => text !== fmt(value) && onCommit(text)}
+      onBlur={(e) => {
+        if (text !== fmt(value)) onCommit(text)
+        const el = e.currentTarget
+        if (end) requestAnimationFrame(() => { el.scrollLeft = el.scrollWidth })
+      }}
       onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()} />
   )
 }
@@ -168,26 +115,37 @@ const PATH_EXTS: Record<string, { exts: string[]; mode: 'open' | 'save' }> = {
   'pattern.picture': { exts: ['.png', '.jpg', '.jpeg', '.bmp'], mode: 'open' },
 }
 
-function PortEditor({ nodeId, typeId, port, value }: { nodeId: string; typeId: string; port: PortSpec; value: unknown }) {
+function PortEditor({ nodeId, typeId, port, value, unit }: {
+  nodeId: string; typeId: string; port: PortSpec; value: unknown; unit?: string
+}) {
   const setInput = useStore((s) => s.setInput)
   const openBrowser = useBrowser((s) => s.open)
+  const listInput = useStore((s) => s.specs[typeId]?.inputs.find((p) => p.type === 'cad')?.name)
   const commit = (v: unknown) => setInput(nodeId, port.name, v)
   const shown = value ?? port.default
 
-  if (port.choices) {
-    return (
-      <select className="nodrag value-input" value={fmt(shown)} onChange={(e) => commit(e.target.value)}>
-        {port.choices.map((c) => <option key={c} value={c}>{c}</option>)}
-      </select>
-    )
+  if (port.choices) return <ChoiceInput port={port} value={shown} onCommit={commit} />
+  if (port.pick === 'body' && listInput) {
+    return <BodyPick nodeId={nodeId} input={listInput} port={port} value={shown} onCommit={commit} />
   }
+  if (port.switch) return <IntSwitch value={shown} onCommit={commit} />
+  if (port.type === 'int' && port.name === 'seed') return <SeedInput value={shown} onCommit={commit} />
   switch (port.type) {
     case 'number':
     case 'scalar':
-      return <NumberInput value={shown} onCommit={commit} />
     case 'int':
-      return <NumberInput value={shown} integer onCommit={commit} />
+      return <NumberInput value={shown} integer={port.type === 'int'} unit={unit} zero={port.zero} slider={port.slider}
+        onCommit={commit} />
     case 'text':
+      if (isVec3(port) && parseVec3(shown)) return <Vec3Input value={shown} onCommit={commit} />
+      if (port.pick === 'font') {
+        return (
+          <div className="path-input">
+            <TextInput value={shown} onCommit={commit} />
+            <FontPick value={shown} onCommit={commit} />
+          </div>
+        )
+      }
       return <TextInput value={shown} onCommit={commit} />
     case 'faces':
       return <FacesInput nodeId={nodeId} value={shown} onCommit={commit} />
@@ -195,13 +153,17 @@ function PortEditor({ nodeId, typeId, port, value }: { nodeId: string; typeId: s
       const cfg = PATH_EXTS[typeId] ?? { exts: [], mode: 'open' as const }
       return (
         <div className="path-input">
-          <TextInput value={shown} onCommit={commit} placeholder={cfg.mode === 'open' ? 'choose a file…' : 'output file'} />
+          <TextInput value={shown} onCommit={commit} end placeholder={cfg.mode === 'open' ? 'choose a file…' : 'output file'} />
           <button className="nodrag browse-btn" title="Browse"
             onClick={async () => {
               const p = await openBrowser({ mode: cfg.mode, exts: cfg.exts, initial: fmt(shown),
                 title: cfg.mode === 'open' ? 'Open file' : 'Save as' })
               if (p) commit(p)
             }}>…</button>
+          <button className="nodrag browse-btn" disabled={!fmt(shown)}
+            title={cfg.mode === 'save' ? 'Show the file in Explorer (its folder if it is not written yet)' : 'Show the file in Explorer'}
+            onClick={() => api.reveal(fmt(shown)).catch((e: Error) =>
+              useStore.getState().addLog(`Cannot show ${fmt(shown)}: ${e.message}`, 'warning'))}>📂</button>
         </div>
       )
     }
@@ -234,18 +196,27 @@ const OPTIMIZERS: Record<string, { run: string; stop: string }> = {
 }
 
 function OptimizeBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
-  const running = useStore((s) => s.run?.running && s.run.mode === 'optimize' && s.status[nodeId]?.state === 'running')
+  // (from its run_start: the nodes before it are read first, and the card must not offer Optimize meanwhile)
+  const running = useStore((s) => s.run?.running && s.run.mode === 'optimize' &&
+    (s.run.label === `optimize ${nodeId}` || s.status[nodeId]?.state === 'running'))
+  const stopping = useStore((s) => !!s.run?.stopping)
   const editing = useStore((s) => !!s.editing)
+  const starting = useStore((s) => s.starting === nodeId)
+  const finished = useStore((s) => s.status[nodeId]?.finished)
   const text = OPTIMIZERS[typeId]
   return (
-    <div className="enode-row optimize-row">
-      {running
-        ? <button className="nodrag optimize-btn stop" title={text.stop}
-            onClick={() => api.cancel()}>Stop</button>
-        : <button className="nodrag optimize-btn" disabled={editing}
-            title={editing ? 'Optimize outside the group' : text.run}
-            onClick={() => startOptimize(nodeId)}>Optimize</button>}
-    </div>
+    <>
+      <div className="enode-row optimize-row">
+        {running
+          ? <button className="nodrag optimize-btn stop" title={stopping ? 'Stops at the next stopping point' : text.stop}
+              disabled={stopping} onClick={() => stopRun()}>{stopping ? 'Stopping…' : 'Stop'}</button>
+          : <button className="nodrag optimize-btn" disabled={editing || starting || !!finished}
+              title={editing ? 'Optimize outside the group' : starting ? 'Waiting for the update running now to stop'
+                : finished ?? text.run}
+              onClick={() => startOptimize(nodeId)}>{starting ? 'Starting…' : finished ? 'Finished ✓' : 'Optimize'}</button>}
+      </div>
+      {finished && <div className="enode-note">{finished}</div>}
+    </>
   )
 }
 
@@ -274,16 +245,65 @@ function PlaceBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
   )
 }
 
+/** A wire shown as a label (the graph's Wires menu): hovering it shows the wire, a click goes to its source. */
+function WireLabel({ nodeId, edge, source, color }: { nodeId: string; edge: string; source: string; color: string }) {
+  return (
+    <button className="nodrag wire-label" style={{ ['--wire' as string]: color }}
+      title={`Linked from ${source}. The wire shows while either node is hovered or selected; click to go to ${source}.`}
+      onMouseEnter={() => hoverWires({ edge }, 0)} onMouseLeave={() => hoverWires({ node: nodeId }, 0)}
+      onClick={(e) => { e.stopPropagation(); useStore.getState().focusNode(source) }}>
+      ← {source}
+    </button>
+  )
+}
+
+/** The node's id; double-click to rename it (links and the 3D view follow). */
+function NodeName({ id }: { id: string }) {
+  const [text, setText] = useState<string | null>(null)
+  const editing = useStore((s) => !!s.editing)
+  const finish = (commit: boolean) => {
+    if (commit && text !== null) {
+      const error = useStore.getState().renameNode(id, text)
+      if (error) useStore.getState().addLog(error, 'error')
+    }
+    setText(null)
+  }
+  if (text === null) {
+    return (
+      <span className="enode-id" title={editing ? id : `${id} (double-click to rename)`}
+        onDoubleClick={(e) => { e.stopPropagation(); setText(id) }}>{id}</span>
+    )
+  }
+  return (
+    <input className="nodrag value-input rename-input" autoFocus value={text} spellCheck={false}
+      onChange={(e) => setText(e.target.value)} onBlur={() => finish(true)}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false) }} />
+  )
+}
+
 function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
   const spec = useStore((s) => s.specs[data.typeId])
   const links = useStore(useShallow((s) =>
     s.edges.filter((e) => e.target === id).map((e) => `${e.targetHandle}|${e.source}`)))
+  // outputs with wires (zoomed out, only wired ports keep their dots)
+  const usedOutputs = useStore((s) => [...new Set(s.edges.filter((e) => e.source === id).map((e) => e.sourceHandle))].sort().join(' '))
+  // its wires shown as labels: per input the wire's id, per output how many
+  const [shared, long] = useWires(useShallow((w) => [w.shared, w.long]))
+  const labelText = useStore((s) => wireLabels(s.nodes, s.edges, shared, long).of[id] ?? '')
+  const labels = useMemo(() => (labelText ? JSON.parse(labelText) as { in: Record<string, string>; out: Record<string, number> }
+    : { in: {}, out: {} }), [labelText])
   const status = useStore((s) => s.status[id])
   const problems = useStore((s) => s.problems[id])
   const visible = useStore((s) => s.visible.includes(id))
   const toggleVisible = useStore((s) => s.toggleVisible)
   const setInput = useStore((s) => s.setInput)
   const editing = useStore((s) => !!s.editing)
+  // a Load Case node and its loads: "<colour> <name>" (a string, so cards re-render only when it changes)
+  const inCase = useStore((s) => {
+    const c = loadCases(s.nodes, s.edges).of[id]
+    return c ? `${c.color} ${c.name}` : ''
+  })
 
   // A change made from the 3D view flashes the node's card for a moment (a new flash restarts it).
   const flashAt = useStore((s) => (s.flash.ids.includes(id) ? s.flash.at : 0))
@@ -298,10 +318,23 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
     flashTimer.current = window.setTimeout(() => setFlash((f) => ({ ...f, on: false })), left)
   }, [flashAt])
 
+  /** the advanced inputs are shown ("more" row) */
+  const [more, setMore] = useState(false)
+
   if (!spec) return <div className="enode enode-error">Unknown node type “{data.typeId}”</div>
 
   const linked = Object.fromEntries(links.map((l) => l.split('|')))
-  const color = CATEGORY_COLORS[spec.category] ?? '#888'
+  // inputs that do not apply with the others' values are left out (a pattern's Sides for round holes);
+  // advanced ones with their default value wait under the "more" row
+  const valueOf = (name: string) => (linked[name] ? undefined
+    : data.inputs[name] ?? spec.inputs.find((q) => q.name === name)?.default)
+  const applying = spec.inputs.filter((p) => !p.hidden && (linked[p.name] || portApplies(p, valueOf)))
+  const isTucked = (p: PortSpec) => !!p.advanced && !linked[p.name] && !changedFromDefault(p, data.inputs[p.name])
+  const tucked = applying.filter(isTucked).length
+  const inputs = more ? applying : applying.filter((p) => !isTucked(p))
+  const caseColor = inCase ? inCase.slice(0, inCase.indexOf(' ')) : null
+  const caseLabel = inCase ? inCase.slice(inCase.indexOf(' ') + 1) : null
+  const color = caseColor ?? CATEGORY_COLORS[spec.category] ?? '#888'
   const isField = isFieldNode(spec)
   const canShow = !editing && (isField || spec.outputs.some((o) => DISPLAYABLE.includes(o.type)))
   const error = status?.state === 'error' ? status.message : undefined
@@ -312,13 +345,21 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
 
   return (
     <div className={`enode ${selected ? 'selected' : ''} ${messages.length ? 'has-error' : ''} ${group ? 'group' : ''}` +
+      `${data.collapsed ? ' collapsed' : ''}${data.bypass ? ' bypassed' : ''}` +
       (flash.on ? ` node-flash node-flash-${flash.n % 2}` : '')}
       style={{ ['--cat' as string]: color }} title={spec.doc}
       onDoubleClick={group && !editing ? () => useStore.getState().editGroup(group) : undefined}>
       <div className="enode-header">
+        <button className="nodrag collapse-btn" title={data.collapsed ? 'Show the inputs (H)' : 'Collapse to the header (H)'}
+          onClick={() => useStore.getState().setNodeFlags([id], { collapsed: !data.collapsed })}>{data.collapsed ? '▸' : '▾'}</button>
         <span className={`status-dot ${status?.state ?? 'idle'}`} />
         <span className="enode-title">{spec.title}</span>
-        <span className="enode-id">{id}</span>
+        <NodeName id={id} />
+        {caseLabel && data.typeId !== LOAD_CASE && (
+          <span className="case-chip" title={`In load case ${caseLabel}: it acts with that case's other loads only`}>
+            {caseLabel}
+          </span>
+        )}
         {group && !editing && (
           <>
             <button className="nodrag mini-btn" title="Open the group to change its nodes (every copy follows; also double-click)"
@@ -338,7 +379,7 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
       </div>
 
       {spec.outputs.map((o, i) => (
-        <div className="enode-row output" key={o.name} title={o.doc}>
+        <div className={`enode-row output ${usedOutputs.split(' ').includes(o.name) ? 'wired' : ''}`} key={o.name} title={o.doc}>
           {i === 0 && status?.range && (
             <span className="range-tag" title="The values this output can take (Remap with Auto uses this)">
               {fmtRange(status.range)}
@@ -346,29 +387,52 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
           )}
           <span className="port-label out">{o.label}</span>
           <span className="type-tag" style={{ color: TYPE_COLORS[o.type] }}>{o.type}</span>
-          <Handle type="source" position={Position.Right} id={o.name} className="handle"
+          {labels.out[o.name] > 0 && (
+            <span className="wire-count" title={`${labels.out[o.name]} of its wires show as labels on the inputs they feed ` +
+              '(hover or select this node to see them)'}>{labels.out[o.name]} →</span>
+          )}
+          <Handle type="source" position={Position.Right} id={o.name} className={`handle ${labels.out[o.name] ? 'labelled' : ''}`}
             style={{ background: TYPE_COLORS[o.type] }} />
         </div>
       ))}
 
-      {spec.inputs.filter((p) => !p.hidden).map((p) => {
+      {inputs.map((p) => {
         const value = data.inputs[p.name] ?? p.default
         const scrubbable = !linked[p.name] && NUMERIC.includes(p.type) && !p.choices && !ignoredByAuto(data, p.name)
         return (
-          <div className={`enode-row ${ignoredByAuto(data, p.name) ? 'ignored' : ''}`} key={p.name}
+          <div className={`enode-row ${ignoredByAuto(data, p.name) ? 'ignored' : ''} ${linked[p.name] ? 'wired' : ''}`} key={p.name}
             title={ignoredByAuto(data, p.name) ? 'Ignored: Auto takes this from X\'s range' : p.doc}>
-            <Handle type="target" position={Position.Left} id={p.name} className="handle"
-              style={{ background: TYPE_COLORS[p.type] }} />
+            <Handle type="target" position={Position.Left} id={p.name} className={`handle ${labels.in[p.name] ? 'labelled' : ''}`}
+              style={{ background: TYPE_COLORS[p.type] }}
+              title={linked[p.name] ? 'Drag to move this wire to another input (an output: that output feeds this input; empty space: removes it)' : undefined}
+              onPointerDownCapture={linked[p.name] ? (e) => {
+                const wire = useStore.getState().edges.find((w) => w.target === id && w.targetHandle === p.name)
+                if (wire) pickUpWire(e, wire.id)
+              } : undefined} />
             {scrubbable
-              ? <ScrubLabel label={p.label} value={value} integer={p.type === 'int'}
+              ? <ScrubLabel label={p.label} value={value} integer={p.type === 'int'} range={p.slider}
                   onChange={(v) => setInput(id, p.name, v)} />
               : <span className="port-label">{p.label}</span>}
             {linked[p.name]
-              ? <span className="linked">← {linked[p.name]}</span>
-              : <PortEditor nodeId={id} typeId={data.typeId} port={p} value={data.inputs[p.name]} />}
+              ? <>
+                  {labels.in[p.name]
+                    ? <WireLabel nodeId={id} edge={labels.in[p.name]} source={linked[p.name]} color={TYPE_COLORS[p.type] ?? '#888'} />
+                    : <span className="linked">← {linked[p.name]}</span>}
+                  {p.type === 'cad' && data.typeId !== 'input.pick_body' && <BodyChip nodeId={id} input={p.name} />}
+                </>
+              : <PortEditor nodeId={id} typeId={data.typeId} port={p} value={data.inputs[p.name]}
+                  unit={unitOf(p, valueOf)} />}
           </div>
         )
       })}
+      {tucked > 0 && (
+        <div className="enode-row more-row">
+          <button className="nodrag more-btn" onClick={() => setMore((m) => !m)}
+            title={more ? 'Hide the settings most designs leave as they are' : 'Settings most designs leave as they are'}>
+            {more ? '▴ fewer settings' : `▾ ${tucked} more setting${tucked === 1 ? '' : 's'}`}
+          </button>
+        </div>
+      )}
 
       {OPTIMIZERS[data.typeId] && <OptimizeBar nodeId={id} typeId={data.typeId} />}
       {PLACE_PORTS[data.typeId] && <PlaceBar nodeId={id} typeId={data.typeId} />}
@@ -388,6 +452,20 @@ function EngineNodeView({ id, data, selected }: NodeProps<EngineNode>) {
         </div>
       )}
       {messages.map((m, i) => <div className="enode-message" key={i}>{m}</div>)}
+      <FarFace title={data.typeId === SETTING_TYPE ? id : spec.title}
+        sub={data.typeId === SETTING_TYPE ? `= ${fmt(data.inputs.value ?? spec.inputs.find((p) => p.name === 'value')?.default)}` : id}
+        state={status?.state ?? 'idle'} />
+    </div>
+  )
+}
+
+/** What a card shows zoomed out (NodeEditor's `data-far`): its name, sized to read, over the card, which
+ *  keeps its size; a Number node shows its name and value. Only wired ports keep their dots (CSS). */
+function FarFace({ title, sub, state }: { title: string; sub: string; state: string }) {
+  return (
+    <div className="enode-far" aria-hidden>
+      <div className="enode-far-title">{title}</div>
+      <div className="enode-far-sub"><span className={`status-dot ${state}`} /><span>{sub}</span></div>
     </div>
   )
 }

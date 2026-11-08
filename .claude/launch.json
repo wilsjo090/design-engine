@@ -3,8 +3,7 @@
   "configurations": [
     {
       "name": "design-engine",
-      "runtimeExecutable": "cmd",
-      "runtimeArgs": ["/c", ".\\start.bat", "--no-browser"],
+      "url": "http://localhost:8765",
       "port": 8765
     },
     {
@@ -12,6 +11,12 @@
       "runtimeExecutable": "cmd",
       "runtimeArgs": ["/c", ".\\start.bat", "--no-browser", "--port", "8766"],
       "port": 8766
+    },
+    {
+      "name": "design-engine-test2",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", ".\\start.bat", "--no-browser", "--port", "8767"],
+      "port": 8767
     }
   ]
 }

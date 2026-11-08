@@ -128,6 +128,27 @@ def release_gpu_memory():
         _cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
+# This process's GPU search structures: (module, cache) of Warp meshes and BVHs, rebuilt when needed
+GPU_CACHES = (("engine.sdf_gpu", "_MESHES"), ("engine.segments", "_TREES"), ("engine.frame.kernel", "_KERNEL_DATA"))
+
+
+def release_gpu_caches():
+    """Drop this process's GPU search structures (sdf_gpu's meshes, up to 512 MB, the foam's and frames'
+    BVHs; rebuilt in seconds when needed) and give the memory back to the driver. Returns whether there
+    was anything to drop. Modules not imported yet hold nothing and are not imported."""
+    import sys
+    dropped = False
+    for name, attr in GPU_CACHES:
+        cache = getattr(sys.modules.get(name), attr, None)
+        if cache:
+            cache.clear()
+            dropped = True
+    if dropped and "warp" in sys.modules:
+        sys.modules["warp"].synchronize()   # (Warp's memory pool gives freed blocks back at a synchronize)
+    release_gpu_memory()
+    return dropped
+
+
 def gaussian_filter(xp):
     if xp is np:
         from scipy.ndimage import gaussian_filter as f

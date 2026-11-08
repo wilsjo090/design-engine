@@ -99,6 +99,12 @@ def _nearest_grid(mesh: wp.uint64, origin: wp.vec3, sx: int, sy: int, sz: int, v
 
 _MESHES = OrderedDict()  # key -> (wp.Mesh, its point and index arrays): BVH built once per mesh
 _MAX_MESHES = 48
+# ... and at most this much GPU memory in all (the newest is always kept): every new shape is a new
+# key, and 48 entries of a fine topology result or a CAD part could hold several GB per process.
+# Measured per triangle after splitting (Warp's memory pool off): 166 B, 610-650 B with the
+# winding-number data a mesh with cracks needs (test part, key box, a 330k-triangle sphere).
+MAX_MESH_BYTES = 512 * 2**20
+MESH_BYTES, CRACKED_MESH_BYTES = 180, 680
 MAX_EDGE = 2.0  # mm. Warp works in float32: on long thin triangles (CAD tessellations of flat
                 # faces have 50 mm edges) its closest-point maths was off by up to 0.03 mm.
                 # Splitting them (geometry unchanged) brings the error to ~0.0005 mm.
@@ -132,6 +138,7 @@ class _GpuMesh:
         self.crack = wp.array(flags if self.has_cracks else np.zeros(1, np.int8), dtype=wp.int8)
         # winding numbers need extra BVH data: only built for meshes that have cracks
         self.mesh = wp.Mesh(points=self.points, indices=self.indices, support_winding_number=bool(self.has_cracks))
+        self.nbytes = self.nfaces * (CRACKED_MESH_BYTES if self.has_cracks else MESH_BYTES)   # GPU memory
 
 
 def _mesh(V, F, key):
@@ -140,7 +147,8 @@ def _mesh(V, F, key):
         entry = _GpuMesh(*arrays(V, F))  # Shared arrays are read from the SSD only here
         if key is not None:
             _MESHES[key] = entry
-            while len(_MESHES) > _MAX_MESHES:
+            while len(_MESHES) > _MAX_MESHES or (len(_MESHES) > 1 and
+                                                 sum(m.nbytes for m in _MESHES.values()) > MAX_MESH_BYTES):
                 _MESHES.popitem(last=False)
     elif key is not None:
         _MESHES.move_to_end(key)

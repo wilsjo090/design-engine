@@ -46,6 +46,14 @@ from .fields import Field, _digest, sample
 
 ALIGN = ("as in CAD", "x", "y", "z")
 JOIN_FACES = ("tangent", "no")  # chosen faces joined smoothly: one unfolded pattern, or one pattern per face
+# on a face that closes around an axis with a changing girth (a cone, a vase): rows the same distance apart,
+# each with as many as fit around; as many in every row (wider gaps where it is wider); or as many in every
+# row, everything growing with the girth (the pattern conformal, like a pinecone's scales). See _around.
+GIRTH = ("same size", "same count", "scale")
+MIN_GIRTH = 0.05        # girth "scale": the girth counts as at least this share of the largest (a pole needs endless rows)
+MIN_STEP, MAX_STEP = 0.9, 1.25   # girth "same size": a row keeps the count of the one before while its copies stay
+#                                  between these many Spacings apart
+EDGE_SLACK = 0.02       # mm: rows fitted between a face's ends keep this much more than Edge margin (footprints are flat)
 MAX_STRETCH = 0.25      # a sheet that only unfolds stretching more (on 5% of its area) keeps a pattern per face
 MIN_HOLE = 1.0          # mm: smaller holes print poorly (SLS: the powder hardly clears)
 MIN_WEB = 0.8           # mm: thinner webs between holes are fragile
@@ -91,6 +99,9 @@ class Holes:
         self.lines = []               # (text, level) for the editor's log
         self.smallest_web = None
         self.regular = None           # cells of a regular layout: what they all are ("hexagons"), else None
+        self.uneven_rows = False      # Girth same size: rows around with different counts (staggered rows can't nest)
+        self.grow = None              # Girth scale: how much the pattern has grown with the girth at each one
+        self.stretch = None           # Pattern on Faces, Fit stretch: each copy's stretch in its turned frame (n, 2, 2)
 
     def __len__(self):
         return len(self.centre)
@@ -98,7 +109,7 @@ class Holes:
     def take(self, keep):
         self._outlines = None
         for name in ("centre", "normal", "t1", "t2", "scale", "turn", "outer", "depth", "face", "cells", "wall",
-                     "morph", "face_normal"):
+                     "morph", "face_normal", "grow", "stretch"):
             value = getattr(self, name)
             if value is not None and len(value) == len(keep):  # depths are only set at the end
                 setattr(self, name, value[keep])
@@ -458,11 +469,15 @@ def _jacobians(P, UV):
 
 
 def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle, offset, randomness=0.0, seed=0,
-                inset=None, check=None, alternate="none", cell_kind=None, name=None, flat=False):
+                inset=None, check=None, alternate="none", cell_kind=None, name=None, flat=False, girth=None,
+                footprint=None, margin=0.0, height=0.0):
     """Centres, axes and frames of the holes on one CAD face (corners: (k, 3) vertex numbers of its
-    triangles, UV: (k, 3, 2) their surface parameters), and with `inset` (Voronoi) each one's cell
-    (unit polygons in its frame), or None. name: what the log calls it; flat: UV is already in mm
-    (an unfolded sheet of faces)."""
+    triangles, UV: (k, 3, 2) their surface parameters), with `inset` (Voronoi) each one's cell
+    (unit polygons in its frame) or None, and how much each one grows with the face's girth (1
+    unless girth "scale"). name: what the log calls it; flat: UV is already in mm (an unfolded
+    sheet of faces); girth: None, or how the pattern follows a face that closes around one way
+    (GIRTH: rows then fitted between its ends, `margin` from them with what stands on each point,
+    `footprint`, see _around)."""
     name = name or f"face {face}"
     P = V[corners]
     if not np.isfinite(UV).all(axis=(1, 2)).any():
@@ -475,13 +490,24 @@ def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle
         normal = cross / (2 * area[:, None])
     w = np.where(ok, area, 0.0)
     lu, lv = np.linalg.norm(Ju, axis=1), np.linalg.norm(Jv, axis=1)
+    # Periodic surfaces: a face covering (about) half the period or more, a cylinder or a half of
+    # one, gets a whole number of cells in the period, so the pattern closes and both halves of a
+    # split cylinder line up. A fillet (a quarter or less) is left as it is.
+    span = np.ptp(UV[ok], axis=(0, 1))
+    pu, pv = (float(p) if p > 0 and s > 0.45 * p else 0.0 for p, s in zip(period, span))
+    closes = [p > 0 and s > 0.99 * p for p, s in zip((pu, pv), span)]
+    around = None   # which parameter runs around, when the layout follows the girth
+    if girth is not None and not flat and layout not in ("rings", "spiral") and (pu > 0) != (pv > 0):
+        if inset is not None:
+            raise HoleError("cells cannot follow the girth")
+        around = 0 if pu > 0 else 1
     if flat:  # the sheet's stretch is reported where it is unfolded
         su = sv = 1.0
     else:
         su, sv = float(np.sum(w * np.nan_to_num(lu)) / w.sum()), float(np.sum(w * np.nan_to_num(lv)) / w.sum())
         lo = min(_quantile(lu / su, w, 0.05), _quantile(lv / sv, w, 0.05))
         hi = max(_quantile(lu / su, w, 0.95), _quantile(lv / sv, w, 0.95))
-        if hi > 1.1 * lo:
+        if hi > 1.1 * lo and around is None:
             holes.note(f"cell size varies {lo:.2f}x to {hi:.2f}x across {name} (uneven CAD parameters)")
 
     eu = Ju / np.where(lu > 0, lu, 1.0)[:, None]
@@ -500,59 +526,76 @@ def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle
         else:
             phi = math.atan2(vy, vx)
     phi += face_hand * math.radians(angle)
-    # Periodic surfaces: a face covering (about) half the period or more, a cylinder or a half of
-    # one, gets a whole number of cells in the period, so the pattern closes and both halves of a
-    # split cylinder line up. A fillet (a quarter or less) is left as it is.
-    span = np.ptp(UV[ok], axis=(0, 1))
-    pu, pv = (float(p) if p > 0 and s > 0.45 * p else 0.0 for p, s in zip(period, span))
-    closes = [p > 0 and s > 0.99 * p for p, s in zip((pu, pv), span)]
-    if pu > 0 or pv > 0:  # only quarter turns keep the pattern closing
+    if (pu > 0 or pv > 0) and around is None:  # only quarter turns keep the pattern closing
         snapped = round(phi / (math.pi / 2)) * (math.pi / 2)
         if abs(snapped - phi) > math.radians(1):
             holes.note(f"{name} runs around an axis, so the pattern only turns in steps of 90° "
                        f"there")
         phi = snapped
     c, s = round(math.cos(phi), 12), round(math.sin(phi), 12)
-
-    # (x, y): the pattern's frame in mm
-    Umm, Vmm = UV[..., 0] * su, UV[..., 1] * sv
-    X, Y = Umm * c + Vmm * s, Vmm * c - Umm * s
-    fsx, fsy = sx, sy
-    wrap = [0, 0]   # cells around in x and in y (Randomness moves cell i and i + wrap alike)
-    along_u = abs(c) > 0.5
-    for p, scale, is_u, whole in ((pu, su, True, closes[0]), (pv, sv, False, closes[1])):
-        if p <= 0 or layout in ("rings", "spiral"):
-            continue
-        length = p * scale
-        if is_u == along_u:  # x runs around
-            fsx = _fit(sx, length, even=alternate.startswith("checker"))
-            count = length / fsx
-            wrap[0] = int(round(count))
-        else:
-            fsy = _fit(sy, length, even=layout == "staggered" or alternate != "none")
-            count = length / fsy
-            wrap[1] = int(round(count))
-        if whole:
-            holes.note(f"{name} closes around: {int(round(count))} cells around "
-                       f"({length:.1f} mm)")
-    X, Y, tw = X[ok], Y[ok], np.repeat(w[ok], 3)
-    box = (X.min(), Y.min(), X.max(), Y.max())
-    centroid = (np.sum(tw * X.ravel()) / tw.sum(), np.sum(tw * Y.ravel()) / tw.sum())
-    reach = 2 * max(fsx, fsy)   # a Voronoi cell at the face's edge needs its neighbours beyond it
     varies = isinstance(randomness, Field)   # then the centres move after the field is read where they are
-    try:
-        x, y, turn, li, lj = P2.lattice(layout, fsx, fsy, box, origin=offset,
-                                        center=(centroid[0] + offset[0], centroid[1] + offset[1]),
-                                        pad=(reach if inset is not None else 0.0) + (0.5 * reach if varies else 0.0),
-                                        randomness=0.0 if varies else randomness, seed=seed, wrap=tuple(wrap))
-    except ValueError as err:
-        raise HoleError(f"{name}: {err}") from err
+    grows = None
+
+    if around is None:
+        # (x, y): the pattern's frame in mm
+        Umm, Vmm = UV[..., 0] * su, UV[..., 1] * sv
+        X, Y = Umm * c + Vmm * s, Vmm * c - Umm * s
+        fsx, fsy = sx, sy
+        wrap = [0, 0]   # cells around in x and in y (Randomness moves cell i and i + wrap alike)
+        along_u = abs(c) > 0.5
+        for p, scale, is_u, whole in ((pu, su, True, closes[0]), (pv, sv, False, closes[1])):
+            if p <= 0 or layout in ("rings", "spiral"):
+                continue
+            length = p * scale
+            if is_u == along_u:  # x runs around
+                fsx = _fit(sx, length, even=alternate.startswith("checker"))
+                count = length / fsx
+                wrap[0] = int(round(count))
+            else:
+                fsy = _fit(sy, length, even=layout == "staggered" or alternate != "none")
+                count = length / fsy
+                wrap[1] = int(round(count))
+            if whole:
+                holes.note(f"{name} closes around: {int(round(count))} cells around "
+                           f"({length:.1f} mm)")
+        X, Y, tw = X[ok], Y[ok], np.repeat(w[ok], 3)
+        box = (X.min(), Y.min(), X.max(), Y.max())
+        centroid = (np.sum(tw * X.ravel()) / tw.sum(), np.sum(tw * Y.ravel()) / tw.sum())
+        reach = 2 * max(fsx, fsy)   # a Voronoi cell at the face's edge needs its neighbours beyond it
+        try:
+            x, y, turn, li, lj = P2.lattice(layout, fsx, fsy, box, origin=offset,
+                                            center=(centroid[0] + offset[0], centroid[1] + offset[1]),
+                                            pad=(reach if inset is not None else 0.0) + (0.5 * reach if varies else 0.0),
+                                            randomness=0.0 if varies else randomness, seed=seed, wrap=tuple(wrap))
+        except ValueError as err:
+            raise HoleError(f"{name}: {err}") from err
+
+        def to_uv(x, y):
+            return np.column_stack([(x * c - y * s) / su, (x * s + y * c) / sv])
+
+        def frame(index):  # the pattern's x and y in 3D at triangles `index`
+            return Ju[index] * (c / su) + Jv[index] * (s / sv), Jv[index] * (c / sv) - Ju[index] * (s / su)
+    else:
+        reach = 2 * max(sx, sy)
+        # the rows always run around; Align and Angle turn the shapes instead, as they would the pattern
+        turn0 = phi if around == 0 else math.pi / 2 - phi
+        try:
+            x, y, turn, li, lj, fsx, fsy, wrap, to_uv, grows = _around(
+                holes, name, UV[ok], P[ok], around, (pu, pv)[around], girth, layout, sx, sy, offset,
+                0.0 if varies else randomness, seed, 0.5 * reach if varies else 0.0, alternate, turn0, footprint,
+                margin, height)
+        except ValueError as err:
+            raise HoleError(f"{name}: {err}") from err
+        turn = turn + turn0
+
+        def frame(index):
+            return (Ju, Jv)[around][index], (Ju, Jv)[1 - around][index]
     if not len(x):
         return None
 
     def on_face(x, y):
         """(found mask, triangle of each found point, barycentric coordinates) in the face."""
-        tri, bary = _locate(UV[ok], np.column_stack([(x * c - y * s) / su, (x * s + y * c) / sv]))
+        tri, bary = _locate(UV[ok], to_uv(x, y))
         found = tri >= 0
         return found, np.flatnonzero(ok)[tri[found]], bary[found]
 
@@ -595,11 +638,24 @@ def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle
     vn /= np.maximum(np.linalg.norm(vn, axis=1), 1e-300)[:, None]
     n = np.einsum("ij,ijk->ik", b, vn[inverse.reshape(-1, 3)[index]])
     n /= np.linalg.norm(n, axis=1)[:, None]
-    t1 = Ju[index] * (c / su) + Jv[index] * (s / sv)
-    t1 -= np.einsum("ij,ij->i", t1, n)[:, None] * n
+    t1, ty = frame(index)
+    if around is not None:  # the row's own direction, along its line across the triangles: a long triangle's
+        ahead = []          # dP/du leans with its other edges (0.7° on a cone's), a chord of the line does not
+        period_a, first_a = (pu, pv)[around], float(UV[ok][..., around].min())
+        q = to_uv(x[found], y[found])
+        for side in (1e-3, -1e-3):   # round the seam too
+            near = q.copy()
+            near[:, around] = first_a + (near[:, around] + side * period_a - first_a) % period_a
+            tri, weights = _locate(UV[ok], near)
+            point = np.full((len(q), 3), np.nan)
+            point[tri >= 0] = np.einsum("ij,ijk->ik", weights[tri >= 0], P[np.flatnonzero(ok)[tri[tri >= 0]]])
+            ahead.append(point)
+        chord = ahead[0] - ahead[1]
+        good = np.isfinite(chord).all(axis=1) & (np.linalg.norm(np.nan_to_num(chord), axis=1) > 1e-9)
+        t1[good] = chord[good]
+    t1 = t1 - np.einsum("ij,ij->i", t1, n)[:, None] * n
     t1 /= np.linalg.norm(t1, axis=1)[:, None]
     t2 = np.cross(n, t1)
-    ty = Jv[index] * (c / sv) - Ju[index] * (s / su)
     mirrored = np.einsum("ij,ij->i", ty, t2) < 0
     turn = np.where(mirrored, -turn[found], turn[found])
     if cells is not None:  # in the shapes' frames: y flips where the face's frame is mirrored
@@ -607,7 +663,236 @@ def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle
         cells[mirrored, :, 1] *= -1
         cells[mirrored] = cells[mirrored, ::-1]     # counter-clockwise again
         turn = np.zeros(len(centre))
-    return centre, n, t1, t2, turn, np.full(len(centre), face, dtype=np.int64), cells
+    grow = np.ones(len(centre)) if grows is None else \
+        grows(np.einsum("ij,ij->i", b, UV[index][..., 1 - around]))
+    return centre, n, t1, t2, turn, np.full(len(centre), face, dtype=np.int64), cells, grow
+
+
+def _around(holes, name, Q, P, a, period, girth, layout, sx, sy, offset, randomness, seed, pad, alternate,
+            turn0=0.0, footprint=None, margin=0.0, height=0.0):
+    """The layout on a face that closes around one way (a: 0 = u runs around, 1 = v; Q, P: the
+    surface parameters and the 3D corners of its usable triangles), following its girth (GIRTH):
+    frame x runs around and y along the face, in rows spread evenly from end to end, the first and
+    the last Edge `margin` from the ends with what stands on them (`footprint`, turned by `turn0`,
+    `height` tall: kept inside the planes of the ends where the face leans out over them).
+    Returns the centres (x, y), their turn and cells (i, j), the steps in x (one per centre) and y,
+    the wrap, the map from (x, y) to (u, v) and, for "scale", how large the pattern is at each
+    along-parameter (else None).
+    The girth is measured on the face's own triangles: at each along-parameter the length of the
+    line of that parameter across them, over how far around it runs (so long triangles, a cone's,
+    which run the whole way up, count where they are and not at their middle); the same for the
+    distance along, on lines of constant around-parameter. Exact on surfaces of revolution."""
+    b = 1 - a
+    T = Q[..., b]
+    lo, hi = float(T.min()), float(T.max())
+    count = int(np.clip(math.sqrt(len(T)), 8, 256))
+    edges = np.linspace(lo, hi, count + 1)
+    mid = (edges[:-1] + edges[1:]) / 2
+    slice_, ends, points = _param_slices(Q, P, b, mid)            # lines across: around at each mid
+    length = np.linalg.norm(points[:, 1] - points[:, 0], axis=1)
+    turned = np.abs(ends[:, 1, a] - ends[:, 0, a])
+    total = np.bincount(slice_, turned, count)
+    has = total > 0
+    if not has.any():
+        raise ValueError("its girth cannot be measured")
+    radius = np.interp(mid, mid[has], np.bincount(slice_, length, count)[has] / total[has])
+    span_a = Q[..., a]
+    marks = np.linspace(span_a.min(), span_a.max(), 11)[1:-1]     # lines along, at 9 places around
+    _, ends, points = _param_slices(Q, P, a, marks)
+    t0, t1 = np.minimum(ends[:, 0, b], ends[:, 1, b]), np.maximum(ends[:, 0, b], ends[:, 1, b])
+    per = np.linalg.norm(points[:, 1] - points[:, 0], axis=1) / np.maximum(t1 - t0, 1e-300)
+    cover = np.clip(np.minimum(t1[:, None], edges[None, 1:]) - np.maximum(t0[:, None], edges[None, :-1]), 0, None)
+    covered = cover.sum(axis=0)
+    has = covered > 0
+    if not has.any():
+        raise ValueError("its length cannot be measured")
+    along = np.interp(mid, mid[has], (per @ cover)[has] / covered[has])
+    area = radius * along                              # per unit around and along
+    R = float(np.sum(area * radius) / area.sum())      # mm per unit around at the mean girth
+    # at each end: the girth's radius (mm) and how fast it changes along the face (mm per mm)
+    ends_r = radius[[0, -1]] * period / (2 * np.pi)
+    ends_slope = (radius[[1, -1]] - radius[[0, -2]]) * period / (2 * np.pi) / \
+        np.maximum(along[[0, -1]] * (mid[1] - mid[0]), 1e-300) if count > 1 else np.zeros(2)
+    if girth == "scale":
+        radius = np.maximum(radius, MIN_GIRTH * radius.max())
+        along = along * R / radius                     # conformal: the rows as far apart as the cells are wide
+    # frame y at the slices' edges: mm along the face (scaled by the girth for "scale"), 0 near where
+    # the along-parameter is 0, so faces sharing a surface (the halves of a split one) line up
+    y_at = lo * float(np.sum(area * along) / area.sum()) + np.concatenate([[0.0], np.cumsum(along * np.diff(edges))])
+    amin, amax = float(span_a.min()), float(span_a.max())
+    even = alternate.startswith("checker")
+
+    def t_of(y):
+        return _straight_on(y, y_at, edges)
+
+    def r_of(t):
+        return np.interp(t, mid, radius)
+
+    def uv(around, t):
+        return np.column_stack([around, t] if a == 0 else [t, around])
+
+    ox, oy = offset
+    below, above, wide = _reach_along(footprint, turn0, alternate != "none")
+    if girth == "scale":    # frame units per mm at each end (a copy there is r / R as large: its reach is not)
+        k0, k1 = R / float(r_of(lo)), R / float(r_of(hi))
+    else:
+        k0 = k1 = 1.0
+    # A flat footprint on a face that narrows away from an end reaches nearer the end's circle than
+    # straight along: the circle, seen in the footprint's plane, bends towards it by (half its
+    # width)^2 / (2 radius) x the slope (0.06 mm for a 6 mm wide copy at the foot of a 24° cone)
+    bend = [(wide / k) ** 2 / (2 * max(r, 1e-9)) * max(0.0, slope)
+            for k, r, slope in zip((k0, k1), ends_r, (-ends_slope[0], ends_slope[1]))]
+    # Where the face widens away from an end (a vase's foot), each copy leans out over it: one
+    # `height` tall stays inside the end's plane only height x tan(lean) farther in (a frame unit
+    # each at any girth: copies and frame grow alike)
+    lean = [height * math.tan(math.asin(min(max(slope, 0.0), 0.95))) for slope in (ends_slope[0], -ends_slope[1])]
+    reach0, reach1 = below + lean[0], above + lean[1]
+    if girth == "scale":    # a copy sized for its middle covers more of the frame towards a narrower end
+        rho = R * period / (2 * np.pi)
+        reach0 += reach0 ** 2 * max(ends_slope[0], 0.0) / rho
+        reach1 += reach1 ** 2 * max(-ends_slope[1], 0.0) / rho
+    start = y_at[0] + reach0 + (margin + EDGE_SLACK + bend[0]) * k0
+    end = y_at[-1] - reach1 - (margin + EDGE_SLACK + bend[1]) * k1
+    if end < start - 1e-9:
+        holes.note(f"{name} is too short for a row of copies")
+        return (np.zeros(0),) * 5 + (sx, sy, (0, 0), None, None)
+    n = int(math.floor((end - start) / sy + 1e-9)) + 1    # rows spread evenly from end to end
+    fsy = (end - start) / (n - 1) if n > 1 else sy
+    ry = (np.array([(start + end) / 2]) if n == 1 else start + np.arange(n) * fsy) + oy
+    rr = r_of(t_of(ry))
+    xr = np.full(n, R) if girth == "scale" else rr                # frame x per unit around, in each row
+    if girth == "same size":
+        counts = _counts(period * rr / sx, even)
+    else:
+        counts = np.full(n, int(round(period * R / _fit(sx, period * R, even=even))))
+    if np.sum(counts * (amax - amin) / period + 2) > 4_000_000:
+        raise ValueError("the spacing is far too small for this face")
+    # where each row starts around: staggered rows half a step on from the row before, or where they
+    # nest best when the counts differ (from the widest row out); grid rows all at Offset u
+    first = ox / R
+    phase = np.full(n, first)
+    if layout == "staggered" and n > 1:
+        widest = int(np.argmax(np.where(counts > 0, rr, -1)))
+        for order in (range(widest + 1, n), range(widest - 1, -1, -1)):
+            before = widest
+            for j in order:
+                if counts[j] and counts[before]:
+                    step = period / counts[j]
+                    if counts[j] == counts[before]:
+                        phase[j] = phase[before] + step / 2
+                    else:
+                        prev = phase[before] + np.arange(counts[before]) * period / counts[before]
+                        phase[j] = _nest(prev, counts[j], period)
+                before = j
+    xs, ii, jj, steps = [], [], [], []
+    for j in range(n):
+        if not counts[j]:
+            continue
+        step = period / counts[j]
+        reach = pad / xr[j]
+        k = np.arange(math.floor((amin - reach - phase[j]) / step) - 1, math.ceil((amax + reach - phase[j]) / step) + 2)
+        xs.append((phase[j] + k * step) * xr[j])
+        ii.append(k % counts[j])
+        jj.append(np.full(len(k), j))
+        steps.append(np.full(len(k), step * xr[j]))
+    if not xs:
+        return (np.zeros(0),) * 5 + (sx, sy, (0, 0), None, None)
+    x, i, j, fsx = np.concatenate(xs), np.concatenate(ii), np.concatenate(jj), np.concatenate(steps)
+    y = ry[j]
+    if randomness > 0:
+        x, y = P2.jitter("grid", x, y, i, j, randomness, fsx, fsy, seed)
+    used = counts[counts > 0]
+    holes.uneven_rows |= len(used) > 0 and used.min() != used.max()
+    rows = f"{n} rows {fsy * (1 if girth != 'scale' else rr[n // 2] / R):.1f} mm apart"
+    if girth == "scale":
+        holes.note(f"{name} closes around: {used.max()} around in {rows}, everything {radius.min() / R:.2f}x to "
+                   f"{radius.max() / R:.2f}x as large with the girth")
+        return x, y, np.zeros(len(x)), i, j, fsx, fsy, (0, 0), lambda x, y: uv(x / R, t_of(y)), lambda t: r_of(t) / R
+    holes.note(f"{name} closes around: " + (f"{used.min()} to {used.max()}" if used.min() != used.max()
+                                             else f"{used.max()}") + f" around in {rows}")
+
+    def to_uv(x, y):
+        t = t_of(y)
+        return uv(x / r_of(t), t)
+    return x, y, np.zeros(len(x)), i, j, fsx, fsy, (0, 0), to_uv, None
+
+
+def _reach_along(footprint, turn, alternate=False):
+    """How far a footprint ((m, 2) round its point, or None: a point) reaches below and above its
+    point across the rows, and either way along them, turned by `turn` (either way: the frame may
+    be mirrored; with Alternate by any quarter turn as well)."""
+    if footprint is None:
+        return 0.0, 0.0, 0.0
+    turns = [turn, -turn] + ([turn + k * math.pi / 2 for k in (1, 2, 3)] if alternate else [])
+    x = np.concatenate([footprint[:, 0] * math.cos(t) - footprint[:, 1] * math.sin(t) for t in turns])
+    y = np.concatenate([footprint[:, 0] * math.sin(t) + footprint[:, 1] * math.cos(t) for t in turns])
+    return float(max(-y.min(), 0.0)), float(max(y.max(), 0.0)), float(np.abs(x).max())
+
+
+def _counts(ideal, even=False):
+    """How many go around each row (ideal: how many times Spacing fits around it). The widest row
+    gets the nearest whole number; from there out, a row keeps the count of the row before it while
+    they stay between MIN_STEP and MAX_STEP Spacings apart, so the rows nest and the count only
+    steps now and then, to the nearest again (none where not half of one fits)."""
+    def fit(x):
+        return 2 * int(round(x / 2)) if even else int(round(x))
+
+    out = np.zeros(len(ideal), dtype=np.int64)
+    widest = int(np.argmax(ideal))
+    out[widest] = fit(ideal[widest])
+    for order in (range(widest + 1, len(ideal)), range(widest - 1, -1, -1)):
+        c = out[widest]
+        for j in order:
+            if not (0 < c and MIN_STEP * c <= ideal[j] + 1e-9 and ideal[j] <= MAX_STEP * c):
+                c = fit(ideal[j])
+            out[j] = c
+    return out
+
+
+def _nest(prev, count, period, tries=48):
+    """Where to start a row of `count` around (parameter units, `period` all round) so that it keeps
+    as far as it can from the row before's positions `prev`."""
+    step = period / count
+    trial = np.arange(tries) * step / tries
+    at = trial[:, None] + np.arange(count)[None] * step
+    d = (at[:, :, None] - prev[None, None, :]) % period
+    return float(trial[np.argmax(np.minimum(d, period - d).min(axis=(1, 2)))])
+
+
+def _param_slices(Q, P, d, values):
+    """Where the triangles cross the lines of constant surface parameter d (0 = u, 1 = v) at
+    `values` (sorted): per crossing the line's index, its two ends in (u, v) (2, 2) and in 3D (2, 3),
+    found on the triangles' edges by linear interpolation (a corner on the line counts as above it)."""
+    lo, hi = Q[..., d].min(axis=1), Q[..., d].max(axis=1)
+    first = np.searchsorted(values, lo, side="right")            # lines strictly inside each triangle's range
+    last = np.searchsorted(values, hi, side="left")
+    count = np.maximum(last - first, 0)
+    tri = np.repeat(np.arange(len(Q)), count)
+    line = np.repeat(first, count) + np.arange(count.sum()) - np.repeat(np.cumsum(count) - count, count)
+    q = Q[tri][..., d] - values[line][:, None]                  # (k, 3), the line at 0
+    above = q >= 0
+    ends_uv, ends_3d = np.zeros((len(tri), 2, 2)), np.zeros((len(tri), 2, 3))
+    found = np.zeros(len(tri), dtype=np.int64)
+    for i, j in ((0, 1), (1, 2), (2, 0)):
+        cut = above[:, i] != above[:, j]
+        k = np.flatnonzero(cut)
+        s = (q[k, i] / (q[k, i] - q[k, j]))[:, None]
+        slot = np.minimum(found[k], 1)
+        ends_uv[k, slot] = Q[tri[k], i] + s * (Q[tri[k], j] - Q[tri[k], i])
+        ends_3d[k, slot] = P[tri[k], i] + s * (P[tri[k], j] - P[tri[k], i])
+        found[k] += 1
+    keep = found == 2
+    return line[keep], ends_uv[keep], ends_3d[keep]
+
+
+def _straight_on(x, xp, fp):
+    """np.interp continued straight past both ends."""
+    x = np.asarray(x, dtype=np.float64)
+    out = np.interp(x, xp, fp)
+    below, above = x < xp[0], x > xp[-1]
+    out[below] = fp[0] + (x[below] - xp[0]) * (fp[1] - fp[0]) / (xp[1] - xp[0])
+    out[above] = fp[-1] + (x[above] - xp[-1]) * (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+    return out
 
 
 def read_at(field, points, check=None):

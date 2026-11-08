@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from engine.graph.core import GROUP_SEP
-from engine.server import build_run_graph, create_app
+from engine.server import Session, build_run_graph, create_app, detail_floor
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,6 +46,25 @@ def test_build_run_graph_applies_quality_and_views():
     assert not any(g.nodes[t]["type"].startswith("output.") for t in targets)
 
 
+def test_a_bypassed_shown_node_shows_what_it_passes_on_and_exports_can_be_chosen():
+    g = recipe()
+    body = next(n for n, s in g["nodes"].items() if s["type"] == "implicit.offset")
+    g["nodes"][body]["bypass"] = True
+    graph, _, views, _ = build_run_graph(g, "preview", "draft", [body])
+    passed = g["nodes"][body]["inputs"]["body"]["link"]
+    assert graph.nodes[f"__view__{body}"]["inputs"]["body"] == {"link": passed}
+    g["nodes"]["second"] = {"type": "output.export", "inputs": {"mesh": {"link": "mesh.mesh"}, "path": "b.stl"}}
+    assert set(build_run_graph(g, "export", "final", [])[1]) == {"export", "second", "preview"}   # every file
+    assert build_run_graph(g, "export", "final", [], only=["second"])[1] == ["second"]
+
+
+def test_a_mesh_made_by_dual_contouring_gets_no_marching_cubes_detail():
+    g = recipe()
+    assert detail_floor(build_run_graph(g, "preview", "draft", ["mesh"])[0], "mesh", "draft") == pytest.approx(0.1)
+    g["nodes"]["mesh"]["inputs"]["method"] = "dual contouring"
+    assert detail_floor(build_run_graph(g, "preview", "draft", ["mesh"])[0], "mesh", "draft") is None
+
+
 def test_views_know_what_they_are_made_of_and_keep_what_the_editor_shows_finer():
     g = recipe()
     shown = ["mesh", "part_0", "implicit_body_0"]
@@ -69,7 +88,26 @@ def test_views_know_what_they_are_made_of_and_keep_what_the_editor_shows_finer()
     _, targets, kept, _ = build_run_graph(g, "preview", "final", ["mesh"], have=have)
     assert not kept["mesh"].kept and "mesh" in targets                   # finer than shown
     _, targets, kept, _ = build_run_graph(g, "export", "final", ["mesh"], have={"mesh": {"key": key, "level": "final"}})
-    assert not kept["mesh"].kept and "mesh" in targets                   # exports make everything
+    assert kept == {} and "export" in targets and "mesh" not in targets  # exports write files, make no views
+
+
+def test_previews_coarsen_a_linked_voxel_and_skip_reduce_mesh():
+    g = recipe()
+    g["nodes"]["size"] = {"type": "input.number", "inputs": {"value": 0.2}}
+    g["nodes"]["mesh"]["inputs"]["voxel"] = {"link": "size.out"}
+    g["nodes"]["lighter"] = {"type": "mesh.reduce", "inputs": {"mesh": {"link": "mesh.mesh"}, "tolerance": 0.02}}
+    draft, _, views, _ = build_run_graph(g, "preview", "draft", ["lighter"])
+    assert draft.nodes["mesh"]["inputs"]["coarser"] == 4.0 and draft.nodes["lighter"]["inputs"]["skip"] == 1
+    assert not views["lighter"].exact          # so refining goes on to Final, where it is reduced
+    final = build_run_graph(g, "preview", "final", ["lighter"])
+    assert "coarser" not in final[0].nodes["mesh"]["inputs"] and "skip" not in final[0].nodes["lighter"]["inputs"]
+    assert final[2]["lighter"].key == views["lighter"].key
+    assert detail_floor(draft, "mesh", "draft") is None                        # a linked voxel: from the view
+    assert detail_floor(draft, "mesh", "draft", shown=0.8) == pytest.approx(0.2)
+    from engine.graph import Evaluator
+    out = Evaluator(draft, log=None).run(["lighter"])
+    assert out["mesh"]["mesh"].metadata["voxel"] == pytest.approx(0.8)         # 4 x 0.2
+    assert out["lighter"]["mesh"] is out["mesh"]["mesh"]                       # not reduced in Draft
 
 
 def test_refining_previews_compute_only_what_is_not_shown_finer_yet():
@@ -85,7 +123,6 @@ def test_refining_previews_compute_only_what_is_not_shown_finer_yet():
         assert ready["mesh"]["level"] == "draft" and not ready["mesh"]["exact"]
         assert ready["part_0"]["level"] == "final" and ready["part_0"]["exact"]          # a CAD body: no finer view
         assert first[-1]["ok"] and first[-1]["sharper"] and first[-1]["shown"] == "draft"
-        assert any(e["type"] == "phase" and "mesh" in e["text"] for e in first)        # the steps after the nodes
         shown_now = have(first)
 
         # the same graph at Medium: the CAD body is kept, the mesh is made finer
@@ -113,6 +150,34 @@ def test_refining_previews_compute_only_what_is_not_shown_finer_yet():
         cad = run_and_collect(client, ws, {"graph": recipe(), "mode": "preview", "quality": "draft",
                                            "visible": ["part_0"]})[-1]
         assert not cad["sharper"] and cad["shown"] is None                              # nothing gets finer
+
+
+def test_views_are_sent_as_soon_as_their_node_is_done():
+    # a run of many bodies showed nothing until its last one was done
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        events = run_and_collect(client, ws, {"graph": recipe(), "mode": "preview", "quality": "draft",
+                                              "visible": ["part_0", "mesh"]})
+        at = lambda kind, node: next(i for i, e in enumerate(events) if e["type"] == kind and e.get("node") == node)
+        assert at("node_done", "part_0") < at("view_ready", "part_0") < at("node_start", "mesh")
+        assert at("node_done", "mesh") < at("view_ready", "mesh")
+        assert not any(e["type"] == "phase" for e in events)  # (no steps left after the nodes)
+        assert next(e for e in events if e["type"] == "view_ready")["parts"] is None   # not a list
+
+
+def test_a_list_view_is_sent_item_by_item_while_it_is_made():
+    g = recipe()
+    g["nodes"]["copies"] = {"type": "cad.pattern", "inputs": {"body": {"link": "part_0.body"}, "count": 3,
+                                                              "spacing": "60, 0, 0"}}
+    g["nodes"]["implicit_body_6"]["inputs"]["cad"] = {"link": "copies.body"}
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        events = run_and_collect(client, ws, {"graph": g, "mode": "preview", "quality": "draft", "visible": ["mesh"]})
+        parts = sorted((e for e in events if e["type"] == "view_part"), key=lambda e: e["index"])
+        view = next(e for e in events if e["type"] == "view_ready")
+        assert [e["index"] for e in parts] == [0, 1, 2] and all(e["total"] == 3 and e["node"] == "mesh" for e in parts)
+        assert max(e["version"] for e in parts) < view["version"]   # the whole view comes after them, and replaces them
+        # each item's triangles, one after the other: the editor draws a later run's pieces instead of them
+        assert view["parts"] == [e["faces"] for e in parts] and sum(view["parts"]) == view["faces"]
+        assert client.get("/api/view/part:0:mesh").status_code == 404   # dropped once the whole view is there
 
 
 def test_a_detail_shows_part_of_a_body_finer_than_its_view():
@@ -224,6 +289,55 @@ def test_preview_run_streams_events_and_serves_mesh():
         assert all(e.get("cached", True) for e in events if e["type"] == "node_done")
 
 
+def test_the_engine_tells_every_tab_which_one_uses_it():
+    # every tab gets every event and views are kept by node id: an old tab reconnecting after a restart
+    # showed its part in the new tab under the same node name. A new connection hears which tab uses the
+    # engine; a claim or a run by a tab tells all of them, and a run's tag names its tab (store.CLIENT), so
+    # the others take none of its events
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        hello = ws.receive_json()
+        assert hello["type"] == "hello" and hello["engine"]   # which engine process: a restart is another one
+        assert ws.receive_json() == {"type": "active", "client": None}
+        assert client.post("/api/claim", json={"client": "a"}).json() == {"active": "a"}
+        assert ws.receive_json() == {"type": "active", "client": "a"}
+        run_id = client.post("/api/run", json={"graph": recipe(), "mode": "preview", "quality": "draft",
+                                               "visible": [], "client": "b",
+                                               "tag": {"version": 1, "client": "b"}}).json()["run"]
+        seen = [ws.receive_json()]
+        while not (seen[-1]["type"] == "run_done" and seen[-1].get("run") == run_id):
+            seen.append(ws.receive_json())
+        assert seen[0] == {"type": "active", "client": "b"}
+        assert next(e for e in seen if e["type"] == "run_start")["tag"]["client"] == "b"
+        with client.websocket_connect("/ws") as other:
+            assert other.receive_json() == hello
+            assert other.receive_json() == {"type": "active", "client": "b"}
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["engine"] != hello["engine"]   # (the editor then makes everything again)
+
+
+def test_views_and_results_of_nodes_no_longer_shown_are_forgotten():
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        preview = lambda graph, visible: run_and_collect(client, ws, {"graph": graph, "mode": "preview",
+                                                                      "quality": "draft", "visible": visible})
+        assert preview(recipe(), ["mesh", "implicit_body_6"])[-1]["ok"]
+        assert client.get("/api/view/implicit_body_6").status_code == 200
+
+        # hidden: its view and the mesh made for it are dropped; shown again, it is meshed again
+        assert preview(recipe(), ["mesh"])[-1]["ok"]
+        assert client.get("/api/view/implicit_body_6").status_code == 404
+        assert client.get("/api/view/mesh").status_code == 200
+        events = preview(recipe(), ["mesh", "implicit_body_6"])
+        assert any(e["type"] == "node_done" and e["node"] == "implicit_body_6" and e.get("view") and not e["cached"]
+                   for e in events)
+
+        # another recipe (here an empty one): nothing of the first one is kept
+        assert preview({"version": 1, "nodes": {}}, [])[-1]["ok"]
+        assert client.get("/api/view/mesh").status_code == 404
+        events = preview(recipe(), ["mesh"])
+        done = [e for e in events if e["type"] == "node_done"]
+        assert done and not any(e["cached"] for e in done)
+
+
 def test_field_nodes_are_shown_as_slices():
     with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
         events = run_and_collect(client, ws, {
@@ -296,6 +410,48 @@ def test_file_api_round_trip(tmp_path):
         assert client.post("/api/file", params={"path": str(tmp_path / "x.txt")}, json=recipe()).status_code == 400
 
 
+def test_file_dialog_answers_the_path_cancel_busy_or_unavailable(monkeypatch):
+    """/api/file_dialog passes the request to Windows' dialog (replaced here: a real one would open on the
+    desktop) and tells the editor when to use its own."""
+    from engine import native_dialog
+    asked = []
+
+    def fake(mode, title, exts, folder, name):
+        asked.append((mode, title, exts, folder, name))
+        return {"pick": r"C:\parts\a.step", "cancel": None}[title]
+    monkeypatch.setattr(native_dialog, "ask", fake)
+    with TestClient(create_app()) as client:
+        req = {"mode": "open", "title": "pick", "exts": [".step"], "dir": r"C:\parts", "name": ""}
+        assert client.post("/api/file_dialog", json=req).json() == {"path": r"C:\parts\a.step"}
+        assert asked[-1] == ("open", "pick", [".step"], r"C:\parts", "")
+        assert client.post("/api/file_dialog", json={**req, "title": "cancel"}).json() == {"path": None}
+
+        def raising(error):
+            def ask(*_):
+                raise error
+            return ask
+        monkeypatch.setattr(native_dialog, "ask", raising(native_dialog.Busy("open")))
+        assert client.post("/api/file_dialog", json=req).json() == {"busy": True}
+        monkeypatch.setattr(native_dialog, "ask", raising(native_dialog.Unavailable("no tkinter")))
+        assert client.post("/api/file_dialog", json=req).json() == {"unavailable": "no tkinter"}
+
+
+def test_file_dialog_helper_reports_failures_as_unavailable(monkeypatch):
+    """A helper that cannot run, or prints no answer, means the editor's own dialog, never an error page."""
+    import subprocess
+    from engine import native_dialog
+    monkeypatch.setattr(native_dialog.sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "Tcl died"))
+    with pytest.raises(native_dialog.Unavailable, match="Tcl died"):
+        native_dialog.ask("open", "t", [".json"], "", "")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, '{"error": "TclError: x"}\n', ""))
+    with pytest.raises(native_dialog.Unavailable, match="TclError"):
+        native_dialog.ask("open", "t", [".json"], "", "")
+    assert native_dialog._open.acquire(blocking=False)  # the lock was let go after each failure
+    native_dialog._open.release()
+    assert native_dialog._label([".step", ".stp", ".STEP"]) == "STEP / STP files"
+
+
 def decode_faces(blob):
     """/api/faces -> (face per triangle, body per triangle, copies of one part?, group lists)."""
     b = np.frombuffer(blob, dtype=np.uint32)
@@ -332,7 +488,7 @@ def test_face_info_describes_a_face_of_a_cad_view():
         assert events[-1]["ok"], events[-1]
         ask = lambda node="import", **at: client.get(f"/api/faceinfo/{node}", params=at)
         bore = ask(body=0, face=6).json()                     # the pin hole: radius 4 mm, along Y
-        assert set(bore) == {"type", "area", "centre", "normal", "axis", "radius", "hole", "triangles"}
+        assert set(bore) == {"type", "area", "centre", "normal", "axis", "radius", "hole", "triangles", "body_name"}
         assert bore["type"] == "cylinder" and bore["hole"] is True and bore["normal"] is None
         assert bore["radius"] == pytest.approx(4.0, rel=1e-3) and abs(bore["axis"][1]) == pytest.approx(1.0)
         side = ask(body=0, face=0).json()
@@ -383,6 +539,34 @@ def test_face_at_finds_the_cad_face_behind_an_implicit_view():
 
         assert ask("nowhere", 0, 0, 0).status_code == 404                  # no such view
         assert client.get("/api/face_at/solid", params={"x": 0, "y": 0}).status_code == 422   # z is required
+
+
+def test_face_region_marks_the_triangles_of_an_implicit_view_on_the_face():
+    from engine.server import unpack_meshes
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        events = run_and_collect(client, ws, {"graph": bracket_graph(), "mode": "preview", "quality": "draft",
+                                              "visible": ["thick"]})
+        assert events[-1]["ok"], events[-1]
+        ask = lambda node, x, y, z, **more: client.get(f"/api/face_region/{node}", params={"x": x, "y": y, "z": z, **more})
+        answer = ask("thick", -1.0, 15, 25, edge=1.0)                      # the offset of the plane x = 0
+        assert answer.status_code == 200, answer.text
+        triangles = np.frombuffer(answer.content, dtype=np.uint32)
+        blob = client.get("/api/view/thick")
+        assert int(answer.headers["X-View-Version"]) == int(blob.headers["X-View-Version"])
+        V, F = unpack_meshes(blob.content)
+        centres = V[F].mean(axis=1)
+        x = centres[triangles, 0]                                           # on the offset plane x = -0.5
+        assert len(triangles) > 10 and np.median(x) == pytest.approx(-0.5, abs=0.05) and np.all(x < 0.3)
+        flat = np.flatnonzero(np.abs(centres[:, 0] + 0.5) < 0.1)          # and nearly all of what lies there
+        assert np.isin(flat, triangles).mean() > 0.9
+
+        bore = np.frombuffer(ask("thick", 50, 15, 36.5).content, dtype=np.uint32)   # on the offset pin hole
+        radius = np.hypot(centres[bore, 0] - 50, centres[bore, 2] - 40)
+        assert len(bore) > 10 and np.median(radius) == pytest.approx(3.5, abs=0.1) and np.all(radius < 4.5)
+        assert not np.isin(bore, triangles).any()
+
+        assert ask("thick", -1.0, 15, 25, detail=True).status_code == 404   # it has no detail
+        assert ask("nowhere", 0, 0, 0).status_code == 404
 
 
 def test_face_at_leaves_out_bodies_inside_groups_and_goes_through_group_inputs():
@@ -471,6 +655,67 @@ def test_node_at_reports_nodes_inside_a_group_as_the_group():
         through = ask("plain", 0)                                          # the part's face: the group's steps are one entry
         assert (through["node"], through["inner"], through["type"]) == ("space", None, "input.pick_body")
         assert [s["node"] for s in through["path"]] == ["plain", "space"]
+
+
+def test_bodies_lists_the_step_files_names_and_reads_them_for_imports_kept_without(tmp_path):
+    """/api/bodies: Pick Body's list of bodies with the names SolidWorks writes into the STEP file. An import
+    kept on the SSD before names were has none until the editor asks for them (read from the file once)."""
+    from engine import cache
+    link = lambda ref: {"link": ref}
+    step = tmp_path / "named.step"
+    text = (ROOT / "samples" / "two_blocks.step").read_text()
+    step.write_text(text.replace("#15 = MANIFOLD_SOLID_BREP('',", "#15 = MANIFOLD_SOLID_BREP('Fillet9',", 1)
+                    .replace("#359 = MANIFOLD_SOLID_BREP('',", "#359 = MANIFOLD_SOLID_BREP('CirPattern1[2]',", 1))
+    g = {"version": 1, "nodes": {
+        "import": {"type": "input.import_step", "inputs": {"path": str(step)}},
+        "pick": {"type": "input.pick_body", "inputs": {"bodies": link("import.bodies"), "index": 1}}}}
+    run = {"graph": g, "mode": "preview", "quality": "draft", "visible": ["pick"]}
+    ask = lambda client, **extra: client.get("/api/bodies/pick", params={"input": "bodies", **extra}).json()
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        assert ask(client)["bodies"] is None                     # nothing made yet
+        assert run_and_collect(client, ws, run)[-1]["ok"]
+        got = ask(client)
+        assert sorted(b["name"] for b in got["bodies"]) == ["CirPattern1[2]", "Fillet9"] and not got["names_unread"]
+        boxes = sorted((b["lo"][0], b["hi"][0]) for b in got["bodies"])   # x 0..40 and 40..90
+        assert boxes == [pytest.approx((0, 40), abs=1e-3), pytest.approx((40, 90), abs=1e-3)]
+        assert all(b["faces"] == 6 and b["triangles"] >= 12 for b in got["bodies"])
+        # a Pick Body added since the run: the editor names its source
+        later = client.get("/api/bodies/new", params={"input": "bodies", "source": "import", "port": "bodies"}).json()
+        assert [b["name"] for b in later["bodies"]] == [b["name"] for b in got["bodies"]]
+
+    for f in (cache.default_cache_dir() / cache.STEP_FOLDER).glob("*.names.json"):
+        f.unlink()                                               # as kept before names were
+    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
+        assert run_and_collect(client, ws, run)[-1]["ok"]
+        bare = ask(client)
+        assert bare["names_unread"] and all(b["name"] is None for b in bare["bodies"])
+        named = ask(client, names=True)
+        assert [b["name"] for b in named["bodies"]] == [b["name"] for b in got["bodies"]] and not named["names_unread"]
+    from engine.graph import REGISTRY
+    tolerance = REGISTRY["input.import_step"].input("tolerance").default
+    angle = REGISTRY["input.import_step"].input("angle").default
+    assert sorted(cache.load_step_names(step, tolerance, angle)) == ["CirPattern1[2]", "Fillet9"]   # kept now
+
+
+def test_reveal_shows_the_file_or_its_nearest_folder_in_explorer(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **_: started.append(args))
+    monkeypatch.setattr(sys, "platform", "win32")
+    (tmp_path / "a.stl").write_bytes(b"solid")
+    with TestClient(create_app()) as client:
+        assert client.post("/api/reveal", json={"path": str(tmp_path / "a.stl")}).json()["shown"] == str(tmp_path / "a.stl")
+        assert client.post("/api/reveal", json={"path": str(tmp_path / "out" / "b.stl")}).json()["shown"] == str(tmp_path)
+        assert client.post("/api/reveal", json={"path": ""}).status_code == 400
+    assert started == [["explorer", f"/select,{tmp_path / 'a.stl'}"], ["explorer", str(tmp_path)]]
+
+
+def test_fonts_lists_installed_fonts_by_name():
+    with TestClient(create_app()) as client:
+        fonts = client.get("/api/fonts").json()["fonts"]
+    arial = [f for f in fonts if f["value"] == "arialbd"]
+    assert arial == [{"value": "arialbd", "family": "Arial", "style": "Bold"}] or not (Path(r"C:\Windows\Fonts") / "arialbd.ttf").exists()
 
 
 def test_node_at_follows_the_matching_body_of_a_list():
@@ -629,3 +874,48 @@ def test_exports_queue_up_and_previews_wait(tmp_path):
         assert (tmp_path / "a.stl").exists() and (tmp_path / "b.stl").exists()
         state = client.get("/api/queue").json()
         assert state["current"] is None and state["exports"] == [] and not state["preview_waiting"]
+
+
+class Hub:
+    """Session's hub, with a hook on every event."""
+
+    def __init__(self):
+        self.events, self.hook = [], lambda event: None
+
+    def publish(self, event):
+        self.events.append(event)
+        self.hook(event)
+
+
+def test_a_stop_as_a_run_starts_is_kept_and_does_not_reach_the_next_run():
+    """Optimize, right behind the preview a changed setting started, tells that preview to stop before its
+    thread gets going. That was wiped out as the run began, and Optimize waited for the whole preview (of
+    a topology result: 3 minutes, holding the start lock)."""
+    hub = Hub()
+    session = Session(hub)
+    hub.hook = lambda e: session.evaluator.cancel() if e["type"] == "run_start" and e["label"] == "first" else None
+    try:
+        session.start(recipe(), "preview", "draft", ["mesh"], label="first")
+        session.thread.join(60)
+        assert [e.get("cancelled") for e in hub.events if e["type"] == "run_done"] == [True]
+        session.start(recipe(), "preview", "draft", ["mesh"], label="second")
+        session.thread.join(60)
+        assert [e["ok"] for e in hub.events if e["type"] == "run_done"] == [False, True]
+    finally:
+        session.evaluator.close()
+
+
+def test_a_second_optimize_of_a_node_is_not_queued(monkeypatch):
+    """One click that waited behind a stopping preview, then another: queued, it started as soon as the
+    first was stopped. Another node's optimization still queues."""
+    session = Session(Hub())
+    monkeypatch.setattr(session, "exporting", lambda: True)
+    session.current = {"id": 0, "label": "optimize mesh"}
+    session.start(recipe(), "optimize", "draft", [], label="optimize mesh", optimize="mesh")
+    assert session.queue == []
+    session.start(recipe(), "optimize", "draft", [], label="optimize export", optimize="export")
+    session.start(recipe(), "optimize", "draft", [], label="optimize export", optimize="export")
+    assert [j["label"] for j in session.queue] == ["optimize export"]
+    # after a changed setting (a newer tag) it is another job: it was dropped without a word
+    session.start(recipe(), "optimize", "draft", [], label="optimize mesh", optimize="mesh", tag={"version": 2})
+    assert [j["label"] for j in session.queue] == ["optimize export", "optimize mesh"]

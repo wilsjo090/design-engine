@@ -29,6 +29,22 @@ def nan_above_x5(body):
     return body + hole
 
 
+def test_texture_node_is_the_wired_chain(body):
+    """Texture = Remap (pattern's range to 0..1) x Height x Fade into Offset Body, in one node."""
+    from engine.graph.nodes import texture
+    grid = Grid((-12, -12, -7), (12, 12, 7), 1.0)
+    noise, fade = F.noise(5), F.smoothstep(F.X, -5.0, 5.0)
+    values = lambda f: F.Context(grid).eval_full(f)
+    wired = F.offset(body, F.remap(noise, -1, 1, 0, 0.8) * fade)
+    assert np.allclose(values(texture(body, noise, 0.8, fade)), values(wired), atol=1e-6)
+    inverted = F.offset(body, F.remap(noise, -1, 1, 0, 0.8) * (1 - fade))
+    assert np.allclose(values(texture(body, noise, 0.8, fade, invert_fade="yes")), values(inverted), atol=1e-6)
+    assert np.allclose(values(texture(body, noise, -0.5, 1.0, stretch="as is")), values(F.offset(body, noise * -0.5)),
+                       atol=1e-6)
+    lo, hi = BOX.bounds
+    assert np.allclose(texture(body, noise, 0.8, 1.0).bounds, [lo - 0.8, hi + 0.8])  # grown by the height
+
+
 def test_offsets_grow_the_box_by_their_reach(body):
     lo, hi = BOX.bounds
     texture = F.remap(F.noise(5), -1, 1, -0.5, 1.5)  # -0.5 .. 1.5 mm

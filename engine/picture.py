@@ -7,8 +7,10 @@ face (a cylinder or a cone) around its axis, so the picture keeps its proportion
 surface. Within Band of the face only (a picture projected straight through a box would also land
 on its far side). A pure function of position, so block meshing stays exact.
 """
+import functools
 import hashlib
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +44,42 @@ def load_image(path):
         k = MAX_PIXELS / max(image.size)
         image = image.resize((max(1, round(image.width * k)), max(1, round(image.height * k))), Image.LANCZOS)
     return 1.0 - np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _font_folders():
+    user = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts"
+    return [FONTS] + ([user] if os.environ.get("LOCALAPPDATA") else [])
+
+
+def font_list():
+    """Every installed font, for the editor's list (Text's Font): [{value (what Font takes: the file name in
+    the Windows Fonts folder, a full path for one installed for this user only), family, style}], by name.
+    Read again only when a fonts folder changes (opening every file takes about a second)."""
+    stamp = tuple(f.stat().st_mtime_ns if f.is_dir() else 0 for f in _font_folders())
+    return _fonts(stamp)
+
+
+@functools.lru_cache(maxsize=1)
+def _fonts(_stamp):
+    from PIL import ImageFont
+    found = []
+    for folder in _font_folders():
+        try:
+            files = sorted(p for p in folder.iterdir() if p.suffix.lower() in (".ttf", ".otf", ".ttc"))
+        except OSError:
+            continue
+        for p in files:
+            try:
+                family, style = ImageFont.truetype(str(p), 12).getname()
+            except (OSError, ValueError):
+                continue
+            if folder != FONTS:
+                value = str(p)
+            else:
+                value = p.stem if p.suffix.lower() in (".ttf", ".otf") else p.name
+            found.append({"value": value, "family": family or p.stem, "style": style or "Regular"})
+    found.sort(key=lambda f: (f["family"].lower(), f["style"] != "Regular", f["style"].lower()))
+    return found
 
 
 def render_text(text, font="arial", pixels=240):

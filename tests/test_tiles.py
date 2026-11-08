@@ -3,10 +3,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 import trimesh
+from scipy.spatial import cKDTree
 
 from engine import fields as F
 from engine import tiles
 from engine.cad_import import load_step, tessellate
+from engine.dualcontour import dual_contour
 from engine.graph import Evaluator, Graph, link
 from engine.grid import Grid
 from engine.meshing import field_to_mesh
@@ -117,6 +119,54 @@ def test_blocks_the_probe_missed_are_added(part, small_blocks, monkeypatch):
                                                                 if tiles._mesh_block(f, plan, b, 1.0, np)[1] is not None][:1])
     mesh, _, _ = tiles.mesh_tiled(field, field.bounds, VOXEL, 1.5, 1.0, sequential)
     assert len(mesh.faces) == len(full.faces)
+
+
+DUAL_VOXEL = 0.4  # (dual contouring in blocks of 48 with their halo: ~4x the samples)
+
+
+def whole_box_dual(field):
+    """Dual contouring on one grid over the box the blocks cover."""
+    plan = tiles.Plan(field, field.bounds, DUAL_VOXEL, 1.5)
+    grid = Grid.block(plan.base, DUAL_VOXEL, (0, 0, 0), [n * plan.block + 1 for n in plan.blocks])
+    return dual_contour(F.Context(grid).eval_full(field), grid)
+
+
+def same_vertices(a, b, within=1e-5):  # (blocks are snapped to float32)
+    return all(cKDTree(q.vertices).query(p.vertices)[0].max() < within for p, q in ((a, b), (b, a)))
+
+
+@pytest.mark.parametrize("make", [lambda part: F.body_from_mesh(part, 1.5), textured,
+                                  lambda part: F.subtract(F.body_from_mesh(part, 1.5),
+                                                          F.bar((0, -30, 7.5), (0, 30, 7.5), 3.0))])
+def test_dual_contouring_in_blocks_matches_the_whole_grid(part, small_blocks, make, tmp_path):
+    # blocks keep the vertices of their own cells and the quads of their own edges, computed with a halo
+    # that holds everything they depend on, and join by vertex names: the whole grid's mesh
+    field = make(part)
+    whole = whole_box_dual(field)
+    mesh, computed, _ = tiles.mesh_tiled(field, field.bounds, DUAL_VOXEL, 1.5, 1.0, sequential,
+                                         method="dual contouring")
+    assert computed > 1
+    assert len(mesh.faces) == len(whole.faces) and same_vertices(mesh, whole)
+    assert mesh.volume == pytest.approx(whole.volume, rel=1e-6)
+    assert reload(mesh, tmp_path).is_watertight
+
+
+def test_dual_contouring_blocks_the_probe_missed_are_added(part, small_blocks, monkeypatch):
+    field = F.body_from_mesh(part, 1.5)
+    full, _, _ = tiles.mesh_tiled(field, field.bounds, DUAL_VOXEL, 1.5, 1.0, sequential, method="dual contouring")
+    found = tiles.find_surface
+    monkeypatch.setattr(tiles, "find_surface", lambda f, plan: [b for b in found(f, plan)
+                                                                if tiles._mesh_block(f, plan, b, 1.0, np)[1] is not None][:1])
+    mesh, _, _ = tiles.mesh_tiled(field, field.bounds, DUAL_VOXEL, 1.5, 1.0, sequential, method="dual contouring")
+    assert len(mesh.faces) == len(full.faces) and same_vertices(mesh, full)
+
+
+def test_dual_contouring_blocks_close_a_body_cut_by_the_box(part, small_blocks, tmp_path):
+    field = F.offset(F.body_from_mesh(part, 1.5), F.X * 0 + 2.0)  # reaches past the box, unknown to the mesher
+    mesh, _, _ = tiles.mesh_tiled(field, part.bounds, DUAL_VOXEL, 1.0, 1.0, sequential, method="dual contouring")
+    assert mesh.metadata["clipped"] and reload(mesh, tmp_path).is_watertight
+    lighter, _, _ = tiles.mesh_tiled(field, part.bounds, DUAL_VOXEL, 1.0, 0.3, sequential, method="dual contouring")
+    assert len(lighter.faces) < 0.4 * len(mesh.faces) and reload(lighter, tmp_path).is_watertight
 
 
 def test_big_body_is_meshed_in_blocks_by_the_workers(small_blocks, tmp_path):

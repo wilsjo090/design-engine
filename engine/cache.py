@@ -10,11 +10,13 @@ another one wrote, and the cache survives restarts.
 """
 import ctypes
 import hashlib
+import json
 import os
 import shutil
 import sys
 import threading
 import time
+import zipfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -26,10 +28,18 @@ except ImportError:  # optional: only needed for live memory checks
     psutil = None
 
 # --- memory budget ----------------------------------------------------------------------------
-LIMIT_OF_TOTAL = 0.6      # never plan to use more than this share of all RAM ...
-LIMIT_OF_AVAILABLE = 0.75 # ... or of the RAM that was free when the engine started
-CACHE_SHARE = 0.2         # part of the limit used by RAM caches; the SSD cache takes the rest
+LIMIT_OF_TOTAL = 0.6      # never plan to use more than this share of all RAM (more, and the engine's own data is paged)
+CACHE_SHARE = 0.2         # part of the limit (at most of the RAM free) used by RAM caches; the SSD cache takes the rest
 MAIN_SHARE_WITH_WORKERS = 0.3  # of the cache part, while worker processes are running
+
+# Commit: the memory Windows has promised to programs, at most RAM + page file (the commit limit). Free RAM
+# is not the limit any more: with the page file on the NVMe SSD, a full RAM only pages other programs' idle
+# memory out, and the PC stays responsive (FINDINGS, "The PC freeze"). Running out of commit is what breaks:
+# then any program's next allocation fails, SolidWorks' too. (On 2026-10-31 an export reached 77.7 of the
+# 77.8 GB with the engine holding 4 GB: other programs committed ~53 GB, its 7 GPU workers 17 GB.)
+COMMIT_TIGHT = int(6 * 2**30)   # left for other programs when planning; under it caches are freed
+COMMIT_STOP = int(3 * 2**30)    # the run stops
+COMMIT_LAST_RESORT = int(1.5 * 2**30)  # after a stop: the process ends if it stays this low (core)
 
 
 def physical_memory():
@@ -60,22 +70,64 @@ def available_memory():
     return physical_memory() // 2
 
 
-_LIMIT = None
+class _PerformanceInfo(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_ulong), ("CommitTotal", ctypes.c_size_t), ("CommitLimit", ctypes.c_size_t),
+                ("CommitPeak", ctypes.c_size_t), ("PhysicalTotal", ctypes.c_size_t),
+                ("PhysicalAvailable", ctypes.c_size_t), ("SystemCache", ctypes.c_size_t),
+                ("KernelTotal", ctypes.c_size_t), ("KernelPaged", ctypes.c_size_t),
+                ("KernelNonpaged", ctypes.c_size_t), ("PageSize", ctypes.c_size_t), ("HandleCount", ctypes.c_ulong),
+                ("ProcessCount", ctypes.c_ulong), ("ThreadCount", ctypes.c_ulong)]
+
+
+def commit_room():
+    """Bytes the PC can still commit: its commit limit (RAM + page file, as large as the page file is now)
+    less what all programs have committed. Elsewhere than on Windows: free RAM plus free swap."""
+    if sys.platform == "win32":
+        info = _PerformanceInfo()
+        info.cb = ctypes.sizeof(info)
+        if ctypes.windll.psapi.GetPerformanceInfo(ctypes.byref(info), info.cb):
+            return int(info.CommitLimit - info.CommitTotal) * int(info.PageSize)
+    if psutil is not None:
+        return int(psutil.virtual_memory().available + psutil.swap_memory().free)
+    return physical_memory() // 2
+
+
+def memory_room():
+    """Bytes a step may still take as far as the PC goes: the commit room less COMMIT_TIGHT, which is left
+    for other programs."""
+    return commit_room() - COMMIT_TIGHT
+
+
+_LIMIT = _CACHES = None
 
 
 def memory_limit():
-    """Bytes the whole engine (all its processes) should stay under. Fixed at first use, from
-    total RAM and what was free then, so other programs keep their share."""
-    global _LIMIT
+    """Bytes the whole engine (all its processes) should stay under in this run: set when each run starts
+    (refresh_memory_limit; before the first run, from this process alone)."""
     if _LIMIT is None:
-        own = psutil.Process().memory_info().rss if psutil is not None else 0
-        _LIMIT = int(min(LIMIT_OF_TOTAL * physical_memory(), LIMIT_OF_AVAILABLE * available_memory() + own))
+        refresh_memory_limit(psutil.Process().memory_info().rss if psutil is not None else 0)
+    return _LIMIT
+
+
+def refresh_memory_limit(in_use):
+    """Set the limit for a run from total RAM and the commit room now (where the run would be stopped
+    anyway, COMMIT_STOP); `in_use`: what the engine's processes hold already. Not from the RAM free: that
+    stopped a 0.05 mm export at 7.4 GB with 4 GB still free, while Windows could have paged other programs'
+    idle memory out. Fixed during the run: recomputed on every check, it would grow as the engine's own use
+    took the room and never be reached. (It used to be fixed at start-up: an editor started with 8 GB free
+    kept a 6.2 GB limit, and ran blocks 2 at a time, with 10.9 GB free later.)"""
+    global _LIMIT, _CACHES
+    _LIMIT = int(min(LIMIT_OF_TOTAL * physical_memory(), in_use + max(commit_room() - COMMIT_STOP, 0)))
+    # the RAM caches only take RAM that is free: they would page other programs out for arrays the SSD
+    # cache holds anyway, and an idle editor keeps them
+    _CACHES = int(CACHE_SHARE * min(_LIMIT, in_use + available_memory()))
     return _LIMIT
 
 
 def ram_cache_budget(workers=0):
     """(main process, each worker) RAM cache sizes in bytes."""
-    total = CACHE_SHARE * memory_limit()
+    memory_limit()
+    total = _CACHES
     if workers <= 0:
         return int(total), 0
     main = MAIN_SHARE_WITH_WORKERS * total
@@ -219,6 +271,25 @@ def load_step_meshes(path, tolerance, angle):
     return meshes
 
 
+def load_step_names(path, tolerance, angle):
+    """The bodies' names in the file (one per solid, "" for none) kept beside its meshes, or None. A file of
+    their own (`.names.json`), so the imports cached before names were kept stay valid."""
+    try:
+        names = json.loads(_step_file(path, tolerance, angle).with_suffix(".names.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return [str(n) for n in names] if isinstance(names, list) else None
+
+
+def save_step_names(path, tolerance, angle, names):
+    file = _step_file(path, tolerance, angle).with_suffix(".names.json")
+    try:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps([str(n) for n in names]), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def save_step_meshes(path, tolerance, angle, meshes):
     file = _step_file(path, tolerance, angle)
     file.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +317,7 @@ def save_step_meshes(path, tolerance, angle, meshes):
         total += size
         if total > STEP_MAX_BYTES and f != file:
             f.unlink(missing_ok=True)
+            f.with_suffix(".names.json").unlink(missing_ok=True)
 
 
 # --- topology optimization states ---------------------------------------------------------------
@@ -267,7 +339,7 @@ def _load_state(folder, key):
         with np.load(file, allow_pickle=False) as data:
             state = {k: data[k] for k in data.files}
         os.utime(file)
-    except (OSError, ValueError, EOFError):
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile):  # (a damaged file: the run is simply not there)
         return None
     return state
 

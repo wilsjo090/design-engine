@@ -11,6 +11,12 @@ marked **(open)** are the user's.
 Builds on FEA phases 1 and 2 ([TOPOLOGY_PLAN.md](TOPOLOGY_PLAN.md), Topology Optimization in
 `engine/fea/topology.py`).
 
+Added 2026-11-08: the layout's LPs kept in HiGHS and solved without crossover (2 mm spacing 250 s to 77 s, Stop at
+once inside an LP), mid-bar joints up to 150k candidates, and the calculation shown while it runs (FINDINGS, "Faster
+layout LPs, and the calculation shown"). Also: edge cases checked (FINDINGS, "Edge cases of Frame Optimization"): bars never thicker than the design
+space, loads no frame can carry refused at once, tiny and huge loads scaled for the LPs, member adding stops when the
+volume does (mid-bar joints left out over 80k candidates), loads on supports and nodes on a line said plainly.
+
 ## What the user decided (2026-10-15)
 
 - Instead of the organic SIMP shape, the part is built from **bars**: members with one profile
@@ -107,7 +113,7 @@ instead **(open)**.
 ### 1. Ground structure (`engine/frame/ground.py`)
 
 - Candidate nodes: a regular lattice inside the design space at *node spacing* (auto: design space
-  diagonal / ~15), kept where the design space's distance field says "inside, at least half a min
+  diagonal / ~15, then 0.8x finer while a support or load gets no bar, down to a third), kept where the design space's distance field says "inside, at least half a min
   size deep". Plus nodes at supports and loads: each Fixed Faces / Load condition's triangles are
   sampled with `model.sample_triangles` and clustered (k-means) to a few nodes per face (1 for a small
   face, up to ~6 for a large one, so a bolted face can take a moment).
@@ -137,6 +143,12 @@ instead **(open)**.
   along the way). A continuous bar keeps one section from end to end: its size is that of its most
   loaded piece, so the look stays "one bar with others welded onto it".
 - A setting *mid-bar joints* (on / off, default on) for when only end-to-end joints are wanted.
+- *Move joints* (on / off, default on; built 2026-10-26, `engine/frame/joints.py`): geometry
+  optimization after the layout (He & Gilbert 2015, "Rationalization of trusses generated via layout
+  optimization"): the joints that hold no support or load move off the lattice by sequential LPs in
+  forces and moves together (balance linearized in the moves, a shrinking trust box, every bar kept
+  inside the design space), then joints that met merge, idle bars go and joints on a straight bar are
+  taken out. Results in FINDINGS, "Move joints".
 
 ### 3. Curving (`engine/frame/curves.py`)
 
@@ -396,8 +408,11 @@ the beam model; the voxel check of its real body comes with F2's geometry.
   also in the frame check), between end planes; pieces of one bar are mitred. Exact against
   `Profile.distance` and the capsule union (tests); GPU equals CPU (`test_gpu.py --gpu`); a block
   equals the whole grid bit for bit.
-- **Joints:** *fillet* (default): the kernel keeps the two nearest *different* bars and blends them
-  with a polynomial smooth minimum, k = 0.6 x the thinner bar (or the node's Fillet, mm); pieces of
+- **Joints:** *fillet* (default): the kernel keeps the nearest *different* bars (up to 12) and blends
+  them thickest first with a polynomial smooth minimum, k = 0.6 x the incoming (thinner) bar (or the
+  node's Fillet, mm), faded out between one and two k away; round bars are tubes round one quintic
+  spline per bar with rounded ends; Fillet continuity G1 / G2 (default) / G3 (FINDINGS "Torn fillet
+  seams", "G2 and G3 fillets"); pieces of
   one bar never blend (a curve would get rings). The bars are joined to the bolt bosses and the
   pin's eye with the same fillet (`F.smooth_union`). *plain*: a hard union. *ball*: a filleted ball
   (0.6 x the largest bar) at each free joint, none at bolts and pins. The first ball joints (stuck-on

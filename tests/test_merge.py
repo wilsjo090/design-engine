@@ -97,6 +97,31 @@ def test_merge_without_fuse_keeps_every_part(tmp_path):
     assert out["merge"]["mesh"].volume == pytest.approx(2000, rel=1e-6)  # overlap counted twice
 
 
+def test_a_fuse_that_does_not_fit_stops_idle_workers_or_says_why(monkeypatch):
+    import engine.graph.core as core
+    from engine.graph import GraphError
+    g = Graph()
+    g.add("src", "input.import_step", path="unused")
+    g.add("cad_mesh", "mesh.from_cad", cad=link("src.bodies"))
+    g.add("merge", "mesh.merge", a=link("cad_mesh.mesh"))
+    free = {"bytes": 1000}  # room for 1 kB: 24 triangles need ~16 kB to fuse
+    monkeypatch.setattr(core, "memory_room", lambda: free["bytes"])
+    stopped = []
+
+    def stop(self):
+        stopped.append(1)
+        free["bytes"] += 2**30  # the stopped workers give their memory back
+        return True
+    monkeypatch.setattr(core.Evaluator, "_stop_idle_workers", stop)
+    out = run_with_bodies(g, [box(0), box(8)])
+    assert stopped and out["merge"]["mesh"].is_watertight
+
+    free["bytes"] = 1000
+    monkeypatch.setattr(core.Evaluator, "_stop_idle_workers", lambda self: False)  # no workers to stop
+    with pytest.raises(GraphError, match="Merge Meshes needs about .* GB of memory at once"):
+        run_with_bodies(g, [box(0), box(8)])
+
+
 def test_fused_marching_cubes_meshes_export_watertight(tmp_path):
     # Real pipeline: implicit bodies meshed (and decimated, as in exports), then fused with a CAD mesh.
     g = Graph()

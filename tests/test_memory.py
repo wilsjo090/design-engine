@@ -67,7 +67,7 @@ def test_disk_cache_stays_under_its_size(tmp_path):
 def test_too_large_job_stops_before_it_starts(monkeypatch):
     # (bigger grids than this are meshed block by block, which needs little memory)
     import engine.graph.nodes as nodes
-    monkeypatch.setattr(nodes, "available_memory", lambda: 2**30)       # pretend: 1 GB free
+    monkeypatch.setattr(nodes, "memory_room", lambda: 2**30 // 2)       # pretend: the PC can give out 0.5 GB
     box = trimesh.creation.box((25, 25, 25))                            # 0.1 mm grid: ~21M voxels, ~1 GB
     with pytest.raises(GraphError, match="needs about .* GB of memory"):
         nodes._mesh(F.body_from_mesh(box, 1.0), box.bounds, 0.1, 1.0, 1.0)
@@ -75,7 +75,7 @@ def test_too_large_job_stops_before_it_starts(monkeypatch):
 
 def test_big_grid_is_meshed_in_blocks_with_little_memory(monkeypatch):
     import engine.graph.nodes as nodes
-    monkeypatch.setattr(nodes, "available_memory", lambda: 2**30)       # tiled path ignores it
+    monkeypatch.setattr(nodes, "memory_room", lambda: 2**30 // 2)       # tiled path ignores it
     box = trimesh.creation.box((40, 40, 40))                            # 0.1 mm grid: ~77M voxels
     mesh = nodes._mesh(F.body_from_mesh(box, 1.0), box.bounds, 0.1, 1.0, 1.0)
     assert mesh.is_watertight and mesh.volume == pytest.approx(40 ** 3, rel=1e-3)
@@ -86,7 +86,7 @@ def test_parallel_slots_follow_the_memory_estimate(monkeypatch):
     from engine.graph.core import REGISTRY
     ev = Evaluator(Graph(), workers=8, log=None)
     monkeypatch.setattr(core, "memory_limit", lambda: 10 * 2**30)
-    monkeypatch.setattr(core, "available_memory", lambda: 64 * 2**30)
+    monkeypatch.setattr(core, "memory_room", lambda: 64 * 2**30)
     monkeypatch.setattr(ev, "memory_in_use", lambda: 2 * 2**30)        # 8 GB of room
     ntype = REGISTRY["mesh.from_implicit"]
     box = trimesh.creation.box((10, 10, 10))
@@ -122,13 +122,95 @@ def test_release_memory_drops_meshes_but_keeps_imports(tmp_path):
     assert ev.computed == ["mesh"]  # only the dropped mesh is rebuilt
 
 
-def test_idle_editor_gives_memory_back_when_the_pc_runs_low(monkeypatch):
+def test_the_memory_limit_is_set_from_the_commit_room_when_each_run_starts(monkeypatch):
+    import engine.cache as cache
+    from engine.graph.nodes import ARRAY_CACHE
+    gb = 2**30
+    monkeypatch.setattr(cache, "_LIMIT", cache._LIMIT)  # all put back after the test
+    monkeypatch.setattr(cache, "_CACHES", cache._CACHES)
+    monkeypatch.setattr(ARRAY_CACHE, "max_bytes", ARRAY_CACHE.max_bytes)
+    monkeypatch.setattr(cache, "physical_memory", lambda: 64 * gb)
+    monkeypatch.setattr(cache, "available_memory", lambda: 4 * gb)  # RAM full or not: Windows pages others out
+    g = Graph()
+    g.add("a", "input.number", value=1.0)
+    ev = Evaluator(g, workers=1, log=None)
+    monkeypatch.setattr(ev, "memory_in_use", lambda: 1 * gb)   # what the engine holds already
+    # it + the room less the 3 GB where a run stops, at most 60% of all RAM; none left: what it holds
+    for room, limit in ((8, 1 + 5), (20, 1 + 17), (60, 0.6 * 64), (2, 1)):
+        monkeypatch.setattr(cache, "commit_room", lambda: room * gb)
+        ARRAY_CACHE.set_limit(16 << 20)  # shrunk by the watchdog in an earlier run
+        ev.run()
+        assert cache.memory_limit() == int(limit * gb)
+        # the caches' share of the new limit, but only of what is held and free: not paging others out for them
+        assert ARRAY_CACHE.max_bytes == cache.ram_cache_budget()[0] == int(0.2 * min(limit, 1 + 4) * gb)
+
+
+def test_the_watchdog_stops_runs_on_commit_not_on_a_full_ram(monkeypatch):
+    # a full RAM pages other programs' idle memory out to the SSD: caches are freed and the run goes on;
+    # with the PC's commit nearly given out, any program's next allocation would fail: the run stops
+    import threading
+    import engine.graph.core as core
+    from engine.graph.nodes import ARRAY_CACHE
+    gb = 2**30
+    monkeypatch.setattr(ARRAY_CACHE, "max_bytes", ARRAY_CACHE.max_bytes)  # halved while tight
+    monkeypatch.setattr(core, "memory_limit", lambda: 10 * gb)
+    monkeypatch.setattr(core, "available_memory", lambda: 0)            # RAM full
+    room = [20 * gb]
+    monkeypatch.setattr(core, "commit_room", lambda: room[0])
+
+    def watch(starved_seconds):
+        monkeypatch.setattr(core, "STARVED_SECONDS", starved_seconds)
+        ev = Evaluator(Graph(), workers=1, log=None)
+        monkeypatch.setattr(ev, "memory_in_use", lambda: 1 * gb)
+        stop = threading.Event()
+        thread = threading.Thread(target=ev._watch_memory, args=(stop,), daemon=True)
+        thread.start()
+        return ev, stop, thread
+
+    ev, stop, thread = watch(60)
+    try:
+        time.sleep(1.3)
+        assert not ev._cancel                                           # still running
+        room[0] = 2 * gb                                                # under COMMIT_STOP
+        time.sleep(1.0)
+        assert ev._cancel and "give out only 2.0 GB more memory" in ev._stop_reason
+    finally:
+        stop.set()
+        thread.join(5)
+    room[0] = 20 * gb
+    ev, stop, thread = watch(0.6)   # free RAM that stays near 0: Windows cannot page out fast enough
+    try:
+        time.sleep(2.0)
+        assert ev._cancel and "RAM free for 0.6 s" in ev._stop_reason
+    finally:
+        stop.set()
+        thread.join(5)
+
+
+def test_forget_drops_the_results_of_nodes_left_out():
+    from engine.graph import link
+    g = Graph()
+    g.add("a", "input.number", value=1.0)
+    g.add("b", "input.number", value=2.0)
+    g.add("sum", "math.add", a=link("a.out"), b=link("b.out"))
+    ev = Evaluator(g, workers=1, log=None)
+    ev.run()
+    ev.forget({"a", "sum"})   # b deleted from the recipe, or another recipe opened
+    assert set(ev._cache) == {"a", "sum"}
+    ev.run()
+    assert ev.computed == ["b"]  # its consumer's signature is unchanged: only b is computed again
+
+
+@pytest.mark.parametrize("low", ["ram", "commit"])
+def test_idle_editor_gives_memory_back_when_the_pc_runs_low(monkeypatch, low):
     import threading
     import engine.server as server
     session = server.Session(server.Hub())
     calls = []
     monkeypatch.setattr(session.evaluator, "release_memory", lambda: calls.append(1))
-    monkeypatch.setattr(server, "available_memory", lambda: 2**30)   # 1 GB free: low
+    gb = 2**30
+    monkeypatch.setattr(server, "available_memory", lambda: (1 if low == "ram" else 16) * gb)
+    monkeypatch.setattr(server, "commit_room", lambda: (2 if low == "commit" else 40) * gb)
     stop = threading.Event()
     watcher = threading.Thread(target=session.watch_idle_memory, args=(stop, 0.02), daemon=True)
     watcher.start()

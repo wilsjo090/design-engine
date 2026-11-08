@@ -1,6 +1,6 @@
 # Right-click menus in the 3D view: plan
 
-Status 2026-10-23: M1, M2 and M3 built (see Status at the end). Decisions marked **(open)** are the user's.
+Status 2026-10-25: M1, M2, M3 and M4 built (see Status at the end). Decisions marked **(open)** are the user's.
 Code read for this plan: `frontend/src/components/Viewport.tsx` (views, face picking, markers,
 the Load arrow, frame bars), `frontend/src/store.ts` (`addNode`, `connect`, `setInput`,
 `pasteClip`, `picking`, undo), `NodeEditor.tsx` (palette and auto-wiring), `engine/server.py`
@@ -401,7 +401,71 @@ that spot (`/api/node_at`: an Offset Body for a texture's bump, the Hole Pattern
 the CAD body's node for a plain face, Topology for its result), on a marker / slice / bar their
 node. The graph pans to it and flashes it; a toast names it (the walk as its tooltip).
 
-**Not done:** the rest of the *Later* list (edges, face-based Keep, pinned value labels).
+**Face highlight on implicit bodies (2026-10-24, checked in the test editor):** while a face menu is
+open on an implicit body or mesh, the CAD face it acts on is highlighted on the shown surface (as
+on CAD views): `GET /api/face_region/{node}?x=&y=&z=&edge=[&detail=true]` (`Session.face_region`,
+`facemask.face_region`) answers the view's (or the on-screen detail's) triangles whose centre lies
+straightest off that face, within max(3 × the click's distance, 2 × the triangle size, 5% of the
+body) of it and not nearer another body of the list; fetched after the menu shows (2M-triangle view:
+~0.35 s). The nearest triangle alone made a speckled band on an offset's rounded edges (ties between
+the two faces); `_straightest` takes, of the triangles through the closest point, the one whose plane
+is farthest, so roundings split down the middle and corners into thirds.
+
+**Built (M4, 2026-10-25, checked in the test editor on wall_bracket_bolts.step):** the user asked to
+"make it even easier to do more things directly from the 3D viewer" and then for all of the list below,
+and for node-editor improvements.
+
+- **Texture ▸** (face menu) Noise bumps · Waves · Gyroid cells · Raised shapes: the whole chain in one step
+  (`viewActions.textureEdit`): Noise / 3D Wave → Remap (-1..1 → 0..0.5 mm) × Face Mask → Offset Body, or
+  Surface Pattern × height → Offset Body, put into the shown body (`bodySlot` / `modifyEdit`: after an
+  implicit view's output, relinking what used it; before a Mesh from Implicit Body; a CAD view gets a new
+  Implicit Body from CAD Body and the result is shown in its place). Scale, period and fade from the face's
+  size. The quick-edit box shows Amplitude, Scale / Period, Seed and Edge fade of the new nodes at once
+  (`QuickEditState.fields`).
+- **Modify ▸** (body menu) Offset, Shell, Smoothen, Fill with lattice (gyroid, struts, Voronoi with the
+  CAD body as its box), Cut out / Add shape (Ball, Box, Bar at the click, Subtract / Union, the shape
+  selected so its handles drag).
+- **Edit what you click**: double-click a body opens the quick-edit box of the node that made that spot
+  (`/api/node_at`), a click's toast has *Edit*; the box takes any node (QUICK_INPUTS, else all plain
+  inputs) and a linked input is a link to the node it comes from (‹ goes back). *Edit settings…* in the
+  body menu.
+- **Sliders** (tool button, View menu): every Number node and group setting as a slider
+  (`SettingsPanel.tsx`; span 0..2× the value, double-click re-centres).
+- **Node actions** in the body menu: Optimize / Stop (Topology, Frame), Colour by (Static, Topology),
+  Choose STEP file…, Export… (a mesh: its Export Mesh node or a new one, the file asked for, then an
+  export of only that node: `/api/run` `only`), Mesh and export… now asks for the file and exports,
+  Bypass, Delete / Delete and reconnect.
+- **Choosing faces**: Ctrl+click toggles a face (CAD views, and the CAD face under an implicit body,
+  highlighted via `/api/face_region`), `store.faceSel`; right-click one of the chosen faces and Fix /
+  Add load / Texture / Decorate / Add to act on all of them. *Choose faces ▸ Similar faces* (same size:
+  every hole Ø x; in the same plane; every face of that kind) from `/api/similar_faces`
+  (`facemask.similar_faces`, `face_table`), *Tangent faces*. *Save as selection…* (name box,
+  `NamePrompt`).
+- **Measure** (M, tool button): two points, distance and ΔXYZ, per point the CAD face (type, Ø, area)
+  and the wall thickness under it (`/api/thickness`, a Warp ray straight in), and the member's cross-section
+  (`/api/section`, `checks.member_section`: the smallest closed cut through the point halfway straight in,
+  turned round the normal and leaned up to 60°; area with holes off, the round member as large, narrowest /
+  widest across; drawn as a cyan outline and fill with the area; "a wall or plate" when no cut closes
+  within 24 wall thicknesses). About 0.15 s on the bolted bracket's topology result.
+- **Views**: Space opens Front / Back / Left / Right / Top / Bottom / Isometric (also keys 1-7),
+  *Look at this spot* (square to the surface), *Section here ▸* through the click (axis most across the
+  surface first), the section plane drawn with an orange ball that drags it (`SectionGizmo`); Fit uses the
+  narrower view angle.
+- **Variants**: right-click a variant: what differs, *Restore this variant* (one undo step,
+  `store.restoreVariant`), Hide, Remove; ↺ in the variants list.
+- **Again: …** at the top of the face menu repeats the last face action on the new face; typing in any
+  menu searches all its items at any depth.
+
+Node editor: right-click a node (or the selection): show/hide, rename, bypass (B), collapse (H),
+duplicate, reset to defaults, select upstream/downstream, tidy, group, preset, delete, delete and
+reconnect. Right-click or double-click a wire: insert a node that fits between its ends. Find (Ctrl+F
+over the graph, button), Tidy (selection or all, `graphConvert.tidyPositions`), rename by double-clicking
+a node's name, collapse button on each card. Bypass is engine-side: a node with `"bypass": true` passes its
+first linked input of its first output's type on (`core.bypass_input`, `Graph.bypassed`; a shown
+bypassed node shows what it passes on). A "?" over the graph lists the mouse and keys.
+
+**Not done:** the rest of the *Later* list (edges, face-based Keep, pinned value labels); a drag
+handle for a texture's amplitude (the Sliders and the quick-edit box cover it for now).
 **Not checked:** the first right-click on a million-triangle body (a 122k one was instant),
 `/api/face_at` on the lamp (145 bodies; the box ranking should keep it to a few trees), the
 two-chains submenu, the copies choice (lamp_petals is too heavy to open for a menu test; no small

@@ -117,7 +117,8 @@ exported STL reloads clean (CLAUDE.md rule), and Static Analysis of the result l
 
 ### Phase 3: extras (by need)
 
-Symmetry planes; several load cases (stiff for each); sliding supports, bearing loads, torque,
+Symmetry planes; several load cases (stiff for each; **done 2026-10-25**: Load Case node, see
+FINDINGS.md "Load cases"); sliding supports, bearing loads, torque,
 gravity; a stress-graded lattice preset (Static Analysis stress > Remap > lattice thickness: a
 "simulation-driven lattice"); deformed-shape view (exaggerated); overhang limit for printing; a
 guided side panel (1 Design space, 2 Fixed, 3 Loads, 4 Goal, Run) over the same nodes **(open)**;
@@ -345,6 +346,12 @@ Added 2026-10-15: a **bearing** Load kind (a pin presses only on the side of its
 points to) and Members **struts only**; the answer to "a big flat member" turned out to be holding
 the part where it is really held (bolt holes, not a whole glued face). See FINDINGS.md, "Bearing
 load, and the big flat member".
+
+Added 2026-11-07: edge cases checked (FINDINGS, "Edge cases of Topology Optimization"): limits past the design space
+are off with a note (`topology._room`), sheets and slender bars run on the GPU (kernels' `kids`, float64 hand-over).
+
+Added 2026-11-07: **Max section** on Topology Optimization (a limit on members' cross-section area, in mm2): struts only
+limits thickness, so a plate just thin enough stayed. See FINDINGS.md, "Max section".
 
 Added 2026-10-15: a **torque** Load kind and an **Offset** for forces (a force acting away from
 its faces), both as a rigid-connection moment on the faces; dragged in the 3D view. See

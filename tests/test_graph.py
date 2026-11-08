@@ -181,6 +181,28 @@ def test_events_report_progress_and_cache(tmp_path):
     assert all(e["type"] == "node_done" and e["cached"] for e in events)
 
 
+def test_results_and_list_items_are_passed_on_as_they_come():
+    # the server shows each view as soon as its node is done, and a list's items (the lamp's 144 petals)
+    # one by one while they are made
+    g = Graph()
+    g.add("import", "input.import_step", path=str(ROOT / "samples" / "two_blocks.step"))
+    g.add("sdf", "implicit.from_cad", cad=link("import.bodies"), band=1.0)
+    g.add("mesh", "mesh.from_implicit", body=link("sdf.out"), voxel=1.0)   # a node mapped over the list
+    g.add("view", "mesh.view", body=link("sdf.out"), cells=32)               # parallel_map(parts=) inside one node
+    for workers in (1, 2):  # one by one in this process, and in worker processes
+        ev = Evaluator(g, workers=workers, log=None)
+        items, results = [], []
+        ev.on_item = lambda node, i, total, outputs: items.append((node, i, total, len(outputs["mesh"].faces)))
+        ev.on_result = lambda node, outputs: results.append(node)
+        try:
+            out = ev.run(["mesh", "view"])
+        finally:
+            ev.close()
+        for node in ("mesh", "view"):
+            assert sorted(x[1:] for x in items if x[0] == node) == [(k, 2, len(m.faces)) for k, m in enumerate(out[node]["mesh"])]
+        assert sorted(results) == ["import", "mesh", "sdf", "view"]
+
+
 def test_cancel_stops_run(tmp_path):
     g = wave_graph(tmp_path)
     ev = Evaluator(g, log=None)
@@ -226,6 +248,25 @@ def test_equal_remap_values_are_an_error_not_nan():
     g.add("flat", "math.remap", x=link("x.out"), from_low=1, from_high=1)
     with pytest.raises(GraphError, match="no range to stretch"):
         Evaluator(g, log=None).run(["flat"])
+
+
+def test_math_on_numbers_gives_a_number_that_sets_number_inputs():
+    g = Graph()
+    g.add("size", "input.number", value=0.1)
+    g.add("spacing", "math.multiply", a=link("size.out"), b=3)       # spacing = 3 x size
+    g.add("sum", "math.add", a=link("spacing.out"), b=link("spacing.out"))
+    g.add("noise", "field.noise", scale=link("sum.out"))             # a number input
+    g.add("count", "cad.pattern", count=link("spacing.out"))         # an int input
+    assert g.problems(["noise"]) == []
+    assert [m for _, m in g.problems(["count"])] == ["required input 'body' is not set"]
+    out = Evaluator(g, log=None).run(["noise"])
+    assert type(out["sum"]["out"]) is float and out["sum"]["out"] == 0.1 * 3 * 2    # float64, not float32
+    g.add("x", "field.coordinate", axis="x")
+    g.set("spacing", "a", link("x.out"))                            # now it varies with position
+    assert [n for n, m in g.problems(["noise"]) if "needs a plain number" in m] == ["noise"]
+    g.add("ratio", "math.divide", a=link("size.out"), b=0.0)
+    with pytest.raises(GraphError, match="B is 0"):
+        Evaluator(g, log=None).run(["ratio"])
 
 
 def test_keep_going_leaves_out_only_what_needs_a_failed_node():
@@ -316,6 +357,32 @@ def test_groups_expand_into_their_nodes():
     assert g.owners["g__m"] == "g" and g.aliases["g.out"] == "g__m.out" and g.groups["g"] == [("out", "scalar")]
     results = Evaluator(g, log=None).run(["sum"])
     assert _value(results["sum"]["out"]) == pytest.approx(3 * 2 + 3 * 0.5)
+
+
+def test_bypassed_nodes_pass_their_input_on():
+    recipe = {"version": 1, "nodes": {
+        "n": {"type": "input.number", "inputs": {"value": 3.0}},
+        "double": {"type": "math.multiply", "inputs": {"a": {"link": "n.out"}, "b": 2.0}, "bypass": True},
+        "triple": {"type": "math.multiply", "inputs": {"a": {"link": "double.out"}, "b": 3.0}, "bypass": True},
+        "use": {"type": "math.add", "inputs": {"a": {"link": "triple.out"}, "b": 1.0}},
+        "plain": {"type": "input.number", "inputs": {"value": 1.0}, "bypass": True}}}   # nothing to pass on: runs
+    g = Graph.from_dict(recipe)
+    assert g.nodes["use"]["inputs"]["a"] == {"link": "n.out"}               # a chain of bypassed nodes is skipped
+    assert g.bypassed == {"double.out": "n.out", "triple.out": "n.out"}
+    assert _value(Evaluator(g, log=None).run(["use", "plain"])["use"]["out"]) == pytest.approx(4.0)
+    recipe["nodes"]["triple"]["bypass"] = False
+    assert _value(Evaluator(Graph.from_dict(recipe), log=None).run(["use"])["use"]["out"]) == pytest.approx(10.0)
+
+
+def test_a_bypassed_node_inside_a_group_is_skipped_too():
+    group = _wave_group()
+    group["nodes"]["m"]["bypass"] = True
+    recipe = {"version": 1, "groups": {"wave": group}, "nodes": {
+        "n": {"type": "input.number", "inputs": {"value": 3.0}},
+        "g": {"type": "group:wave", "inputs": {"x": {"link": "n.out"}}},
+        "use": {"type": "math.add", "inputs": {"a": {"link": "g.out"}, "b": 0.0}}}}
+    g = Graph.from_dict(recipe)
+    assert g.nodes["use"]["inputs"]["a"] == {"link": "n.out"} and g.aliases["g.out"] == "n.out"
 
 
 def test_groups_nest_and_unknown_groups_are_reported():

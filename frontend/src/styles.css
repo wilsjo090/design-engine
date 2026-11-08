@@ -124,12 +124,27 @@ button.on { background: #3a4a33; border-color: var(--accent); color: #d6f5c3; }
 .help-reopen { position: absolute; top: 10px; right: 10px; z-index: 5; width: 26px; height: 26px; padding: 0;
   border-radius: 50%; font-weight: 600; }
 .react-flow { --xy-background-color: #1f2024; }
-.react-flow__edge-path { stroke-width: 2; }
+.react-flow__edge-path { stroke-width: 2; transition: opacity 0.15s; }
 .react-flow__edge.selected .react-flow__edge-path { stroke: #fff !important; }
+/* the Wires menu (wires.ts): wires away from the selected / hovered nodes fade, labelled wires show dashed */
+.react-flow__edge.wire-dim .react-flow__edge-path { opacity: 0.15; }
+.react-flow__edge.wire-dim.soft .react-flow__edge-path { opacity: 0.4; }
+.react-flow__edge.wire-tag .react-flow__edge-path { stroke-dasharray: 7 5; }
+.wire-label { flex: 1; min-width: 0; text-align: right; padding: 0; background: none; border: none;
+  font-size: 12px; font-style: italic; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wire-label::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 5px; vertical-align: middle;
+  border-radius: 50%; background: var(--wire); }
+.wire-label:hover { color: #fff; text-decoration: underline dotted; }
+.wire-count { font-size: 10px; color: var(--muted); padding: 0 4px; border: 1px solid #3a3d44; border-radius: 8px; }
+.handle.labelled { box-shadow: 0 0 0 1.5px #9aa0a8; }
+/* a wired input's dot picks up its wire (wires.pickUpWire) */
+.enode-row.wired > .react-flow__handle.target { cursor: grab; }
+.react-flow__edgeupdater { cursor: grab; }
 .react-flow__controls button { background: var(--panel-2); border-color: var(--border); fill: var(--text); }
 .react-flow__node-engine { padding: 0; border: none; background: none; }
 
 .enode {
+  position: relative;
   min-width: 250px; max-width: 340px;
   background: var(--node);
   border: 1px solid var(--border);
@@ -149,6 +164,12 @@ button.on { background: #3a4a33; border-color: var(--accent); color: #d6f5c3; }
   border-radius: 0 6px 0 0;
 }
 .enode-title { font-weight: 600; color: #f1f2f4; }
+/* a load in a load case: the case's name in its colour (the card's accent is the case colour too) */
+.case-chip {
+  flex: 0 1 auto; max-width: 110px; padding: 0 7px; border-radius: 8px;
+  font-size: 11px; font-weight: 600; line-height: 16px; color: #15171a; background: var(--cat);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .enode-id { flex: 1; text-align: right; color: var(--accent); font-style: italic; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .eye {
   flex: 0 0 auto; width: 22px; height: 22px; margin: -3px -3px -3px 0; padding: 0;
@@ -199,6 +220,53 @@ select.value-input { padding: 2px 4px; }
 .enode-footer { padding: 3px 10px; font-size: 11px; color: var(--muted); text-align: right; }
 .enode-note { padding: 4px 10px; font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
 .optimize-row { justify-content: center; }
+.more-row { justify-content: flex-start; padding-top: 0; }
+.more-btn { background: none; border: none; padding: 1px 0; color: var(--muted); font-size: 11px; cursor: pointer; }
+.more-btn:hover { color: var(--accent-2); }
+
+/* settings fields (PortInputs.tsx): cards, the quick-edit box and the wizard */
+.num-field { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.num-box { position: relative; display: flex; min-width: 0; }
+.num-box input::placeholder { color: #8a9099; font-style: italic; }
+.num-unit, .num-axis { position: absolute; top: 50%; transform: translateY(-50%); pointer-events: none; font-size: 11px; }
+.num-unit { right: 6px; color: var(--muted); }
+.num-axis { left: 5px; font-size: 10px; font-weight: 700; }
+.axis-x { color: #f0716a; }
+.axis-y { color: #8fd36f; }
+.axis-z { color: #6aaaf7; }
+.num-slider { position: relative; height: 4px; margin: 1px 5px 2px; border-radius: 2px; background: #4a4e57; cursor: ew-resize; }
+.num-slider::before { content: ''; position: absolute; inset: -5px -5px; }
+.num-slider-fill { height: 100%; border-radius: 2px; background: var(--accent-2); opacity: 0.75; }
+.num-slider-thumb { position: absolute; top: 50%; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%;
+  background: #d5d9de; box-shadow: 0 0 0 1px #1b1c1f; pointer-events: none; }
+.num-slider:hover .num-slider-fill { opacity: 1; }
+.num-slider:hover .num-slider-thumb { background: #fff; }
+.vec3 { flex: 1; display: flex; gap: 4px; min-width: 0; }
+.toggle-field { flex: 1; display: flex; align-items: center; }
+.toggle { position: relative; width: 30px; height: 16px; padding: 0; border-radius: 8px; background: #3a3d44; border-color: #50545c; }
+.toggle-knob { position: absolute; top: 1px; left: 1px; width: 12px; height: 12px; border-radius: 50%; background: #9aa0a8;
+  transition: left 0.12s; }
+.toggle.on, .toggle.on:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 45%, #2a2c31); border-color: var(--accent); }
+.toggle.on .toggle-knob { left: 15px; background: #fff; }
+.seg { flex: 1; display: flex; min-width: 0; border: 1px solid #44474e; border-radius: 3px; overflow: hidden; }
+.seg button { flex: 1 1 auto; padding: 2px 6px; border: none; border-right: 1px solid #44474e; border-radius: 0;
+  background: var(--input-bg); color: #b9bec5; font-size: 12px; white-space: nowrap; }
+.seg button:last-child { border-right: none; }
+.seg button.on, .seg button.on:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-2) 32%, var(--input-bg)); color: #fff; }
+.pick-current { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; padding: 1px 6px; text-align: left;
+  background: var(--input-bg); border-color: #44474e; border-radius: 3px; }
+.pick-current.on { background: var(--input-bg); border-color: var(--accent-2); color: inherit; }
+.pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pick-caret { color: var(--muted); font-size: 10px; }
+.pick-grid { flex-basis: 100%; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; padding: 3px 0 2px; }
+.pick-tile { display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 4px 2px 3px; font-size: 10px;
+  background: var(--input-bg); border-color: #3a3d44; color: #b9bec5; }
+.pick-tile span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pick-tile.on, .pick-tile.on:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-2) 22%, var(--input-bg));
+  border-color: var(--accent-2); color: #fff; }
+.pic { flex: none; fill: currentColor; fill-opacity: 0.85; }
+.pic .pic-line { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.enode-row:has(.pick-grid), .vp-quick-row:has(.pick-grid), .wiz-row:has(.pick-grid) { flex-wrap: wrap; }
 .optimize-btn { flex: 1; padding: 3px 10px; font-weight: 600; border-color: var(--accent); color: var(--accent); }
 .optimize-btn.stop { border-color: #e5534b; color: #ff9b94; }
 .enode-message { padding: 5px 10px; font-size: 12px; color: #ffb3ad; background: #3a2221; border-top: 1px solid #5c2f2c; white-space: pre-wrap; word-break: break-word; }
@@ -251,7 +319,23 @@ select.value-input { padding: 2px 4px; }
 .legend-swatch { width: 10px; height: 10px; border-radius: 2px; }
 .legend-name { color: #e8eaed; }
 .legend-info { color: var(--muted); }
-.viewport-tools { position: absolute; top: 10px; right: 12px; display: flex; gap: 6px; }
+/* the tool buttons, and the tool panels under them: the buttons wrap onto a second row in a narrow view */
+.viewport-side { position: absolute; top: 10px; right: 12px; left: max(12px, 30%); display: flex; flex-direction: column;
+  align-items: flex-end; gap: 8px; pointer-events: none; z-index: 4; max-height: calc(100% - 20px); }
+.viewport-side > * { pointer-events: auto; }
+.viewport-tools { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+/* a button with its options beside it (Edges ▾: how CAD bodies are drawn) */
+.split-btn { display: inline-flex; }
+.split-btn > button:first-child { border-radius: 4px 0 0 4px; }
+.split-btn > button + button { margin-left: -1px; border-radius: 0 4px 4px 0; padding: 4px 6px; font-size: 11px; }
+.split-btn > button.on + button:not(.on) { border-left-color: var(--accent); }
+.cad-look .look-row { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 8px; }
+.cad-look .look-row > span:first-child { color: var(--muted); }
+.look-swatches { display: flex; gap: 7px; flex-wrap: wrap; }
+.look-swatch { width: 18px; height: 18px; padding: 0; border-radius: 50%; border: 1px solid rgba(0, 0, 0, 0.6); }
+.look-swatch:hover:not(:disabled) { border-color: #fff; }
+.look-swatch.on { box-shadow: 0 0 0 2px var(--panel), 0 0 0 3.5px var(--accent-2); }
+.look-note { color: var(--muted); line-height: 1.35; }
 .gizmo-hint { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); max-width: 70%;
   background: rgba(27, 28, 31, 0.85); border: 1px solid #ffc93c; border-radius: 6px; padding: 4px 10px;
   font-size: 12px; color: #e8eaed; pointer-events: none; }
@@ -297,7 +381,7 @@ select.value-input { padding: 2px 4px; }
 .slice-title b { color: var(--text); font-weight: 600; }
 .slice-label { color: var(--muted); width: 26px; }
 .slice-row input[type=range] { flex: 1; accent-color: var(--accent); }
-.slice-value { width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
+.slice-value { width: 70px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .slice-panel select { background: var(--input-bg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; }
 .segmented.small button { padding: 2px 8px; font-size: 12px; }
 .slice-bar { height: 10px; border-radius: 3px; border: 1px solid #111; }
@@ -343,15 +427,70 @@ body.scrubbing, body.scrubbing * { cursor: ew-resize !important; user-select: no
 .palette-del:hover { color: var(--danger); }
 
 /* ---------- viewport tool panels (section, print check) ---------- */
-.tool-panels { position: absolute; top: 46px; right: 12px; display: flex; flex-direction: column; gap: 8px; width: 330px; z-index: 4; }
+.tool-panels { display: flex; flex-direction: column; gap: 8px; width: min(330px, 100%); min-height: 0; overflow-x: hidden; overflow-y: auto; }
 .tool-panel { background: rgba(30, 31, 35, 0.94); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
   display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
 .tool-panel select { background: var(--input-bg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; flex: 1; min-width: 0; }
 .frame-sizes { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+/* how Frame Optimization calculates (CalcView): stages, the step's numbers, the mass over the steps */
+.calc { display: flex; flex-direction: column; gap: 4px; }
+.calc-stages { display: flex; flex-wrap: wrap; gap: 3px 8px; }
+.calc-stage { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.calc-stage.done { color: var(--text); }
+.calc-stage.now { color: var(--text); font-weight: 600; }
+.calc-stage.now .legend-swatch { animation: calc-pulse 1s ease-in-out infinite alternate; }
+.calc-stage.skipped { opacity: 0.45; text-decoration: line-through; }
+@keyframes calc-pulse { from { opacity: 1; } to { opacity: 0.3; } }
+.calc-info { line-height: 1.35; }
+.calc-numbers { font-variant-numeric: tabular-nums; line-height: 1.35; }
+.calc-tick { font-variant-numeric: tabular-nums; color: #9fd3ff; }
+.calc-chart { display: block; background: rgba(255, 255, 255, 0.03); border-radius: 4px; max-width: 100%; }
+.calc-axis { fill: var(--muted); font-size: 9px; }
 .frame-size { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+.case-row {
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px 7px;
+  background: none; border: 1px solid transparent; border-radius: 4px; color: inherit; cursor: pointer;
+}
+.case-row:hover { background: rgba(255, 255, 255, 0.07); border-color: var(--border); }
 .small-btn { padding: 1px 7px; font-size: 12px; }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
+
+/* ---------- topology wizard (a tool panel) ---------- */
+.wizard { border-color: #4a6b3a; line-height: 1.4; }
+.wizard b { font-weight: 600; }
+.wiz-steps { display: flex; gap: 2px; }
+.wiz-step { flex: 1; display: flex; align-items: center; justify-content: center; gap: 3px; padding: 2px 0; font-size: 11px;
+  background: none; border: none; border-bottom: 2px solid var(--border); border-radius: 0; color: var(--muted); }
+.wiz-step.done { color: var(--text); border-bottom-color: #4a6b3a; }
+.wiz-step.on { color: var(--accent); border-bottom-color: var(--accent); }
+.wiz-step:disabled { cursor: default; opacity: 1; }
+.wiz-num { display: inline-block; min-width: 14px; height: 14px; line-height: 14px; border-radius: 7px; font-size: 10px;
+  background: rgba(255, 255, 255, 0.08); text-align: center; }
+.wiz-step.on .wiz-num { background: var(--accent); color: #111; }
+.wiz-row { display: flex; align-items: center; gap: 6px; }
+.wiz-row > span:first-child { min-width: 0; }
+.wiz-row > select { flex: 1; }
+.wiz-row > .small-btn, .wiz-row > .case-row + .small-btn { margin-left: auto; }
+.wiz-label { flex: none; width: 92px; }
+.wiz-field { display: contents; }
+.wiz-buttons { display: flex; justify-content: flex-end; gap: 6px; margin-top: 2px; }
+.wiz-buttons .primary { min-width: 84px; }
+.wiz-load { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px; }
+.wiz-load.on { border-color: #e5c07b; }
+.wiz-note { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+/* the texture wizard's choice of texture: three to a row */
+.tex-kinds { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.tex-kinds > button { padding: 3px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wiz-buttons.wrap { flex-wrap: wrap; }
+/* the lattice wizard's weight of the filled part */
+.lat-amount { padding: 4px 8px; border-radius: 4px; background: rgba(255, 255, 255, 0.05); font-variant-numeric: tabular-nums; }
+.lat-amount b { color: var(--text); }
+.wiz-load .wiz-row > .seg { flex: none; }
+.wiz-load .wiz-row > .seg + .small-btn { margin-left: auto; }
+.wizard .warn { color: #ff9b94; }
+.wizard .wiz-warning { color: #e5c07b; }
+.wizard .progress { height: 4px; }
 .warn { color: #ff9b94; }
 .check-input { display: flex; align-items: center; gap: 4px; color: var(--muted); flex: 1; }
 .check-input input { width: 64px; flex: 0 0 auto; }
@@ -375,6 +514,7 @@ body.scrubbing, body.scrubbing * { cursor: ew-resize !important; user-select: no
   align-items: center; gap: 10px; padding: 8px 12px; border-radius: 6px; background: #2c2a1f; border: 1px solid #e3b341;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); font-size: 13px; }
 .recovery-banner b { color: #ffd77a; }
+.recovery-banner.engine-elsewhere { top: 104px; }   /* (below a recovery banner, when both show) */
 .queue { position: relative; }
 .queue-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 30; min-width: 260px; padding: 6px;
   background: var(--panel); border: 1px solid #50545c; border-radius: 6px; box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
@@ -442,6 +582,7 @@ body.scrubbing, body.scrubbing * { cursor: ew-resize !important; user-select: no
   background: var(--panel); border: 1px solid #50545c; border-radius: 6px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
 }
+.vp-quick:has(.vec3) { width: 300px; }   /* (three X / Y / Z fields: room for "120.5" in each) */
 .vp-quick-head { padding: 0 12px 6px; color: #eef0f2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vp-quick-title { font-size: 11px; color: var(--muted); }
 .vp-quick-row { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 2px 12px; color: #eef0f2; }
@@ -455,6 +596,93 @@ select.vp-quick-field { padding: 2px 4px; }
 .vp-quick-unit { flex: none; font-size: 11px; color: var(--muted); }
 .vp-quick-linked { flex: 1; min-width: 0; color: var(--accent); font-size: 12px; font-style: italic; }
 .vp-quick-foot { padding: 5px 12px 0; font-size: 11px; color: var(--muted); }
+.vp-quick-head { display: flex; align-items: center; gap: 4px; }
+.vp-quick-head b { overflow: hidden; text-overflow: ellipsis; }
+.vp-quick-title { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.vp-quick-back, .vp-quick-graph { flex: none; padding: 0 6px; height: 20px; line-height: 18px; font-size: 13px; }
+.vp-quick-graph { margin-left: auto; color: var(--muted); }
+.vp-quick-body { max-height: min(60vh, 520px); overflow-y: auto; }
+.vp-quick-link {
+  flex: 1; min-width: 0; height: 24px; padding: 0 6px; text-align: left;
+  color: var(--accent); font-size: 12px; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vp-quick-name { display: block; width: calc(100% - 24px); margin: 0 12px; }
+.vp-quick .muted { color: var(--muted); font-style: italic; }
+
+/* ---------- 3D view: sliders for the recipe's settings, measuring (SettingsPanel.tsx, Viewport.tsx) ---------- */
+.settings-panel { max-height: 45vh; overflow-y: auto; }
+.setting-row { gap: 6px; }
+.setting-name {
+  flex: 0 0 96px; min-width: 0; padding: 0; text-align: left; background: none; border: none;
+  color: #cfd3d8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px;
+}
+.setting-name:hover:not(:disabled) { background: none; border: none; color: var(--accent); }
+.setting-value { flex: 0 0 64px; height: 22px; font-variant-numeric: tabular-nums; }
+.measure-label { transform: translate(6px, -22px); border-color: #ffd166; }
+.measure-section-label { transform: translate(10px, 6px); border-color: #4cc9f0; white-space: nowrap; }
+
+/* ---------- node editor: collapsed and bypassed nodes, find box, node menu ---------- */
+.enode.collapsed .enode-row:not(.output) {
+  height: 0; min-height: 0; padding: 0; border: none; overflow: visible;
+}
+.enode.collapsed .enode-row:not(.output) > :not(.react-flow__handle) { display: none; }
+.enode.collapsed .enode-row:not(.output) .react-flow__handle { top: 0; opacity: 0.6; }
+.enode.collapsed .enode-note, .enode.collapsed .enode-warning, .enode.collapsed .optimize-row { display: none; }
+.enode.bypassed { opacity: 0.55; border-style: dashed; }
+.enode.bypassed .enode-title::after { content: ' · bypassed'; font-weight: 400; color: #e3d27a; font-size: 11px; }
+.collapse-btn { flex: none; width: 16px; padding: 0; background: none; border: none; color: var(--muted); font-size: 10px; }
+.collapse-btn:hover:not(:disabled) { background: none; border: none; color: var(--text); }
+.rename-input { flex: 1; min-width: 0; height: 20px; padding: 0 4px; font-size: 12px; }
+.graph-find {
+  position: absolute; top: 10px; left: 10px; z-index: 7; width: 280px; padding: 6px;
+  background: var(--panel); border: 1px solid #50545c; border-radius: 6px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.graph-find input { width: 100%; }
+.graph-find-row { display: flex; gap: 8px; padding: 3px 6px; border-radius: 3px; cursor: pointer; font-size: 12px; }
+.graph-find-row.active, .graph-find-row:hover { background: rgba(255, 255, 255, 0.08); }
+.graph-find-row span:last-child { margin-left: auto; color: var(--muted); }
+.graph-tools { position: absolute; top: 10px; left: 10px; z-index: 5; display: flex; gap: 4px; }
+.graph-tools button { padding: 2px 8px; font-size: 12px; opacity: 0.85; }
+
+/* ---------- zoomed out (NodeEditor's data-far below wires.ts FAR_ZOOM): a card keeps its size (nothing moves) and is
+   covered by its name, sized by --zoom to stay readable and by the card (cq units) to fit; it still drags and
+   selects, its inputs take no clicks, and only wired ports keep their dots ---------- */
+.enode-far { display: none; }
+.editor[data-far] .enode-far { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column;
+  justify-content: center; gap: 4px; padding: 6px 12px; overflow: hidden; container-type: size;
+  border-radius: 0 5px 5px 0; background: color-mix(in srgb, var(--cat) 22%, var(--node)); }
+.enode-far-title { font-weight: 700; color: #f1f2f4; line-height: 1.1; overflow-wrap: anywhere; overflow: hidden;
+  font-size: min(calc(13px / var(--zoom)), 13cqw, 36cqh);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.enode-far-sub { display: flex; align-items: center; gap: 0.4em; min-width: 0; color: var(--accent); font-style: italic;
+  font-size: min(calc(10px / var(--zoom)), 9cqw, 22cqh); white-space: nowrap; }
+.enode-far-sub > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.enode-far-sub .status-dot { width: 0.6em; height: 0.6em; }
+.editor[data-far] .react-flow__node-engine .react-flow__handle { z-index: 2; }
+.editor[data-far] .react-flow__node-engine .enode-row:not(.wired) > .react-flow__handle { visibility: hidden; }
+.editor[data-far] .gframe-header { overflow: visible; align-items: flex-end; }
+.editor[data-far] .gframe-label { flex: none; overflow: visible; font-size: clamp(15px, calc(15px / var(--zoom)), 96px);
+  line-height: 1.05; }
+.editor[data-far] .gframe-count { display: none; }
+.editor[data-far] .gframe .collapse-btn { width: auto; font-size: clamp(10px, calc(10px / var(--zoom)), 56px); }
+
+/* ---------- frames in the graph (graphFrames.ts, GraphFrameNode.tsx): only the title bar and the resize
+   border take the pointer, so a click or a box selection inside a frame goes to the graph as elsewhere ---------- */
+.react-flow__node-graphFrame { pointer-events: none !important; }
+.gframe { width: 100%; height: 100%; box-sizing: border-box; border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--frame) 45%, transparent);
+  background: color-mix(in srgb, var(--frame) 8%, transparent); }
+.gframe.selected { border-color: var(--frame); }
+.gframe-header { pointer-events: all; display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px 0 6px;
+  border-radius: 7px 7px 0 0; background: color-mix(in srgb, var(--frame) 28%, #1f2024); cursor: grab;
+  color: #e6e8eb; font-size: 15px; font-weight: 600; }
+.gframe.folded .gframe-header { height: 100%; border-radius: 7px; }
+.gframe-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gframe-count { flex: none; margin-left: auto; font-size: 11px; font-weight: 400; color: #b4b9c0; }
+.gframe-rename { height: 22px; font-size: 13px; }
+.gframe .react-flow__resize-control { pointer-events: all; }
+.gframe-port { width: 8px !important; height: 8px !important; background: var(--frame) !important;
+  border: 2px solid #1b1c1f !important; pointer-events: none; }
 
 /* ---------- node library: ribbon of category tabs above the graph, panel of node tiles over it (NodeLibrary.tsx) ---------- */
 .nlib { --nlib-h: 34px; flex: none; }

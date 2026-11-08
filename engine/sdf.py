@@ -57,6 +57,13 @@ class MeshQuery:
         self.cracks = _Cracks(trimesh.Trimesh(self.V, self.F, process=False))
         self._fwn = None  # winding-number tree, built on first need
 
+    @property
+    def nbytes(self):
+        """RAM it holds: the arrays, plus TREE_BYTES per triangle for each search tree (libigl's are
+        not numpy arrays)."""
+        arrays = sum(a.nbytes for a in (self.V, self.F, self.FN, self.VN, self.EN, self.EMAP))
+        return arrays + TREE_BYTES * len(self.F) * (1 if self._fwn is None else 2)
+
     def _inside(self, points):
         """Winding-number inside test (robust to cracks). Many grid points can sit in a crack
         vertex's corner region, so this uses a prebuilt tree rather than the exact O(faces)
@@ -115,6 +122,12 @@ class MeshQuery:
 
 _QUERIES = OrderedDict()  # per-process cache: mesh key -> MeshQuery
 _MAX_QUERIES = 24  # each holds a search tree (~5-10 MB for a 25k-triangle body)
+# ... and at most this much in all (the newest is always kept): every new shape (a topology result,
+# another texture) is a new key, and 24 medium topology results held ~1 GB per process. Measured
+# 345-580 B per triangle in all (test part, key box, a 330k-triangle sphere), the winding-number
+# tree of a cracked mesh 70-1100 more.
+MAX_QUERY_BYTES = 768 * 2**20
+TREE_BYTES = 450
 
 
 def arrays(*items):
@@ -130,7 +143,8 @@ def mesh_query(V, F, key=None):
     query = _QUERIES.get(key)
     if query is None:
         query = _QUERIES[key] = MeshQuery(*arrays(V, F))
-        while len(_QUERIES) > _MAX_QUERIES:
+        while len(_QUERIES) > _MAX_QUERIES or (len(_QUERIES) > 1 and
+                                               sum(q.nbytes for q in _QUERIES.values()) > MAX_QUERY_BYTES):
             _QUERIES.popitem(last=False)
     else:
         _QUERIES.move_to_end(key)

@@ -6,6 +6,30 @@ export function edgeId(source: string, sourceHandle: string, target: string, tar
   return `${source}.${sourceHandle}->${target}.${targetHandle}`
 }
 
+/** What a node's output carries, for checking wires: its port type, except that a Math node's scalar
+ *  output is a plain number while every scalar input is typed in or wired from a number (a Number node,
+ *  or Math that gives one), so "spacing = 1.5 x size" can set a number input. As the engine's
+ *  `Graph.gives_number`. */
+export function outputType(nodes: EngineNode[], edges: EngineEdge[], specs: Record<string, NodeSpec>,
+  nodeId: string, port: string | null | undefined, path: Set<string> = new Set()): string | undefined {
+  const spec = specs[nodes.find((n) => n.id === nodeId)?.data.typeId ?? '']
+  const type = spec?.outputs.find((p) => p.name === port)?.type
+  if (type !== 'scalar' || !spec?.numeric || path.has(nodeId)) return type
+  path.add(nodeId)
+  try {
+    for (const p of spec.inputs) {
+      if (p.type !== 'scalar') continue
+      const e = edges.find((x) => x.target === nodeId && x.targetHandle === p.name)
+      if (!e) continue
+      const from = outputType(nodes, edges, specs, e.source, e.sourceHandle, path)
+      if (from !== 'number' && from !== 'int') return type
+    }
+    return 'number'
+  } finally {
+    path.delete(nodeId)
+  }
+}
+
 export function makeEdge(
   source: string, sourceHandle: string, target: string, targetHandle: string, type?: string,
 ): EngineEdge {
@@ -13,6 +37,8 @@ export function makeEdge(
     id: edgeId(source, sourceHandle, target, targetHandle),
     source, sourceHandle, target, targetHandle,
     style: { stroke: TYPE_COLORS[type ?? ''] ?? '#888', strokeWidth: 2 },
+    // its input end can be picked up and moved (NodeEditor's onReconnect; wires.pickUpWire from the input's dot)
+    reconnectable: 'target',
   }
 }
 
@@ -56,6 +82,44 @@ function autoLayout(recipe: Recipe): Record<string, [number, number]> {
   return pos
 }
 
+/** Tidy positions for the nodes `ids`: a column per step along the links among them (sources left),
+ *  each column ordered by where its inputs sit and stacked by the cards' measured heights, starting at
+ *  the group's top-left corner. */
+export function tidyPositions(nodes: EngineNode[], edges: EngineEdge[], ids: Set<string>) {
+  const DX = 320, GAP = 28
+  const chosen = nodes.filter((n) => ids.has(n.id))
+  const inner = edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.source !== e.target)
+  const depth: Record<string, number> = {}
+  const visit = (id: string, stack: Set<string>): number => {
+    if (depth[id] !== undefined) return depth[id]
+    if (stack.has(id)) return 0
+    stack.add(id)
+    let d = 0
+    for (const e of inner) if (e.target === id) d = Math.max(d, visit(e.source, stack) + 1)
+    stack.delete(id)
+    return (depth[id] = d)
+  }
+  chosen.forEach((n) => visit(n.id, new Set()))
+  const left = Math.min(...chosen.map((n) => n.position.x)), top = Math.min(...chosen.map((n) => n.position.y))
+  const columns: EngineNode[][] = []
+  for (const n of chosen) (columns[depth[n.id]] ??= []).push(n)
+  const placed: Record<string, { x: number; y: number }> = {}
+  columns.forEach((column, d) => {
+    if (!column) return
+    // in the order of their inputs' heights (fewer crossing links), else as they were
+    const key = (n: EngineNode) => {
+      const ys = inner.filter((e) => e.target === n.id && placed[e.source]).map((e) => placed[e.source].y)
+      return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : n.position.y
+    }
+    let y = top
+    for (const n of [...column].sort((a, b) => key(a) - key(b))) {
+      placed[n.id] = { x: left + d * DX, y }
+      y += (n.measured?.height ?? 200) + GAP
+    }
+  })
+  return placed
+}
+
 export function recipeToFlow(recipe: Recipe, specs: Record<string, NodeSpec>) {
   const layout = autoLayout(recipe)
   const nodes: EngineNode[] = []
@@ -73,7 +137,8 @@ export function recipeToFlow(recipe: Recipe, specs: Record<string, NodeSpec>) {
       }
     }
     const [x, y] = spec.pos ?? layout[id]
-    nodes.push({ id, type: 'engine', position: { x, y }, data: { typeId: spec.type, inputs: literals } })
+    nodes.push({ id, type: 'engine', position: { x, y }, data: { typeId: spec.type, inputs: literals,
+      ...(spec.bypass ? { bypass: true } : {}), ...(spec.collapsed ? { collapsed: true } : {}) } })
   }
   const visible = Object.entries(recipe.nodes).filter(([, s]) => s.visible).map(([id]) => id)
   return { nodes, edges, visible }
@@ -91,6 +156,8 @@ export function flowToRecipe(nodes: EngineNode[], edges: EngineEdge[], visible: 
       inputs,
       pos: [Math.round(n.position.x), Math.round(n.position.y)],
       ...(visible.includes(n.id) ? { visible: true } : {}),
+      ...(n.data.bypass ? { bypass: true } : {}),
+      ...(n.data.collapsed ? { collapsed: true } : {}),
     }
   }
   return out
