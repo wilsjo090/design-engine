@@ -49,6 +49,7 @@ import numpy as np
 import scipy.sparse as sparse
 import trimesh
 
+from . import trace
 from .backend import to_host
 from .meshing import finite_values, touches_box
 
@@ -275,9 +276,10 @@ def dual_contour(values, grid, debug=None):
     # outside all round, so surfaces touching the grid's box still close
     v = np.pad(values, 1, mode="constant", constant_values=max(float(values.max()), grid.voxel))
     del values
-    dc = _vertices(v, grid.voxel, debug)
-    del v
-    faces, _, _, new, info = _faces(dc.x, dc.lo, dc.mean, dc.quads, dc.normals, dc.points, dc.inner)
+    with trace.span("dual contour", device="cpu"):
+        dc = _vertices(v, grid.voxel, debug)
+        del v
+        faces, _, _, new, info = _faces(dc.x, dc.lo, dc.mean, dc.quads, dc.normals, dc.points, dc.inner)
     if debug is not None:
         debug.update(info)
     verts = grid.origin + (np.concatenate([dc.x, new]) - 1.0) * grid.voxel  # (the padding moved every index by one)
@@ -501,6 +503,11 @@ def contour_block(values, start, block, b, blocks, voxel):
     folds moved them, see _faces), the moves it asks of others' vertices, its triangles (vertex names;
     arc vertices as -1 - their row in `arcs`), the arcs (two vertex names and the inside sample's
     number) with their vertices, and `needs`: the other blocks whose vertices or quads these use."""
+    with trace.span("dual contour", device="cpu"):
+        return _contour_block(values, start, block, b, blocks, voxel)
+
+
+def _contour_block(values, start, block, b, blocks, voxel):
     start, blocks, b = (np.asarray(a, dtype=np.int64) for a in (start, blocks, b))
     dims = blocks * block + 2                  # cells -1 .. blocks x block per side
     v = np.pad(values, 1, mode="constant", constant_values=voxel)  # (the same in every block)
@@ -549,6 +556,11 @@ def join_blocks(pieces, block, blocks):
     """The vertices (global sample units) and triangles of contour_block's pieces (a list, emptied on
     the way): each vertex from the block that owns it, moved as far as any block's folds asked; the arc
     vertices, which neighbouring blocks may both make, once."""
+    with trace.span("join blocks", device="cpu", blocks=len(pieces)):
+        return _join_blocks(pieces, block, blocks)
+
+
+def _join_blocks(pieces, block, blocks):
     dims = np.asarray(blocks, dtype=np.int64) * block + 2
     take = lambda key: np.concatenate([p[key] for p in pieces])
     names = take("names")

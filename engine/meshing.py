@@ -3,6 +3,7 @@ import numpy as np
 import trimesh
 from skimage.measure import marching_cubes
 
+from . import trace
 from .backend import to_host, xp_of
 
 
@@ -24,10 +25,91 @@ def touches_box(values):
     return any(float(values.take(i, axis=a).min()) < 0 for a in range(3) for i in (0, -1))
 
 
-def field_to_mesh(values, grid):
+def field_to_mesh(values, grid, normals=False):
     """Extract the zero level of `values` (numpy or CuPy) as a watertight mesh in world coordinates.
     `mesh.metadata` says how many samples were not finite (`nonfinite`) and whether the body was
-    cut off by the grid's box (`clipped`)."""
+    cut off by the grid's box (`clipped`). normals: also the field's normal at every vertex
+    (FIELD_NORMAL, for the editor's views only)."""
+    return surface_mesh(**extract_surface(values, grid, normals))
+
+
+# --- normals from the field (the editor's views: engine/server.py sends them, the browser draws with them) ----------
+FIELD_NORMAL = "field_normal"  # mesh.vertex_attributes key: int16 x 3, the unit normal x NORMAL_SCALE
+NORMAL_SCALE = 32767           # (decoded as a normalized Int16 attribute by three.js: x / 32767)
+NORMAL_CHUNK = 1 << 20         # vertices per pass: bounds the temporaries (~120 B a vertex)
+
+
+def field_normals(samples, verts, offset=(0, 0, 0)):
+    """The field's unit normals at marching-cubes vertices, as int16 x 3 (x NORMAL_SCALE), on the samples' device
+    (numpy or CuPy). `verts` (n x 3, any float type, on the same device) are in samples of the array marching cubes
+    ran on, which starts at `offset` in `samples`. Each normal is the gradient by central differences at the two
+    samples of the grid edge the vertex lies on, interpolated along the edge as the vertex is (true surface normals,
+    smoother than the triangles' own). It points where the field grows: out of the body, whatever way the triangles
+    turn. A sample past the edge of `samples` counts as the outermost one there (as if padded with it: right for a
+    constant pad layer, the box's "outside"); the caller makes sure every other stencil is inside `samples` (a
+    block's samples reach one past its cells, blockmesh.normals_block). Cost: ~0.2 µs a vertex on the CPU (a sixth
+    of skimage's marching cubes), next to nothing on the GPU."""
+    from .backend import xp_of
+    xp = xp_of(samples)
+    shape = np.array(samples.shape, dtype=np.int64)
+    flat = samples.reshape(-1)
+    strides = (shape[1] * shape[2], shape[2], 1)
+    n = len(verts)
+    out = xp.empty((n, 3), dtype=xp.int16)
+    with trace.span("normals", xp=xp, vertices=n):
+        for start in range(0, n, NORMAL_CHUNK):
+            p = xp.asarray(verts[start:start + NORMAL_CHUNK], dtype=xp.float64) + xp.asarray(offset, dtype=xp.float64)
+            out[start:start + len(p)] = _chunk_normals(xp, flat, shape, strides, p)
+    return out
+
+
+def _chunk_normals(xp, flat, shape, strides, p):
+    rows = xp.arange(len(p))
+    whole = xp.rint(p)
+    axis = xp.argmax(xp.abs(p - whole), axis=1)  # the edge runs along the one coordinate that is not a whole sample
+    corner = xp.clip(whole, 0, xp.asarray(shape - 1)).astype(xp.int64)  # (in case of float noise at the ends)
+    along = p[rows, axis]
+    low = xp.clip(xp.floor(along).astype(xp.int64), 0, xp.asarray(shape - 2)[axis])  # the edge's lower sample
+    t = xp.clip(along - low, 0.0, 1.0).astype(xp.float32)[:, None]
+    corner[rows, axis] = low
+    del whole, along, p
+    base = corner[:, 0] * strides[0] + corner[:, 1] * strides[1] + corner[:, 2]
+    step = xp.asarray(strides, dtype=xp.int64)[axis]
+    # (an edge whose stencil reaches past the array, a pad layer's, takes the slower way round)
+    edge = bool(((corner == 0) | (corner >= xp.asarray(shape - 1))).any() or (low >= xp.asarray(shape - 2)[axis]).any())
+    g = _gradient(xp, flat, shape, strides, corner, base, edge) * (1 - t)
+    corner[rows, axis] += 1
+    g += _gradient(xp, flat, shape, strides, corner, base + step, edge) * t
+    length = xp.sqrt((g * g).sum(axis=1))
+    flat_spot = ~(length > 1e-20)  # (a field flat at both samples: the edge's own direction, up the values)
+    if bool(flat_spot.any()):
+        up = xp.sign(flat[base + step] - flat[base]).astype(xp.float32)
+        g[flat_spot] = 0
+        g[rows[flat_spot], axis[flat_spot]] = up[flat_spot]
+        length = xp.where(flat_spot, 1.0, length)
+    return xp.rint(g / length[:, None] * NORMAL_SCALE).astype(xp.int16)
+
+
+def _gradient(xp, flat, shape, strides, corner, base, edge=True):
+    """Twice the central differences of the samples at grid points `corner` (n x 3, flat indices `base`): float32
+    (n x 3). A neighbour past the array's edge is the point itself (only looked for when `edge`)."""
+    g = xp.empty((len(base), 3), dtype=xp.float32)
+    for a in range(3):
+        up, down = base + strides[a], base - strides[a]
+        if edge:
+            c = corner[:, a]
+            up = xp.where(c + 1 < int(shape[a]), up, base)
+            down = xp.where(c > 0, down, base)
+        g[:, a] = flat[up] - flat[down]
+    return g
+
+
+def extract_surface(values, grid, normals=False):
+    """The first part of field_to_mesh, where the samples are (on the GPU for CuPy): marching cubes.
+    Returns the arguments of surface_mesh, which makes the mesh (on the CPU; in a two-stage map in a CPU
+    worker, engine/stages.py): plain arrays, from the GPU as Warp gives them (float32 positions in
+    samples, int32 triangles: half the bytes to hand over). normals: also `normals` (field_normals, on the host;
+    computed where the samples are, so from the GPU only they come back)."""
     xp = xp_of(values)
     values, nonfinite = finite_values(values, grid.voxel)
     clipped = touches_box(values)
@@ -47,35 +129,101 @@ def field_to_mesh(values, grid):
     # Pad with "outside" so surfaces touching the grid boundary still close.
     padded = xp.pad(values, 1, mode="constant", constant_values=max(float(values.max()), grid.voxel))
     del values
-    if xp is np:
-        verts, faces, _, _ = marching_cubes(padded, level=0.0, spacing=(grid.voxel,) * 3)
-    else:
-        verts, faces = _marching_cubes_gpu(padded, grid.voxel)
+    scale = found = None
+    with trace.span("marching cubes", xp=xp):
+        if xp is np:
+            verts, faces, _, _ = marching_cubes(padded, level=0.0, spacing=(grid.voxel,) * 3)
+        else:
+            verts, faces, found = _marching_cubes_gpu(padded, normals)
+            scale = grid.voxel
+    if normals and xp is np:  # (positions in mm here: back to samples; the pad is the samples' own outer layer)
+        found = field_normals(padded, verts / np.float64(grid.voxel))
     del padded
-    verts += grid.origin - grid.voxel
+    surface = dict(verts=verts, faces=faces, scale=scale, shift=grid.origin - grid.voxel, voxel=grid.voxel,
+                   nonfinite=nonfinite, clipped=clipped)
+    if normals:
+        surface["normals"] = found
+    return surface
+
+
+def surface_mesh(verts, faces, scale, shift, voxel, nonfinite, clipped, normals=None):
+    """The mesh of extract_surface's marching cubes, in world coordinates, facing out; with `normals` (field_normals:
+    they point out whatever way marching cubes turned the triangles) in mesh.vertex_attributes[FIELD_NORMAL]."""
+    if scale is not None:  # Warp's: float32 positions in samples (the same sums as before the split)
+        verts = verts.astype(np.float64) * scale
+        faces = faces.reshape(-1, 3).astype(np.int64)
+    verts += shift
     # Marching cubes output is already closed and shares vertices correctly. trimesh's
     # processing (merging near-coincident vertices, dropping zero-area triangles) can pinch or
     # open it where the surface passes through grid corners, so keep its topology untouched.
-    mesh = trimesh.Trimesh(verts, faces, process=False)
+    mesh = trimesh.Trimesh(verts, faces, process=False,
+                           vertex_attributes=None if normals is None else {FIELD_NORMAL: normals})
     # not mesh.volume: it leaves trimesh's per-triangle arrays (96 B per triangle, 2.7x the mesh) in
     # the mesh's cache, kept with the node's result and pickled with it from the workers
     if signed_volume(mesh.vertices, mesh.faces) < 0:
         mesh.invert()
-    mesh.metadata.update(nonfinite=nonfinite, clipped=clipped, voxel=grid.voxel)
+    mesh.metadata.update(nonfinite=nonfinite, clipped=clipped, voxel=voxel)
     return mesh
 
 
-def _marching_cubes_gpu(values, voxel):
+FOLDS_TO_WARN = 1e-3  # share of triangles folded over (dual contouring) worth a warning: CAD parts with holes
+                      # had ~3e-5, the lamp center at 0.3 mm 2e-4, a lamp-like texture on the test part at 0.4 4e-3
+
+
+def finish_body(grid, method, cut_hint, keep, voxel, tolerance, surface=None, values=None, check=None):
+    """The second stage of meshing a body (nodes._mesh; in a CPU worker when the map splits, engine/stages.py):
+    the mesh from extract_surface's `surface` (marching cubes) or from the samples `values` (dual contouring),
+    checked (report_mesh) and reduced (finish). `check`: called now and then to let a Stop take effect."""
+    if surface is not None:
+        mesh = surface_mesh(**surface)
+    else:
+        from .dualcontour import dual_contour
+        mesh = dual_contour(values, grid)
+    report_mesh(mesh, cut_hint)
+    return finish(mesh, keep, voxel, tolerance, check)
+
+
+def report_mesh(mesh, cut_hint):
+    """Warnings about a body just meshed (see field_to_mesh): samples that were not numbers, and a body cut off
+    by its box (`cut_hint`: what to do about it; None = cutting is intended)."""
+    from .stages import report
+    bad = mesh.metadata.get("nonfinite", 0)
+    if bad:
+        report(f"{bad:,} samples were not a number (NaN) or infinite and were meshed as outside "
+               "(inside for minus infinity). Usually a Divide by 0 upstream.", "warning")
+    if mesh.metadata.get("clipped") and cut_hint:
+        report(f"The body reaches the edge of the box it is meshed in and is cut flat there: {cut_hint}", "warning")
+    folded = mesh.metadata.get("folded", 0)
+    if folded > FOLDS_TO_WARN * len(mesh.faces):
+        report(f"Dual contouring left {folded:,} small folded-over triangles where the texture is finer than the "
+               "voxel: a smaller voxel, or marching cubes (which has none), avoids them.", "warning")
+
+
+def finish(mesh, keep, voxel, tolerance, check=None):
+    """Reduce a whole body's mesh: to a tolerance if one is given, else keep a share."""
+    if tolerance > 0:
+        V, F = reduce(mesh.vertices, mesh.faces, float(tolerance), check=check)
+        return trimesh.Trimesh(V, F, process=False)
+    return decimate(mesh, keep, voxel)
+
+
+def _marching_cubes_gpu(values, normals=False):
     """Marching cubes of a CuPy array with NVIDIA Warp: ~8x faster than skimage on the CPU and only
     the mesh comes back to the CPU. Same vertices and triangles as skimage (one vertex per crossed
-    grid edge, closed surface); vertex positions are computed in float32 (~1e-6 mm here)."""
+    grid edge, closed surface); vertex positions are computed in float32 (~1e-6 mm here), in samples
+    (float32), and the triangles as Warp's int32 indices (surface_mesh scales and widens them).
+    Returns (vertices, triangles, field_normals computed on the card or None)."""
     import warp as wp
     import warp.geometry
     from . import backend
-    backend.cupy().cuda.Device().synchronize()  # Warp runs on its own CUDA stream
+    cp = backend.cupy()
+    cp.cuda.Device().synchronize()  # Warp runs on its own CUDA stream
     verts, indices = warp.geometry.IsoSurfaceMarchingCubes.extract(wp.from_dlpack(values), 0.0)
     wp.synchronize_device()
-    return verts.numpy().astype(np.float64) * voxel, indices.numpy().reshape(-1, 3).astype(np.int64)
+    found = None
+    if normals and len(verts):
+        found = backend.to_host(field_normals(values, cp.asarray(verts).reshape(-1, 3)))
+    return verts.numpy(), indices.numpy(), found
 
 
 AGGRESSION = 3  # quadric collapse: low values avoid sliver triangles (specks on curved areas)
@@ -89,16 +237,17 @@ def simplify(verts, faces, keep, voxel, preserve_border=False):
     Returns None if the result is not a clean surface (an edge shared by more than 2 triangles,
     which the algorithm doesn't rule out)."""
     import pyfqmr
-    s = pyfqmr.Simplify()
-    s.setMesh(np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64))
-    s.simplify_mesh(target_count=max(4, int(len(faces) * keep)), aggressiveness=AGGRESSION,
-                    preserve_border=preserve_border, alpha=1e-9 / voxel ** 2, verbose=False)
-    V, F, _ = s.getMesh()
-    F = np.asarray(F, dtype=np.int64)
-    edges = np.sort(F[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-    if (np.unique(edges[:, 0] * np.int64(len(V)) + edges[:, 1], return_counts=True)[1] > 2).any():
-        return None
-    return np.asarray(V, dtype=np.float64), F
+    with trace.span("decimate", device="cpu", triangles=len(faces)):
+        s = pyfqmr.Simplify()
+        s.setMesh(np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64))
+        s.simplify_mesh(target_count=max(4, int(len(faces) * keep)), aggressiveness=AGGRESSION,
+                        preserve_border=preserve_border, alpha=1e-9 / voxel ** 2, verbose=False)
+        V, F, _ = s.getMesh()
+        F = np.asarray(F, dtype=np.int64)
+        edges = np.sort(F[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        if (np.unique(edges[:, 0] * np.int64(len(V)) + edges[:, 1], return_counts=True)[1] > 2).any():
+            return None
+        return np.asarray(V, dtype=np.float64), F
 
 
 def decimate(mesh, keep, voxel):
@@ -131,6 +280,11 @@ def fuse(meshes):
     """Boolean union of closed meshes into one watertight mesh (manifold3d). Meshes only join
     where they overlap; touching is not enough. Separate pieces under SPECK_VOLUME are dropped.
     Returns (mesh, number of separate solids, number of specks dropped)."""
+    with trace.span("fuse", device="cpu", meshes=len(meshes)):
+        return _fuse(meshes)
+
+
+def _fuse(meshes):
     import manifold3d as m3d  # imported here: only needed when fusing
 
     solids = []
@@ -212,6 +366,11 @@ def reduce(vertices, faces, tolerance, check=None, frozen=None, snap=True):
     start. `snap`: snap to float32 as files store it (blocks are snapped after stitching). Every
     edge ends up used by exactly two triangles (open input edges: once); if that cannot be reached
     the input is returned. Returns (vertices, faces)."""
+    with trace.span("reduce", device="cpu", triangles=len(faces)):
+        return _reduce(vertices, faces, tolerance, check, frozen, snap)
+
+
+def _reduce(vertices, faces, tolerance, check, frozen, snap):
     V = np.asarray(vertices, dtype=np.float64)
     F = np.asarray(faces, dtype=np.int64)
     if not len(F) or tolerance <= 0:

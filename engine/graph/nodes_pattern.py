@@ -181,13 +181,18 @@ _SHAPE_PORTS = [
        Port("tilt", "number", 0.0, advanced=True, unit="°",
             doc="Leans every hole's axis away from the face's normal, degrees, towards the pattern's rows (Align sets "
                 "their direction): louvres that keep rain or eyes out. The holes stay straight and are cut through the "
-                "slanted wall.")],
+                "slanted wall."),
+       Port("moved", S, 0.0, label="Faces moved by", advanced=True, unit="mm",
+            doc="When an Offset Faces moved these faces before (cut the holes into its result): its Distance, so the "
+                "holes start from the moved surface. Through holes then reach out through a raised face, pockets "
+                "are as deep and raised shapes as tall as set, measured from it. A field is read at each hole's "
+                "centre. 0 = the faces as in CAD.")],
       [Port("out", "implicit", doc="The shapes as a body (each a straight plug along the face's normal). Holes "
                                    "and pockets: Boolean Subtract it from the part (A = the part, B = this). "
                                    "Raised shapes (Height): Boolean Union it with the part.")])
 def hole_pattern(cad, faces, apply, shape, sides, size, length, corner_radius, rotation, layout, spacing, align,
                  angle, offset_u, offset_v, margin, depth, size_scale, height=0.0, web=1.0, randomness=0.0, seed=0,
-                 min_size=1.0, morph_to="none", morph=0.5, alternate="none", tilt=0.0, join="tangent"):
+                 min_size=1.0, morph_to="none", morph=0.5, alternate="none", tilt=0.0, join="tangent", moved=0.0):
     """Whole holes in a chosen shape, laid out on picked CAD faces: vents and grilles. Each hole's
     axis is the face's normal at its centre; holes that would be cut by the edge of the chosen
     faces are left out. Subtract the result from the part (Boolean Subtract). Depth makes pockets
@@ -205,7 +210,7 @@ def hole_pattern(cad, faces, apply, shape, sides, size, length, corner_radius, r
         found = H.place(cad, chosen, outline, layout, spacing, align, angle, (offset_u, offset_v), margin, depth,
                         size_scale, height, turned, check=check_cancel, randomness=randomness, seed=seed,
                         min_size=min_size, morph_to=second, morph=morph, alternate=alternate, tilt=tilt,
-                        join=join)
+                        join=join, moved=moved)
     except H.HoleError as err:
         raise GraphError(str(err)) from err
     for text, level in found.lines:

@@ -3,10 +3,15 @@
 A field is pickled into every task sent to a worker, and a field that reads a 2.4M-triangle mesh
 carried ~90 MB of vertices and triangles each time (with 2 tasks queued per worker, over 1 GB in
 flight). A Shared array pickles as its fingerprint instead: the first pickling writes the array to
-a folder next to the SSD cache, and every process reads it from there once and keeps it while it
-is used (most tasks never touch the array at all: the distance field is cached by then).
+a folder next to the SSD cache, and every process maps it from there (cache.read_npy: one copy in RAM
+for all of them, the file's own pages) while it is used (most tasks never touch the array at all: the
+distance field is cached by then).
+
+`prepared` keeps arrays worked out from such data (a CAD mesh's normals and cracks, its split for the
+GPU) in the same folder: built once by the first process that needs them, mapped by every other one.
 """
 import hashlib
+import json
 import os
 import threading
 import time
@@ -14,13 +19,16 @@ from collections import OrderedDict
 
 import numpy as np
 
-from .cache import default_cache_dir
+from . import trace
+from .cache import default_cache_dir, psutil, read_npy
 
 FOLDER = "shared"
 INLINE_BYTES = 1 << 20      # smaller arrays travel inside the task as before
 KEEP_BYTES = 256 * 2**20    # arrays each process keeps after reading them (oldest dropped first)
 MAX_BYTES = 4 * 2**30       # files kept on the SSD; older files are deleted ...
 MIN_AGE = 3600.0            # ... unless written or read in the last hour (a run may be using them)
+PREPARED_VERSION = 1        # bump when what a `prepared` build returns changes (sdf, sdf_gpu)
+PREPARED_WAIT = 600.0       # s a process waits for another one building the same prepared arrays
 
 _kept = OrderedDict()       # key -> array, this process
 _kept_bytes = 0
@@ -70,20 +78,28 @@ def _attach(key):
     return s
 
 
-def _store(key, array):
-    path = _folder() / f"{key}.npy"
+def _write(path, array):
+    """Write an .npy file atomically (readers never see half a file); nothing when it is there already
+    (same name, same content: it may be mapped by another process, and then cannot be replaced)."""
     if path.exists():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with open(tmp, "wb") as f:  # a file object: np.save would append ".npy" to a name
-            np.save(f, array, allow_pickle=False)
+            np.save(f, np.ascontiguousarray(array), allow_pickle=False)
         os.replace(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
         if not path.exists():
             raise
+
+
+def _store(key, array):
+    path = _folder() / f"{key}.npy"
+    if path.exists():
+        return
+    _write(path, array)
     _trim(path.parent)
 
 
@@ -95,11 +111,11 @@ def _load(key):
             return _kept[key]
     path = _folder() / f"{key}.npy"
     try:
-        array = np.load(path, allow_pickle=False)
+        with trace.span("shared read", key=key):
+            array = read_npy(path)  # mapped: one copy in RAM for every process
         os.utime(path)  # recently used: not trimmed while a run needs it
     except (OSError, ValueError) as e:
         raise RuntimeError(f"shared data {key} is missing from the SSD cache folder ({e}); run again") from None
-    array.flags.writeable = False
     with _lock:
         _kept[key] = array
         _kept_bytes += array.nbytes
@@ -115,6 +131,109 @@ def forget():
     with _lock:
         _kept.clear()
         _kept_bytes = 0
+
+
+# --- arrays worked out once for all processes ---------------------------------------------------
+def prepared(kind, key, build):
+    """`build()`'s dict of arrays (and plain numbers) for `key`, worked out once for all processes: the first
+    process that needs them builds them and writes them to the shared folder, every process maps them from
+    there (read-only). Processes that need them while one builds them wait for its files instead of building
+    their own (8 GPU workers each split and analysed a big part for themselves, ~290 B per triangle each at
+    the same time: MEMORY_AUDIT C6, C8). The build must give the same result in every process."""
+    stem = hashlib.sha1(repr((PREPARED_VERSION, kind, key)).encode()).hexdigest()[:32]
+    folder = _folder()
+    found = _read_prepared(folder, stem)
+    if found is not None:
+        return found
+    folder.mkdir(parents=True, exist_ok=True)
+    lock, deadline = folder / f"{stem}.lock", time.time() + PREPARED_WAIT
+    while True:
+        if _take(lock):
+            try:
+                found = _read_prepared(folder, stem)  # written while this one waited for the lock
+                if found is None:
+                    with trace.span("prepare", kind=kind):
+                        built = build()
+                    try:
+                        _write_prepared(folder, stem, built)
+                    except OSError:
+                        return built  # a full disk: this process keeps its own
+                    found = _read_prepared(folder, stem)
+                    if found is None:
+                        return built
+            finally:
+                lock.unlink(missing_ok=True)
+            _trim(folder)
+            return found
+        with trace.span("prepare wait", kind=kind):
+            while lock.exists() and not _stale(lock) and time.time() < deadline:
+                time.sleep(0.02)
+        found = _read_prepared(folder, stem)
+        if found is not None:
+            return found
+        if time.time() >= deadline:
+            return build()  # the other one takes too long: build without writing
+        if _stale(lock):
+            lock.unlink(missing_ok=True)
+
+
+def _take(lock):
+    """Create the lock file; False when another process has it."""
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    except OSError:  # e.g. being deleted right now
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def _stale(lock):
+    """A lock left by a process that is gone (stopped by the watchdog, killed)."""
+    try:
+        pid = int(lock.read_text() or 0)
+        age = time.time() - lock.stat().st_mtime
+    except (OSError, ValueError):
+        return False  # being written, or gone (the loop sees that)
+    if psutil is not None and pid:
+        return not psutil.pid_exists(pid)
+    return age > PREPARED_WAIT
+
+
+def _write_prepared(folder, stem, built):
+    """Each array as `<stem>.<name>.npy`, then the list `<stem>.json` last: a list on the SSD means its arrays
+    are complete."""
+    arrays = {name: v for name, v in built.items() if isinstance(v, np.ndarray)}
+    values = {name: v for name, v in built.items() if not isinstance(v, np.ndarray)}
+    for name, array in arrays.items():
+        _write(folder / f"{stem}.{name}.npy", array)
+    path = folder / f"{stem}.json"
+    tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps({"arrays": sorted(arrays), "values": values}))
+    os.replace(tmp, path)
+
+
+def _read_prepared(folder, stem):
+    path = folder / f"{stem}.json"
+    try:
+        listed = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    out = dict(listed.get("values", {}))
+    try:
+        for name in listed["arrays"]:
+            file = folder / f"{stem}.{name}.npy"
+            out[name] = read_npy(file)
+            os.utime(file)  # recently used: not trimmed while a run needs it
+    except (OSError, ValueError, KeyError):  # an array trimmed away: build again
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    return out
 
 
 def _trim(folder):

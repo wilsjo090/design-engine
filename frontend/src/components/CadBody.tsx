@@ -1,12 +1,14 @@
 // CAD bodies in the 3D view, drawn the way a CAD program shows a part: smooth within each CAD face and
 // crisp at its borders, the faces' edges as lines (tangent ones dimmed), styles and colours from the
 // view options (cadLook.ts, the toolbar's Edges ▾).
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { useThree } from '@react-three/fiber'
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 import { loadFaces } from '../api'
+import { cancelBoundsTree, scheduleBoundsTree } from '../bvhBuild'
 import { useStore } from '../store'
+import { viewGeometry, viewNormals, watchFirstFrame } from '../viewTiming'
 import type { FaceData, ViewMesh } from '../types'
 import {
   CAD_COLORS, LOOK_MAX_TRIANGLES, edgesShown, requestLook, tintColors, useCadLook, type CadLookOptions, type EdgeSet,
@@ -94,13 +96,16 @@ export function useLookGeometry(view: ViewMesh, look: LookResult | null) {
     } else {
       g.setAttribute('position', new THREE.BufferAttribute(view.positions, 3))
       g.setIndex(new THREE.BufferAttribute(view.indices, 1))
+      const t = performance.now()
       g.computeVertexNormals()
+      viewNormals(view, performance.now() - t)
       g.userData.source = view.indices
     }
     g.computeBoundingSphere()
+    viewGeometry(view)
     return g
   }, [view, look])
-  useEffect(() => () => { geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
+  useEffect(() => () => { cancelBoundsTree(geometry); geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
   return geometry
 }
 
@@ -213,6 +218,12 @@ export function CadBody({ view, node, wireframe, ghost, clip, box, patch, hide }
   const look = useLook(view, patch ? undefined : node)
   const geometry = useLookGeometry(view, look)
   useEffect(() => hideRanges(geometry, geometry.userData.source, view.parts, 3, hide), [geometry, view, hide])
+  // right-clicks and clicks raycast it: its search tree is built in a worker meanwhile (bvhBuild.ts), on the
+  // look's geometry (the one drawn from then on; a body too big for a look keeps the plain one)
+  const menuTarget = !patch && !!node && !ghost && (!!look || view.faces > LOOK_MAX_TRIANGLES)
+  useEffect(() => { if (menuTarget) scheduleBoundsTree(geometry, geometry.userData.source) }, [geometry, menuTarget])
+  const meshRef = useRef<THREE.Mesh>(null)
+  useLayoutEffect(() => watchFirstFrame(meshRef.current, view), [geometry, view])  // (before a frame can draw it)
   const style = wireframe ? 'shaded' : options.style
   const tinted = style === 'shaded' || style === 'see-through'
   const colors = useMemo(() => (look && tinted ? tintColors(look, options.tint, options.color) : null),
@@ -232,7 +243,7 @@ export function CadBody({ view, node, wireframe, ghost, clip, box, patch, hide }
   const key = `${style}-${!!colors}-${transparent}-${wireframe}`
   return (
     <group>
-      <mesh geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost || patch ? () => null : undefined}
+      <mesh ref={meshRef} geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost || patch ? () => null : undefined}
         // a guide shape's Place clicks on it (Guides.tsx); right-clicks open its node's menu
         userData={patch ? {} : { placeable: true, menu: node && !ghost ? { view: node } : undefined }}>
         {style === 'lines'

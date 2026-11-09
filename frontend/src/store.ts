@@ -58,6 +58,9 @@ interface State {
   starting: string | null
   /** views, slices and colours being downloaded from the engine */
   loadingViews: number
+  /** a number is being dragged (a slider, a scrubbed label: `startValueDrag`), from the press to the release:
+   *  refining starts no finer preview meanwhile */
+  valueDrag: boolean
   views: Record<string, ViewMesh>
   /** the part of a view on screen meshed finer (Refine, when zoomed in), per view */
   details: Record<string, Detail>
@@ -446,6 +449,7 @@ export const useStore = create<State>((set, get) => ({
   requested: null,
   starting: null,
   loadingViews: 0,
+  valueDrag: false,
   views: {},
   details: {},
   pieces: {},
@@ -800,7 +804,8 @@ export const useStore = create<State>((set, get) => ({
         case 'message':
           return { log: [...s.log.slice(-199), { time: Date.now(), text: e.text, level: e.level ?? 'info' }] }
         case 'run_done': {
-          const run: RunState | null = s.run ? { ...s.run, running: false, phase: undefined, stopping: undefined } : null
+          const run: RunState | null = s.run
+            ? { ...s.run, running: false, phase: undefined, stopping: undefined, endedAt: Date.now() } : null
           const secs = `${(e.time ?? 0).toFixed(1)}s`
           const what = s.run?.mode === 'export' ? 'Export' : s.run?.mode === 'optimize' ? 'Optimization'
             : s.run?.mode === 'detail' ? 'Detail' : s.refine && s.run?.quality ? `${QUALITY_LABEL[s.run.quality]} preview` : 'Update'
@@ -1672,3 +1677,20 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
 }))
+
+/** A number is being dragged (a slider, a scrubbed label): `valueDrag` from now until the pointer is let go
+ *  anywhere (or the window loses focus), so refining starts no Medium or Final preview in the middle of a drag
+ *  whose pointer rests for a moment (App.useRefine). */
+export function startValueDrag() {
+  if (useStore.getState().valueDrag) return
+  useStore.setState({ valueDrag: true })
+  const end = () => {
+    window.removeEventListener('pointerup', end, true)
+    window.removeEventListener('pointercancel', end, true)
+    window.removeEventListener('blur', end)
+    useStore.setState({ valueDrag: false })
+  }
+  window.addEventListener('pointerup', end, true)
+  window.addEventListener('pointercancel', end, true)
+  window.addEventListener('blur', end)
+}

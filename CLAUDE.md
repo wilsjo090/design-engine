@@ -20,6 +20,7 @@ Python is the conda env `synkad` (3.12), not on PATH:
 | One test | `python -m pytest tests/test_sdf.py::test_signed_distance_matches_reference -q` |
 | GPU vs CPU equivalence | `python -m pytest tests/test_gpu.py -q --gpu` (skipped without `--gpu`; the rest of the suite is pinned to the CPU by `tests/conftest.py`) |
 | Run a recipe headless | `python run_graph.py recipes/lamp_noise.json --set amplitude.value=0.5` (`--nodes` lists node types, `--save` writes the graph) |
+| Trace a run | `python tools/trace_run.py recipes/x.json --quality medium final` (headless through the editor's own Session; `--optimize NODE`, `--mode export`, `--set`: redirect export paths); in the editor `start.bat --trace`; then `python tools/trace_report.py [run folder \| --match final \| --list]` (summary printed, `report.html` written) |
 | Build the UI | `cd frontend && npm run build` (`tsc -b` is the only type/lint check) |
 | UI dev server | `cd frontend && npm run dev` (:5173, proxies `/api` and `/ws` to a running `app.py`) |
 | Desktop shortcut | `python tools/create_shortcut.py` |
@@ -46,8 +47,15 @@ test; points whose closest feature lies on an open edge (OpenCascade leaves T-ju
 fillet corners) fall back to a winding-number tree. `mesh_to_sdf` computes exact distances only
 in a narrow band, interpolating the rest from a coarse pass. Fields hold big arrays (CAD meshes,
 the Voronoi foam) as `shared.Shared`: pickled into a task as a fingerprint (the array goes to
-`cache\shared` once), read by each worker once; `sdf.arrays()` unwraps them, and search
-structures only read them when they have to be built.
+`cache\shared` once), memory-mapped by each worker (`cache.read_npy`: one copy in RAM for all processes,
+the file's own pages, no commit); `sdf.arrays()` unwraps them, and search structures only read them when
+they have to be built. A mesh from `sdf.PREPARE_TRIANGLES` (100k) with a key gets everything but its search
+tree worked out once for all processes (`shared.prepared`: `sdf.query_arrays`, the normals and cracks of
+`MeshQuery`; `sdf_gpu.gpu_arrays`, the 2 mm split, crack flags and float32 normals the GPU uploads), built
+by the first process that needs it (a lock file; the others wait for its files, a dead holder's lock is
+taken over) and mapped by every one; bump `shared.PREPARED_VERSION` when those builds change. Measured
+(1.31M triangles): per CPU worker 0.48 -> 0.32 GB, a worker's later start 4.4 -> 1.8 s; 4 GPU workers'
+start-up peak 3.45 -> 1.33 GB, 3.5 -> 0.8 s once prepared.
 
 **STEP import** (`engine/cad_import.py`): `tessellate` reads all triangulations of a body in one
 go through OpenCascade's binary writer (`BinTools_ShapeSet.WriteTriangulation`, each one added via
@@ -87,6 +95,28 @@ into an uncomputed neighbour pull it into the next round. Seams are exact only b
 samples are bit-identical in both blocks: `Grid.block` computes positions from a global index
 (also in the Warp kernel), block starts are multiples of `ALIGN` so `Grid.coarser` lattices
 (noise, distance-field coarse passes) coincide, and smoothing gets a halo (`fields.halo`).
+
+**Two-stage maps** (`engine/stages.py`, `workers.StickyPool`, `core.Evaluator._splits` / `_cpu_slots`): in a map on
+the GPU, an item whose work ends on the CPU returns `stages.cpu_stage(fn, **kwargs)`: per body `meshing.finish_body`
+(decimation, Tolerance's reduction, dual contouring's extraction; marching cubes alone stays in the GPU worker);
+blocks when reducing or dual contouring, `blockmesh.mesh_values` / `dual_contour_values` from the samples. The GPU
+worker puts it on the pool's shared CPU queue, arrays out of band in a shared memory block (`stages.HandOver`;
+Windows keeps a block while a process has it open, so the GPU worker closes it when the CPU worker says on
+`released` that it copied it), tells the main process `HANDED` and takes its next item; any CPU worker
+(`stages.cpu_worker_main`) runs it, and its result is the item's (report lines of both stages, order, `on_item`,
+errors, progress as before). While as many stages wait in the CPU queue as there are CPU workers (the task's `split`
+is that number), a GPU worker runs the stage itself (`workers._cpu_queue_full`, `cpu stage here` in traces): in the
+editor 2 CPU workers were 96% busy while 8 GPU workers idled 80%. The main process gives a GPU worker its next item
+only while fewer than `backlog` stages are queued. CPU workers: started when a map hands over its first stage, kept
+like the others (watchdog, `stop_idle_workers`, idle release stop them), `DESIGN_ENGINE_GPU=0`, one BLAS and libigl
+thread, and lean: they import only stages, meshing, dualcontour, blockmesh (0.1-0.3 GB each; `engine/__init__.py`
+imports its names on first use for this). How many: cores left, memory room beside the GPU workers, new ones only in
+the RAM free now (less `FREE_TIGHT` and the GPU workers' `need`: the limits allow paging, where they cost more than
+they gain), at most `CPU_WORKERS_MAX` (10; `DESIGN_ENGINE_CPU_WORKERS`). `DESIGN_ENGINE_SPLIT=0` never splits, `=1`
+always (also on the CPU, and always hands over: tests). The same functions on the same arrays, so meshes are bit for
+bit those of one stage. Measured 2026-11-09: headless with 4 GPU workers the lamp's petals 15.4 -> 10.4 s; in the
+editor with 8 GPU workers (8 GB of the card free) the lamp's Final after an edit 12.7 -> 12.1 s, peak 9.8 -> 10.6 GB
+(the 16 cores are full at ~14 working processes; the gain grows when free GPU memory limits the GPU workers).
 
 **Transforms** (`engine/transform.py`, category Transform in `nodes.py`): Scale, Move, Rotate, Mirror and
 Pattern Bodies act on CAD bodies, before Implicit Body from CAD Body (a field cannot be turned on the
@@ -188,6 +218,29 @@ chamfer (`fields.subtract_edged`, `union_edged`); a cutter must be exact as far 
 so the Booleans call its `regrow`. Picture and Text (`engine/picture.py`) project an image onto a
 face (flat, or around a cylinder's axis) as a 0..1 field. Standard patterns ship as presets in
 `presets/` (25).
+
+**Offset Faces** (`engine/offset_faces.py`, node `implicit.offset_faces` in `nodes.py`; plan in docs/ROADMAP.md):
+picked CAD faces moved out or in as one piece, as a field. `Patch` is the chosen faces as a mesh of their own
+(corner normals angle-weighted per CAD face) and its border (edges of one chosen triangle); `geometry` (cached,
+(3, *grid.shape), 12 B per voxel) gives every sample within `band` of the faces `lat` (0 on walls standing on the
+border along the faces' normals; over the faces minus the distance from the closest point c to the border, beyond
+it the sideways rest of |p - c| signed by the border edge's outward direction), `hgt` (± |p - c| over the faces, so
+outward folds between chosen faces join round as Offset Body; (p - c)·n on the border) and `s`; closest points
+from igl on the patch (`_near`, in chunks) or facemask's Warp kernel on the GPU. Sides straight: part ∪ slab
+{lat ≤ 0, -e ≤ hgt ≤ d} minus recess {lat ≤ 0, d ≤ hgt ≤ e}, one formula for a Distance field of either sign;
+e = |d| but at most half the wall under (free space over) the faces (`walls`: Warp rays, thinnest 2% by area).
+Round: the faces' own offset, not deeper than e under them. Blend: body - d × Face Mask (Fade = Width). Edge =
+the step's outside edge, Foot = its inside edge; chamfer and round as the Booleans (Mercury, exact at the step's
+90°), smooth the G2 `bulge` at `SMOOTH_SIZE` = 3(2 - √2) ≈ 1.76 × size (as deep along the bisector as round; the
+frames' `CONTINUITY_SIZE` was 15% shallower); sizes cut to the step's height (a rounded union of the moved face and
+the parallel old one lifted it). Per border edge s = sin of the fold from the chosen face to its neighbour, Foot ×
+clip(1 - s), Edge × clip(1 + s): a box's top raised or sunk has no foot (Mercury's union of two continuing surfaces
+bulges 0.41 r; the recess's corner left a knife-thin lip), a pocket floor moved has no edge; within `RUNOUT` of a
+border vertex s moves to the vertex's. Walls lying on a neighbouring face with the part (or the air) on both sides
+stand `GAP` × s² beyond the border (else a sheet of zeros the mesher took for a surface). Within `TAPER` of the
+band's end the slab and recess grow smoothly to FAR. Above a sunk face values are a lower bound, as Boolean
+Subtract's. Hole Pattern's `moved` ("Faces moved by", `holes._depths(moved=)`) starts its shapes from the moved
+surface; a Face Mask finds moved faces when its Band ≥ Distance. Demo: `recipes/offset_faces_demo.json`.
 
 **Lattices** (`engine/lattice.py`): TPMS (value / |grad|, exact gradients in `TPMS_GRADIENT`, so
 thickness is in mm), periodic strut lattices (points folded into one octant of a cell,
@@ -346,7 +399,9 @@ sets it for the node of an "optimize" job (`/api/optimize`, queued like exports:
 in exports, and `stamp` (`Session.stamp`, bumped after such jobs) makes previews read the saved
 state again. States are in `cache\topology` (`load_topology` / `save_topology`, keyed by
 `topology_key`; bump `TOPO_VERSION` when the method changes), checkpointed every 5 iterations and
-on Stop (unfinished ones with the power vectors, so a resumed run continues exactly);
+on Stop (unfinished ones with the power vectors, so a resumed run continues exactly; both stay in the optimizer's
+thread: at fine detail a live view takes ~0.1 s every 3 iterations and a checkpoint ~0.05 s every 5, under 3% of
+~1.7 s iterations, and a thread beside it measured no gain, 2026-11-09);
 `core.report_view` shows the shape while it runs (`live_view` event, `topology.LiveSurface`); a node's first
 output can carry a `note` shown on its card.
 
@@ -491,6 +546,35 @@ every `node_done` (`messages`), so the card shows them on cached runs too (the h
 `viewWarnings`; a group's inner nodes' on the group). In a worker process the lines go back with
 the item's result (`_current.sink`); the same line from many list items is reported once, "(xN)".
 
+**Field normals for views** (`meshing.field_normals`): views, list pieces and details of implicit bodies
+(`mesh.view` / `mesh.detail` -> `nodes._mesh(normals=True)`, `tiles.mesh_tiled(normals=True)`) carry each vertex's
+normal from the field: central differences at the two samples of the vertex's grid edge (the edge found from its
+position: the one coordinate that is not a whole sample), interpolated along the edge like the vertex, pointing up the
+values (out of the body). CuPy on the card for a whole body (only the normals come back, `_marching_cubes_gpu`), numpy
+in a block's worker. Kept as int16 x 3 (x `NORMAL_SCALE`) in `mesh.vertex_attributes["field_normal"]` (trimesh keeps
+it through `remove_unreferenced_vertices`, `merge_vertices` / `snap_float32`, `concatenate`, pickling; decimation drops
+it). Blocks: a gradient needs both neighbours and a block's grid cannot start a sample earlier (ALIGN), so with normals
+each block's cells move one sample up (`blockmesh.normals_block`, `NORMAL_MORE` 2: 6% more samples): a seam's vertex
+gets the same normal from both blocks (one-sided differences were 23° off there); block views then differ from before
+in vertex order and last-bit float32 positions only. Only views: Mesh from Implicit Body, Keep, Tolerance, dual
+contouring and exports never get them, STL files have none (`DESIGN_ENGINE_VIEW_NORMALS=0` turns them off). On a
+sphere 0.02° mean error (the triangles' own 1.0°, skimage's `normals` output 0.6°: not used); creases (hex studs, CAD
+edges) are softened over about a voxel. `display_arrays` sends them when every item has them and nothing was
+decimated; `pack_meshes` appends them after the triangles (+17% bytes), and view_ready / view_part / detail_ready say
+`normals: "i16x3"` (older editors read by the counts). In the editor `api.parseMesh` tells them by the blob's length;
+`ViewObject` and `MenuHighlight` set them as a normalized Int16 `normal` attribute instead of `computeVertexNormals`
+(0.69 s for 12M triangles); View ▸ Field normals (localStorage `fieldNormals`) draws the triangles' own normals instead.
+
+**Trace** (`engine/trace.py`, `tools/trace_report.py`, `tools/trace_run.py`): opt-in with `DESIGN_ENGINE_TRACE=1`
+(`app.py --trace`). Each run (a server job in `Session._run`, else `Evaluator.run`) gets a folder in
+`DESIGN_ENGINE_TRACE_DIR` (default `%LOCALAPPDATA%\DesignEngine\trace`, never cleaned up) with each process's spans
+(`trace.span(stage, node=, item=, device=, xp=)`; nested spans inherit node and item; `xp` = cupy marks the device gpu
+and synchronizes at the span's end while tracing) and samples (GPU use and memory by NVML, CPU and RSS per process,
+every 0.1 s, from a sampler process: this file run with `-I`, since a thread was starved 0.5 s by a C extension
+holding the GIL). The clock is `perf_counter` (QPC, the same in every process) plus one offset the main process sends
+to the workers (`time.time()` on Windows steps 1-15 ms). A traced map's tasks carry `trace.task_meta()` as a 4th
+tuple element (none when off). A hook costs ~0.3 µs when off; a new heavy step should get a span.
+
 **Value ranges**: `Field.range` is propagated by interval arithmetic (`fields._interval`,
 `_unary_range`; constants, noise and 3D waves -1..1, masks and Smooth Step 0..1 set explicitly).
 `node_done` events carry it to the editor (range tag on the card); Remap's `auto` uses it. A new
@@ -509,9 +593,17 @@ during it (recomputed on every check it would grow with the engine's own use). P
 `COMMIT_TIGHT`, not free RAM: a full RAM pages other programs out to the NVMe, while running out of commit
 fails any program's allocations. `ArrayCache` is a small RAM LRU in front of `DiskCache`, an SSD folder of `.npy`
 files (`%LOCALAPPDATA%\DesignEngine\cache`) named by content fingerprint, so all processes share
-it and it survives restarts. Bump `CACHE_VERSION` whenever SDF or noise numerics change. Two
-subfolders: `step` (imported STEP meshes), `shared` (arrays for workers) and `topology`
-(optimization states); `clear()` empties all.
+it and it survives restarts (arrays from `DiskCache.MIN_BYTES`, 64 KB: with 1 MB a lamp petal's Draft distance
+field, ~0.4 MB and ~160 ms to compute, was lost once Medium and Final pushed it out of a worker's RAM, and every
+edit's Draft took 5 s instead of 0.7). Hits from `DiskCache.MAP_BYTES` (32 MB) are memory-mapped, as `Shared`
+arrays from 1 MB are: shared by every process that reads the file, dropped by Windows for free, no commit,
+but up to 2x slower to read whole the first time (page faults), so small hits are read. Every array from a
+cache or `Shared` is read-only: never write into one. A mapped file cannot be deleted or replaced, so
+trimming and `clear()` skip it. Bump `CACHE_VERSION` whenever SDF or noise numerics change. Two
+subfolders: `step` (imported STEP meshes), `shared` (arrays for workers, `prepared` ones) and `topology`
+(optimization states); `clear()` empties all. What the engine holds (`Evaluator.memory_in_use`) is the sum
+of its processes' private working sets (`cache.resident_memory`), not RSS, which counts mapped files and
+DLLs in every process again.
 
 **Graph** (`engine/graph/`): `core.py` holds ports, the `@node` registry, the JSON `Graph`
 model and the `Evaluator`. `Graph.from_dict` expands groups (recipe `groups`; a node of type
@@ -525,7 +617,10 @@ and upstream signatures (so an edit only recomputes downstream nodes), maps node
 lists (one STEP file with many bodies flows through the same graph), runs `parallel=True` nodes in
 `workers.StickyPool`, and runs a memory watchdog during each run. `StickyPool` sends item *i* to
 worker *i % active*, so a worker keeps the caches for "its" bodies between edits (each worker starts
-when first given work: runs limited by free GPU memory left half of them idle at ~0.3 GB each); cancelling only
+when first given work: runs limited by free GPU memory left half of them idle at ~0.3 GB each; it imports what
+its tasks use and `gc.freeze()`s it first, `workers._freeze_imports`: every collect between items walked ~350k
+module objects, ~150 ms; only at start, since an object frozen while alive is never collected as part of a cycle);
+cancelling only
 skips queued tasks (killing workers would throw the warm caches away). `nodes.py` is the node
 library; a new `@node` function appears in the editor automatically. A `Port` can say when it applies
 (`when={"shape": [...]}`, a list of such dicts = any of them; the editor's `portApplies` hides it otherwise,
@@ -614,7 +709,12 @@ run's thread starts and when a run ends (`Evaluator.clear_stop`), never as a run
 the next request in line (Optimize right behind a preview a changed setting started), was wiped out there, and that
 request waited out the whole run. Progress streams over `/ws` (events of nodes inside a group are sent as
 the group node; it reports done once, when its output is). Views go out as soon as their node is done
-(`Evaluator.on_result`, `Session._publish_view`; coloured ones at the end, with their colours), and a list's items
+(`Evaluator.on_result`, `Session._publish_view`; coloured ones at the end, with their colours), packed and announced
+by the session's `ViewPublisher` (`Session._views_out`: one thread, in the order handed in; `on_result` / `on_item` only
+queue, so the next node starts at once; `_run_job` waits for it after `evaluator.run`, also when stopped or failed,
+before the views loop, colours and every run_done: a run's views are all out before it ends, none after the next
+run starts; `start()` plans a preview again without the `have` entries its stopped predecessor re-sent meanwhile;
+view_ready carries `timing`: node_s, cached, run_s, wait_ms, pack_ms, bytes), and a list's items
 while they are made (`Evaluator.on_item`: a node mapped over a list, or `parallel_map(parts=)` as `mesh.view` does;
 `StickyPool.map(on_item=)`): `view_part` events, `/api/view/part:{i}:{node}`, dropped when the whole view comes, whose
 view_ready lists each item's triangles (`parts`, from `display_arrays`); meshes, slices and surface colours are
@@ -644,7 +744,13 @@ browser (`groupSpec`). While a group is open, `nodes`/`edges` are its inner grap
 own are in `editing.outer`; `recipe()` composes both. Edits bump `graphVersion`, which triggers a
 debounced (450 ms) preview run. Refine (`store.refine`; it and the quality are kept in localStorage):
 a change previews at Draft, and when a preview is done and `graphVersion` is still its `tag.version`,
-the store sets `run.next` and `App.useRefine` runs it after `REFINE_DELAY`, up to the chosen quality.
+the store sets `run.next` and `App.useRefine` runs it, up to the chosen quality, after a pause: after a
+preview done within `QUICK_RUN` (2.5 s) once the graph has been quiet for `REFINE_DELAY` (800 ms) counted from the
+last change (at least `SHORT_PAUSE`, 150 ms), after a slower one `REFINE_DELAY`; never while `store.valueDrag`
+(`startValueDrag`: scrubbed labels, PortInputs sliders, the Settings and slice sliders, from press to release).
+View timing (the 3D view's View ▸ View timing, or localStorage `viewTiming` = "1"; `viewTiming.tsx`): a line per
+received view in the top-left overlay, always pushed to `window.__viewTiming` (last 200): the engine's timing,
+download_ms, bytes, parse_ms, normals_ms, frame_ms (geometry made -> first `onAfterRender`), total_ms, skipped.
 Then, while the camera rests and nothing runs, `Viewport.DetailProbe` finds each body's part on screen
 (front-facing sampled triangles inside the frustum, `onScreen`) and the voxel that spans
 `PX_PER_VOXEL` pixels there, and asks for a detail when that is `DETAIL_GAIN` finer than the view;
@@ -686,8 +792,14 @@ See-through, Lines (hidden lines removed), Wire; tangent edges shown / dimmed / 
 Right-click menus in the 3D view (plan and status in docs/VIEWPORT_MENU_PLAN.md): a DOM `contextmenu`
 on the canvas (only when the right button moved ≤ 5 px, since right-drag pans) raycasts the meshes
 tagged `userData.menu = {view}` itself (`MenuProbe`; not R3F events, so a left-drag never raycasts
-big bodies), building their search tree on the first right-click (`ensureBoundsTree`, always
-`indirect: true`: the default build reorders triangles and breaks CAD face numbers), skipping hits
+big bodies). Their search trees are built in a Web Worker as soon as a body is drawn (`bvhBuild.ts`,
+`bvh.worker.ts`: ViewObject and CadBody, once its look is there, call `scheduleBoundsTree` with the whole index, so
+items hidden by `hideRanges` are found once shown; copies in, `MeshBVH.serialize` roots and the indirect buffer
+back, `deserialize(setIndex: false)`; one at a time, newest first, at idle; dropped and the worker terminated when
+the body goes; the worker let go after 5 s idle; three-mesh-bvh's own `GenerateMeshBVHWorker` cannot be used: it
+transfers the geometry's buffers, which are views into the one download buffer). `ensureBoundsTree` (always
+`indirect: true`: the default build reorders triangles and breaks CAD face numbers) builds on the main thread when
+the tree is not there yet, as PickableView always does. Hits are skipped where
 the section plane cuts away. `viewActions.ts` builds the entries (`faceMenu`, `bodyMenu`,
 `pickingMenu`, `markerMenu`) from the store alone; every action is one `store.applyEdit(GraphEdit)`:
 one undo step, nodes placed next to their anchor without overlapping (`freeSpot`), changed nodes
@@ -837,10 +949,17 @@ UI data lives in the same file. `lamp_noise.json` is the user's current main des
   come from `grid.coarser(factor)` with a factor dividing `tiles.ALIGN` (12), and a field that
   reads neighbouring samples must declare its reach (like `smoothen`'s `blur`) so `fields.halo`
   counts it. `tests/test_tiles.py` checks block values against the whole grid bit for bit.
+- A CPU stage (`stages.cpu_stage`) must be a module-level function in a lean module (meshing, dualcontour,
+  blockmesh, or one importing neither the graph nor fields/sdf/cad_import), take numpy arrays and plain data only
+  (no CuPy, no Field), report through `stages.report` and take `check=None` (Stop skips queued stages, it cannot
+  stop a running one). Keep `engine/__init__.py` free of imports: importing the node library cost every CPU worker
+  0.2 GB.
 - Memory per worker scales with the CAD meshes a field reads (each worker builds its own
-  search structures): `tiles.worker_memory` counts them so big parts get fewer workers. Wrap big
-  arrays a field captures in `shared.Shared` instead of putting them in task payloads, and don't
-  queue all payloads at once (the pool feeds 2 per worker; terminate drains the queues).
+  search tree; a big mesh's arrays and normals are mapped, one copy for all): `tiles.worker_memory`
+  counts them so big parts get fewer workers. Wrap big arrays a field captures in `shared.Shared`
+  instead of putting them in task payloads, work that every process would derive from them the same
+  way in `shared.prepared`, and don't queue all payloads at once (the pool feeds 2 per worker;
+  terminate drains the queues).
 - Never combine a single big body (the lamp center) with a per-body list in implicit nodes:
   every list item then meshes the big body's whole box (hours). Mesh them separately and join
   them with `Merge Meshes`. Bodies only fuse where they overlap; touching is not enough.

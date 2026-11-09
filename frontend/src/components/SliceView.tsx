@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
 import type { ThreeEvent } from '@react-three/fiber'
-import { isFieldNode, useStore } from '../store'
+import { isFieldNode, startValueDrag, useStore } from '../store'
 import type { Axis, ColorMap, Paint, SliceView } from '../types'
 
 const STOPS: Record<ColorMap, string[]> = {
@@ -177,6 +177,7 @@ export function SlicePanel({ hover }: { hover: HoverValue | null }) {
         <div className="slice-row">
           <span className="slice-label">{settings.axis} =</span>
           <input type="range" min={lo} max={hi} step={(hi - lo) / 400 || 0.1} value={position}
+            onPointerDown={(e) => { if (e.button === 0) startValueDrag() }}
             onChange={(e) => setSettings({ position: Number(e.target.value) })} />
           <span className="slice-value">{position.toFixed(1)} mm</span>
         </div>

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy import ndimage
 
+from .. import trace
 from ..backend import to_host, xp_of
 from ..fields import Field, _digest
 from ..shared import Shared
@@ -120,12 +121,14 @@ def solve_cases(model, material, xp=np, dtype=np.float32, tol=TOLERANCE, callbac
         direct_fill = (max(DIRECT_FILL, DIRECT_FILL_PER_ELEMENT * scale.size) if xp is np else
                        DIRECT_FILL_PER_ELEMENT_GPU * scale.size)
     for precision in (dtype, np.float64):   # (float32 rounding can stop a slender part's multigrid: see Optimizer._solve)
-        H = Hierarchy(scale, stiffness(material.nu), model.fixed, model.grid.coarsenings, xp, precision,
-                      direct_fill=direct_fill)
+        with trace.span("fea setup", xp=xp, elements=int(scale.size)):
+            H = Hierarchy(scale, stiffness(material.nu), model.fixed, model.grid.coarsenings, xp, precision,
+                          direct_fill=direct_fill)
         us, its, res = [], 0, 0.0
         try:
             for k in (range(len(model.forces)) if cases is None else cases):
-                u, n, r = H.solve(model.forces[k], tol=tol, callback=callback)
+                with trace.span("fea solve", xp=xp, case=k):
+                    u, n, r = H.solve(model.forces[k], tol=tol, callback=callback)
                 us.append(u)
                 its, res = its + n, max(res, float(r))
             return us, its, res

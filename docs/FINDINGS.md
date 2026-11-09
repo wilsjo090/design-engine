@@ -2850,3 +2850,54 @@ table in docs/DUAL_CONTOURING_PLAN.md. From the same samples as marching cubes:
   the GPU (one fused kernel: 50 of ~80 ms per Final block of the key cabinet is the wave noise);
   remove loose specks without fusing (the key cabinet's texture pinches off 4); release idle
   workers' GPU memory when the card runs short; decide on the rim tube (a Face Mask can exclude it).
+
+## GPU and CPU together, measured (2026-11-09)
+
+Plan and status: docs/ROADMAP.md, "GPU and CPU together" and "6. Progress". Measured with the timeline trace
+(`tools/trace_run.py`, `start.bat --trace`) and in a test editor with its own cache.
+
+- **Where the time goes.** lamp_noise Final preview: the petals ~0.65 s each in a worker, of which decimation ~0.40 s
+  (CPU), the field ~0.18 s (GPU-labelled, but the GPU averages 23-26% use: host-side work and launches), marching
+  cubes ~0.03 s. hex_studs export at Final: 944 blocks, field ~40 ms, marching cubes ~19 ms (CPU), reduction ~56 ms
+  (CPU); then 6.4 s on one core in the main process (seams 5.0 s, probe 1.4 s). hex_studs' Final preview is one grid
+  in the main process whose 1.4 s "GPU" field step leaves the card near idle.
+- **Worker garbage collection** walked ~350k module objects per collect: ~150 ms each, 10.9 s of worker time per lamp
+  Final. `gc.freeze()` after a worker's imports: 8.5 ms (wall time unchanged: the collects mostly ran while workers
+  waited).
+- **Two-stage maps** (CLAUDE.md): the hand-over costs ~4-5 ms per 3.3 MB petal on each side through shared memory (the
+  pipe alone was 58 ms per 21 MB block task and serialised the CPU workers). Headless, 4 GPU workers: lamp petals
+  15.4 -> 10.4 s. In the editor, 8 GPU workers: the free-RAM cap first allowed only 2 CPU workers, which became the
+  bottleneck (21.9 s, GPU workers 80% idle) until GPU workers ran stages themselves while the queue was full; then
+  12.1 s against 12.7 s without the split, peak 10.6 against 9.8 GB. The 16-core CPU is full at ~14 working
+  processes: per-stage times grow with the process count (decimation 117 ms alone, ~260 ms with 8 at once).
+- **Topology's live view and checkpoints** at fine detail: 104 ms every 3 iterations and 48 ms every 5, under 3% of
+  ~1.7 s iterations; a thread beside the optimizer measured no gain and was dropped.
+- **GPU mesh preparation** (`sdf_gpu._GpuMesh`: split to 2 mm, cracks, normals): 0.95 s for the key cabinet, 0.42 s
+  for the vent case, 0.02 s per petal, once per worker and mesh: only first runs would gain.
+- **Small arrays and the SSD cache**: see CLAUDE.md, Caching (`DiskCache.MIN_BYTES`): the lamp's edit -> Draft on
+  screen went from ~7 s to 1.6 s in the editor.
+- **Offset Faces on the GPU** agree with the CPU to 0.0006 mm within the part's band; beyond it the body's own
+  distances (interpolated from a coarse pass) differ by up to 0.46 mm between GPU and CPU, with or without Offset Faces.
+- **Python 3.12's `time.time()`** on Windows steps 1-15 ms; `perf_counter` (QPC) is the same clock in every process.
+
+## Shared CAD arrays, measured (2026-11-09)
+
+- Every worker built a big part's search structures alone: the CPU's normals and cracks (~96 B per triangle
+  kept, ~240 B while finding the cracks), the GPU's 2 mm split, cracks and normals (~290 B per triangle while
+  building), plus a private copy of the vertices and triangles. Now the arrays are memory-mapped from the
+  shared folder and the derived ones prepared once (`shared.prepared`); only libigl's tree (~195 B per
+  triangle) and Warp's BVH stay per worker (neither can be shared: libigl's is not an array, Warp has no
+  IPC on Windows).
+- 1.31M-triangle sphere, 6 CPU workers: private 0.48 -> 0.32 GB each, PC available RAM dropped 2.70 -> 1.95
+  GB; 4 GPU workers: start-up peak 3.45 -> 1.33 GB, held 0.26 -> 0.21 GB each. Later starts (the files there)
+  4.4 -> 1.8 s (CPU), 3.5 -> 0.8 s (GPU).
+- On real recipes the gain is small, since only parts from 100k triangles prepare: hex_studs (key cabinet,
+  109k) export meshing 22.5 -> 20.9 s, the lamp (petals ~6k, a coarse center) unchanged. It matters for fine
+  imports (a 2.55M-triangle import is in the user's STEP cache).
+- Memory-mapped reads are slower when an array is read whole at once (page faults instead of one read):
+  with the file in Windows' cache 1 MB 0.98 against 0.43 ms, 4 MB 2.6 / 1.4 ms, 32 MB 17 / 14 ms, 128 MB
+  74 / 60 ms. Fine for a CAD mesh read once per worker; the SSD cache maps only hits from 32 MB.
+- RSS counts mapped pages (and DLLs) in every process: with 8 workers mapping one part's 0.3 GB the old meter
+  would have counted 2.4 GB. The meter now sums private working sets (`PROCESS_MEMORY_COUNTERS_EX2`).
+- libigl's angle-weighted vertex normals and edge normals are deterministic (same bits on every call); a few
+  are NaN on the test part's degenerate triangles, so compare them with `equal_nan`.

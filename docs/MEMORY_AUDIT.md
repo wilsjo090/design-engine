@@ -59,8 +59,8 @@ P2: medium effort.
 
 | # | Change | Saves | Where |
 |---|---|---|---|
-| 11 | SSD tier and `Shared` arrays memory-mapped (`np.load(mmap_mode='r')`); watchdog on private bytes or USS instead of RSS | private copies of every cache hit; 8 workers share one copy of a part's V/F | [S2](#s2), [C6](#c6) |
-| 12 | Precompute a CAD mesh's normals and crack data once next to its `Shared` file, mapped by all workers | ~40% of each worker's per-triangle memory, the build peak in every worker | [C6](#c6), [C8](#c8) |
+| 11 ✅ | SSD tier and `Shared` arrays memory-mapped (`np.load(mmap_mode='r')`); watchdog on private bytes or USS instead of RSS | private copies of every cache hit; 8 workers share one copy of a part's V/F | [S2](#s2), [C6](#c6) |
+| 12 ✅ | Precompute a CAD mesh's normals and crack data once next to its `Shared` file, mapped by all workers | ~40% of each worker's per-triangle memory, the build peak in every worker | [C6](#c6), [C8](#c8) |
 | 13 | `tiles.stitch` with int32 faces filled in place, one `remove_unreferenced_vertices`, no `merge_vertices` after plain marching cubes; estimate per triangle | stitch peak ~200 -> ~100 B/tri (1.6 GB on the 13.8M center) | [F3](#f3) |
 | 14 | Browser: build the pick tree only for bodies the ray reaches; free CPU normals/colours after upload | ~1.5 GB transient for the lamp on the first right-click; 90-210 MB per big view | [V2](#v2), [V3](#v3) |
 | 15 | FEA support/load sampling in chunks of ~200k points | up to 1.2 GB per support | [T2](#t2) |
@@ -484,3 +484,26 @@ skipped, the same `testlamp2.json` failure):
   `::test_the_watchdog_stops_runs_on_commit_not_on_a_full_ram`, the idle editor on low RAM or commit.
 - The 0.05 mm gyroid export that the old limit stopped at 7.4 GB (4 GB free) now finishes: 126 s, 6.2 GB STL,
   engine 13 GB, commit at most 69.7 of 77.8 GB, free RAM under 0.3 GB for at most 2.5 s.
+
+2026-11-09, P2 11 and 12 (CPU suite 581 passed, 42 skipped, the same `test_recipes_are_valid` failure on the
+user's own recipes; GPU 42 passed):
+
+11. `cache.read_npy` memory-maps `.npy` files (read-only, a plain ndarray view): `Shared` arrays from 1 MB
+    (`shared._load`), `DiskCache` hits from `DiskCache.MAP_BYTES` (32 MB; mapped arrays read whole cost more the
+    first time, page faults: 1 MB 0.98 against 0.43 ms, 32 MB 17 / 14 ms, 128 MB 74 / 60 ms with the file in
+    Windows' cache, so small hits are read). `Evaluator.memory_in_use` sums `cache.resident_memory`, each
+    process's private working set (`PROCESS_MEMORY_COUNTERS_EX2`), instead of RSS, which counts mapped files in
+    every process: in the test editor's hex_studs export the meter peaked at 4.4 GB, the RSS sum at 6.1 GB.
+    Tests: `test_shared.py`.
+12. `shared.prepared(kind, key, build)`: arrays worked out from shared data, built by the first process that
+    needs them (a lock file holding its pid; the others wait for its files, a dead holder's lock is taken
+    over), written as `.npy` files plus a list written last, mapped by every process. Meshes from
+    `sdf.PREPARE_TRIANGLES` (100k) with a key: `sdf.query_arrays` (normals, edge map, cracks; MeshQuery keeps
+    only its igl tree of its own) and `sdf_gpu.gpu_arrays` (the 2 mm split, crack flags, float32 normals; the
+    GPU worker uploads and keeps only `parent`). Results identical (`test_shared.py`, `test_gpu.py
+    ::test_gpu_mesh_from_prepared_arrays_is_the_same`; hex_studs' exported STL the same SHA-256). Measured,
+    1.31M-triangle sphere: 6 CPU workers private 0.48 -> 0.32 GB each (sum 2.86 -> 1.89 GB, commit 4.07 ->
+    3.10 GB), a worker's build 4.4 -> 3.3 s (first) / 1.8 s (prepared); 4 GPU workers' start-up peak 3.45 ->
+    1.33 GB, build 3.5 -> 2.7 / 0.8 s. `tiles.MESH_BYTES` 500 -> 370. hex_studs export (key cabinet, 109k
+    triangles): meshing 22.5 -> 20.9 s, peak 4.38 -> 4.22 GB. The lamp is unchanged (its parts are under 100k
+    triangles and its arrays under 1 MB).

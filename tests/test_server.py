@@ -1,5 +1,6 @@
 import copy
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,12 +31,46 @@ def run_and_collect(client, ws, body):
             return events
 
 
-def decode(blob):
-    nv, nf = np.frombuffer(blob[:8], dtype=np.uint32)
+def decode(blob, normals=False):
+    """A packed view's vertices and triangles (and with `normals` its normals, None when it has none) read as the
+    editor reads them (api.parseMesh): by the counts, the field's normals (int16 x 3) when the rest is 6 B a vertex."""
+    nv, nf = (int(x) for x in np.frombuffer(blob[:8], dtype=np.uint32))
     verts = np.frombuffer(blob[8:8 + nv * 12], dtype=np.float32).reshape(-1, 3)
-    faces = np.frombuffer(blob[8 + nv * 12:], dtype=np.uint32).reshape(-1, 3)
-    assert len(faces) == nf and faces.max() < nv
-    return verts, faces
+    faces = np.frombuffer(blob[8 + nv * 12:8 + nv * 12 + nf * 12], dtype=np.uint32).reshape(-1, 3)
+    rest = blob[8 + nv * 12 + nf * 12:]
+    assert len(faces) == nf and faces.max() < nv and len(rest) in (0, nv * 6)
+    found = np.frombuffer(rest, dtype=np.int16).reshape(-1, 3) / 32767.0 if rest else None
+    return (verts, faces, found) if normals else (verts, faces)
+
+
+def outward(verts, faces, normals):
+    """Share of vertices whose normal agrees with the triangles' own (area-weighted, as computeVertexNormals)."""
+    V = verts.astype(np.float64)
+    cross = np.cross(V[faces[:, 1]] - V[faces[:, 0]], V[faces[:, 2]] - V[faces[:, 0]])
+    acc = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(acc, faces[:, k], cross)
+    return float(((acc * normals).sum(axis=1) > 0).mean())
+
+
+def test_views_pack_the_field_normals_after_the_triangles():
+    import trimesh
+    from engine.meshing import FIELD_NORMAL
+    from engine.server import pack_meshes, packed_normals, unpack_meshes, unpack_normals
+    box = trimesh.creation.box((2, 3, 4))
+    plain, nv, nf = pack_meshes(box)
+    assert packed_normals(plain) is None and unpack_normals(plain) is None and len(plain) == 8 + 12 * (nv + nf)
+    n = np.rint(box.vertices / np.linalg.norm(box.vertices, axis=1, keepdims=True) * 32767).astype(np.int16)
+    with_normals = trimesh.Trimesh(box.vertices, box.faces, process=False, vertex_attributes={FIELD_NORMAL: n})
+    blob, nv2, nf2, counts = pack_meshes([with_normals, with_normals], counts=True)
+    assert packed_normals(blob) == "i16x3" and (nv2, nf2, counts) == (2 * nv, 2 * nf, [nf, nf])
+    V, F = unpack_meshes(blob)   # (what reads only positions and triangles, an older editor too, is unchanged)
+    assert np.array_equal(V[:nv], box.vertices.astype(np.float32)) and F.max() == 2 * nv - 1
+    assert np.array_equal(unpack_normals(blob), np.vstack([n, n]))
+    _, _, decoded = decode(blob, normals=True)
+    assert np.allclose(decoded[:nv], n / 32767.0)
+    # all or nothing: a list where one item has none sends none (the editor works them out)
+    assert packed_normals(pack_meshes([with_normals, box])[0]) is None
 
 
 def test_build_run_graph_applies_quality_and_views():
@@ -158,7 +193,9 @@ def test_views_are_sent_as_soon_as_their_node_is_done():
         events = run_and_collect(client, ws, {"graph": recipe(), "mode": "preview", "quality": "draft",
                                               "visible": ["part_0", "mesh"]})
         at = lambda kind, node: next(i for i, e in enumerate(events) if e["type"] == kind and e.get("node") == node)
-        assert at("node_done", "part_0") < at("view_ready", "part_0") < at("node_start", "mesh")
+        # (packed beside the run: the nodes after part_0 may start before its view is out, see
+        # test_a_slow_view_does_not_hold_up_the_next_node)
+        assert at("node_done", "part_0") < at("view_ready", "part_0") < at("node_done", "mesh")
         assert at("node_done", "mesh") < at("view_ready", "mesh")
         assert not any(e["type"] == "phase" for e in events)  # (no steps left after the nodes)
         assert next(e for e in events if e["type"] == "view_ready")["parts"] is None   # not a list
@@ -170,14 +207,22 @@ def test_a_list_view_is_sent_item_by_item_while_it_is_made():
                                                               "spacing": "60, 0, 0"}}
     g["nodes"]["implicit_body_6"]["inputs"]["cad"] = {"link": "copies.body"}
     with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
-        events = run_and_collect(client, ws, {"graph": g, "mode": "preview", "quality": "draft", "visible": ["mesh"]})
-        parts = sorted((e for e in events if e["type"] == "view_part"), key=lambda e: e["index"])
-        view = next(e for e in events if e["type"] == "view_ready")
+        events = run_and_collect(client, ws, {"graph": g, "mode": "preview", "quality": "draft",
+                                              "visible": ["mesh", "implicit_body_6"]})
+        parts = sorted((e for e in events if e["type"] == "view_part" and e["node"] == "mesh"), key=lambda e: e["index"])
+        view = next(e for e in events if e["type"] == "view_ready" and e["node"] == "mesh")
         assert [e["index"] for e in parts] == [0, 1, 2] and all(e["total"] == 3 and e["node"] == "mesh" for e in parts)
         assert max(e["version"] for e in parts) < view["version"]   # the whole view comes after them, and replaces them
         # each item's triangles, one after the other: the editor draws a later run's pieces instead of them
         assert view["parts"] == [e["faces"] for e in parts] and sum(view["parts"]) == view["faces"]
         assert client.get("/api/view/part:0:mesh").status_code == 404   # dropped once the whole view is there
+        # the bodies' view (mesh.view): its pieces carry the field's normals, and the whole view each item's in turn
+        bodies = [e for e in events if e["type"] == "view_part" and e["node"] == "implicit_body_6"]
+        whole = next(e for e in events if e["type"] == "view_ready" and e["node"] == "implicit_body_6")
+        assert len(bodies) == 3 and all(e["normals"] == "i16x3" for e in bodies) and whole["normals"] == "i16x3"
+        assert parts[0]["normals"] is None   # (a Mesh from Implicit Body's items: none)
+        verts, faces, normals = decode(client.get("/api/view/implicit_body_6").content, normals=True)
+        assert len(normals) == len(verts) and outward(verts, faces, normals) > 0.999
 
 
 def test_a_detail_shows_part_of_a_body_finer_than_its_view():
@@ -216,8 +261,9 @@ def test_a_detail_shows_part_of_a_body_finer_than_its_view():
         done = next(e for e in got if e["type"] == "detail_ready")
         assert done["node"] == "implicit_body_0" and done["view_version"] == body["version"]
         assert 0.1 <= done["voxel"] < body["voxel"]
-        verts, faces = decode(client.get("/api/view/detail:implicit_body_0").content)
+        verts, faces, normals = decode(client.get("/api/view/detail:implicit_body_0").content, normals=True)
         assert len(faces) == done["faces"] > 1000
+        assert done["normals"] == "i16x3" and outward(verts, faces, normals) > 0.99   # (open: its rim's are lopsided)
         margin = 4 * done["voxel"]  # (triangles reaching into the box from up to 2 voxels outside)
         assert (verts >= np.array(box_lo) - margin).all() and (verts <= np.array(box_hi) + margin).all()
         edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
@@ -279,9 +325,15 @@ def test_preview_run_streams_events_and_serves_mesh():
         assert set(ready) == {"mesh", "implicit_body_6"}
         assert any(e["type"] == "node_done" and e["node"] == "mesh" for e in events)
 
-        verts, faces = decode(client.get("/api/view/mesh").content)
+        verts, faces, normals = decode(client.get("/api/view/mesh").content, normals=True)
         assert len(faces) == ready["mesh"]["faces"] > 1000
         assert verts[:, 0].min() < 0 and verts[:, 0].max() > 60      # the part plus its wave
+        # a Mesh from Implicit Body's view is its mesh as it is (no normals: the editor works them out); an implicit
+        # body's view carries the field's normals, unit length and out of the body
+        assert normals is None and ready["mesh"]["normals"] is None
+        verts, faces, normals = decode(client.get("/api/view/implicit_body_6").content, normals=True)
+        assert ready["implicit_body_6"]["normals"] == "i16x3" and len(normals) == len(verts)
+        assert np.abs(np.linalg.norm(normals, axis=1) - 1).max() < 1e-4 and outward(verts, faces, normals) > 0.999
 
         # Second identical run: everything cached
         events = run_and_collect(client, ws, {"graph": recipe(), "mode": "preview", "quality": "draft",
@@ -903,6 +955,96 @@ def test_a_stop_as_a_run_starts_is_kept_and_does_not_reach_the_next_run():
         assert [e["ok"] for e in hub.events if e["type"] == "run_done"] == [False, True]
     finally:
         session.evaluator.close()
+
+
+def slow_views(monkeypatch, seconds):
+    """Packing a whole view (not a list item's piece) takes `seconds` longer."""
+    from engine import server
+    real = server.pack_meshes
+
+    def slow(value, counts=False):
+        if counts:
+            time.sleep(seconds)
+        return real(value, counts)
+
+    monkeypatch.setattr(server, "pack_meshes", slow)
+
+
+def test_a_slow_view_does_not_hold_up_the_next_node(monkeypatch):
+    """Views are packed beside the run (Session._views_out): packing a Final view (0.1-0.2 s) held up every
+    node after it. They still go out in the order their nodes were done, with versions in that order, all
+    before run_done, and say how long their node and their packing took (the editor's view timing)."""
+    slow_views(monkeypatch, 0.6)
+    hub = Hub()
+    session = Session(hub)
+    try:
+        session.start(recipe(), "preview", "draft", ["part_0", "mesh"])
+        session.thread.join(120)
+    finally:
+        session.evaluator.close()
+    events = hub.events
+    at = lambda kind, node: next(i for i, e in enumerate(events) if e["type"] == kind and e.get("node") == node)
+    assert events[-1]["type"] == "run_done" and events[-1]["ok"], events[-1]
+    assert at("node_done", "part_0") < at("node_start", "mesh") < at("view_ready", "part_0")   # it went on at once
+    ready = [e for e in events if e["type"] == "view_ready"]
+    assert [e["node"] for e in ready] == ["part_0", "mesh"] and ready[0]["version"] < ready[1]["version"]
+    assert at("node_done", "mesh") < at("view_ready", "mesh")
+    assert {n: v for n, (v, _) in session.views.items()} == {e["node"]: e["version"] for e in ready}
+    timing = ready[1]["timing"]
+    assert timing["pack_ms"] >= 500 and timing["bytes"] == len(session.views["mesh"][1])
+    assert timing["node_s"] > 0 and timing["cached"] is False and timing["run_s"] > 0
+    assert timing["wait_ms"] >= 0
+
+
+def test_a_superseded_run_sends_its_views_before_it_ends_and_none_after(monkeypatch):
+    """A newer preview stops the run (Session.start -> cancel): the views of the nodes it finished still go out,
+    before its run_done, and none after the newer run has started."""
+    import threading
+    slow_views(monkeypatch, 0.6)
+    hub = Hub()
+    part_done = threading.Event()
+    hub.hook = lambda e: part_done.set() if e["type"] == "node_done" and e.get("node") == "part_0" else None
+    session = Session(hub)
+    try:
+        first = session.start(recipe(), "preview", "draft", ["part_0", "mesh"])
+        assert part_done.wait(60)
+        second = session.start(recipe(), "preview", "draft", ["part_0"])   # its view is being packed now
+        session.thread.join(120)
+    finally:
+        session.evaluator.close()
+    events = hub.events
+    start = next(i for i, e in enumerate(events) if e["type"] == "run_start" and e["run"] == second)
+    assert all(e.get("run") != first for e in events[start:])
+    old = [e for e in events if e.get("run") == first]
+    assert old[-1]["type"] == "run_done"
+    assert [e["node"] for e in old if e["type"] == "view_ready"][:1] == ["part_0"]   # (and mesh, if it got there)
+    assert events[-1]["type"] == "run_done" and events[-1]["run"] == second and events[-1]["ok"]
+
+
+def test_a_view_the_stopped_run_sent_is_not_kept_by_the_next_one(monkeypatch):
+    """The editor says which views it shows (`have`) when it asks for a preview; the run that preview stops may
+    still send a newer view of one of them as it ends (views are packed beside the run). The new run must not
+    keep that node's view as the editor described it, but make it again."""
+    import threading
+    hub = Hub()
+    session = Session(hub)
+    try:
+        session.start(recipe(), "preview", "draft", ["part_0"])
+        session.thread.join(60)
+        shown = next(e for e in hub.events if e["type"] == "view_ready" and e["node"] == "part_0")
+        have = {"part_0": {"key": shown["key"], "level": shown["level"], "version": shown["version"]}}
+        slow_views(monkeypatch, 0.6)
+        part_done = threading.Event()
+        hub.hook = lambda e: part_done.set() if e["type"] == "node_done" and e.get("node") == "part_0" else None
+        session.start(recipe(), "preview", "draft", ["part_0", "mesh"])        # (without `have`: part_0 is sent again)
+        assert part_done.wait(60)
+        newest = session.start(recipe(), "preview", "draft", ["part_0", "mesh"], have=have)
+        session.thread.join(120)
+    finally:
+        session.evaluator.close()
+    ready = [e for e in hub.events if e["type"] == "view_ready" and e["node"] == "part_0"]
+    assert len(ready) == 3 and ready[-1]["run"] == newest                     # made again, not kept
+    assert session.views["part_0"][0] == ready[-1]["version"]
 
 
 def test_a_second_optimize_of_a_node_is_not_queued(monkeypatch):

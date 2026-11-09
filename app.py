@@ -68,8 +68,12 @@ def main():
     ap.add_argument("--no-browser", action="store_true", help="don't open the browser")
     ap.add_argument("--no-build", action="store_true", help="never rebuild the editor UI")
     ap.add_argument("--clear-cache", action="store_true", help="empty the SSD cache of computed fields and exit")
+    ap.add_argument("--trace", action="store_true",
+                    help="write a timeline of every run (DESIGN_ENGINE_TRACE=1; see tools/trace_report.py)")
     args = ap.parse_args()
     url = f"http://127.0.0.1:{args.port}"
+    if args.trace:  # (before the engine is imported: it reads this once; worker processes inherit it)
+        os.environ["DESIGN_ENGINE_TRACE"] = "1"
 
     if args.clear_cache:
         from engine.cache import DiskCache
@@ -100,6 +104,9 @@ def main():
     if not args.no_browser:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     print(f"Design Engine running at {url}")
+    from engine import trace
+    if trace.ENABLED:
+        print(f"Tracing every run into {trace.trace_dir()} (python tools/trace_report.py <run folder>)")
     print("Close this window or press Ctrl+C to stop it.")
     uvicorn.run(create_app(), host="127.0.0.1", port=args.port, log_level="warning")
     return 0

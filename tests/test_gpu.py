@@ -80,11 +80,11 @@ def test_gpu_out_of_memory_falls_back_to_cpu(gpu, cad_part, monkeypatch):
     real = nodes._mesh_on
     used = []
 
-    def flaky(body, grid, xp, cut_hint, method="marching cubes"):
+    def flaky(body, grid, xp, method="marching cubes", **more):
         used.append(xp.__name__)
         if xp is not np:
             raise gpu.cuda.memory.OutOfMemoryError(1 << 30, 0)   # as if another program took it
-        return real(body, grid, xp, cut_hint, method)
+        return real(body, grid, xp, method, **more)
     monkeypatch.setattr(nodes, "_mesh_on", flaky)
     mesh = nodes._mesh(F.body_from_mesh(cad_part, 1.5), cad_part.bounds, 0.3, 1.5, 1.0)  # 2M voxels: GPU
     assert used == ["cupy", "numpy"] and mesh.is_watertight
@@ -119,6 +119,31 @@ def test_gpu_marching_cubes_matches_cpu(gpu, cad_part):
     assert on_gpu.is_watertight and on_gpu.is_winding_consistent
     assert abs(on_gpu.volume - cpu.volume) < 1e-5 * cpu.volume
     assert np.abs(np.sort(on_gpu.vertices, axis=0) - np.sort(cpu.vertices, axis=0)).max() < 1e-4
+
+
+def test_gpu_field_normals_match_cpu(gpu, cad_part):
+    # a view's normals are worked out on the card beside the samples (only they come back): the CPU's
+    from scipy.spatial import cKDTree
+    from engine.meshing import FIELD_NORMAL, field_to_mesh
+    body = lamp_like_body(cad_part)
+    grid = Grid.from_bounds(cad_part.bounds, 0.2, 1.5)
+    values = F.Context(grid).eval_full(body)
+    cpu = field_to_mesh(values, grid, normals=True)
+    on_gpu = field_to_mesh(gpu.asarray(values), grid, normals=True)
+    dist, nearest = cKDTree(cpu.vertices).query(on_gpu.vertices)
+    assert dist.max() < 1e-4 and len(on_gpu.vertices) == len(cpu.vertices)
+    a = on_gpu.vertex_attributes[FIELD_NORMAL].astype(np.int32)
+    b = cpu.vertex_attributes[FIELD_NORMAL][nearest].astype(np.int32)
+    assert np.abs(a - b).max() <= 3   # (int16 steps of 3e-5: Warp's float32 positions)
+    # and the view node on the GPU (its own samples, float32 on the card) points the same way as on the CPU
+    from engine.graph.nodes import _mesh
+    view = _mesh(body, cad_part.bounds, 0.3, 1.5, 1.0, normals=True)
+    backend.set_gpu(False)
+    reference = _mesh(body, cad_part.bounds, 0.3, 1.5, 1.0, normals=True)
+    dist, nearest = cKDTree(reference.vertices).query(view.vertices)
+    n, m = (x.vertex_attributes[FIELD_NORMAL] / 32767.0 for x in (view, reference))
+    agree = (n * m[nearest]).sum(axis=1)[dist < 1e-3]
+    assert len(agree) > 0.9 * len(n) and np.median(agree) > 0.9999 and agree.min() > 0.9
 
 
 def test_gpu_blocks_stitch_into_a_closed_mesh(gpu, cad_part, monkeypatch, tmp_path):
@@ -465,6 +490,31 @@ def test_gpu_meshes_are_bounded_by_size(gpu, monkeypatch):
     assert list(sdf_gpu._MESHES) == ["big"]
 
 
+def test_gpu_mesh_from_prepared_arrays_is_the_same(gpu, cad_part, monkeypatch, tmp_path):
+    # a big mesh is split and analysed once for all processes (shared.prepared) and mapped by each: the
+    # distances and the nearest triangles must be those of a mesh prepared in the process itself
+    import pickle
+    from collections import OrderedDict
+
+    from engine import sdf_gpu, shared
+    from engine.facemask import nearest_on_grid
+    monkeypatch.setenv("DESIGN_ENGINE_CACHE", str(tmp_path))
+    monkeypatch.setattr(sdf_gpu, "PREPARE_TRIANGLES", 0)
+    monkeypatch.setattr(sdf_gpu, "_MESHES", OrderedDict())
+    V = shared.Shared(np.ascontiguousarray(cad_part.vertices, dtype=np.float64), key="part")
+    F = shared.Shared(np.ascontiguousarray(cad_part.faces, dtype=np.int64), key="part")
+    V, F = pickle.loads(pickle.dumps(V)), pickle.loads(pickle.dumps(F))
+    grid = Grid.from_bounds(cad_part.bounds, 0.25, 1.5)
+    from engine.sdf_gpu import mesh_to_sdf_gpu
+    prepared = backend.to_host(mesh_to_sdf_gpu(V, F, grid, 1.5, key="part"))
+    assert list((tmp_path / shared.FOLDER).glob("*.json")) and sdf_gpu._MESHES["part"].has_cracks
+    plain = backend.to_host(mesh_to_sdf_gpu(cad_part.vertices, cad_part.faces, grid, 1.5))
+    assert np.array_equal(prepared, plain)
+    a = nearest_on_grid(V, F, grid, 1.0, key="part", gpu=True)
+    b = nearest_on_grid(cad_part.vertices, cad_part.faces, grid, 1.0, gpu=True)
+    assert all(np.array_equal(x, y) for x, y in zip(a, b)) and a[1].dtype == np.int64
+
+
 @pytest.mark.parametrize("radius", [2, 6])   # the volume kernel convolves, or the filter goes by FFT
 def test_gpu_fused_oc_update_matches_cupy(gpu, monkeypatch, radius):
     # the optimality criteria's root finding in fused kernels (gpu.Volume), with and without Max thickness
@@ -541,3 +591,83 @@ def test_gpu_hole_depths_match_cpu(gpu, cad_part):
     cpu = place()
     assert len(cpu) == len(on_gpu) > 50
     assert np.allclose(on_gpu.depth, cpu.depth, atol=1e-4) and np.allclose(on_gpu.outer, cpu.outer, atol=1e-4)
+
+
+def test_gpu_offset_faces_match_cpu(gpu, cad_part):
+    # the top (fillets round it: a step with a foot; the 16 mm hole in it: walls running on along its
+    # wall) raised and sunk: the faces' closest points come from the Warp kernel (float32) on the GPU
+    from engine import offset_faces as OF
+    patch = OF.Patch(cad_part, cad_part.face_attributes["cad_face"], [10])
+    body = F.body_from_mesh(cad_part, 3.0)
+    grid = Grid.from_bounds(cad_part.bounds, 0.3, 2.0)
+    for d, kw in ((1.5, dict(edge="chamfer", edge_size=0.4, foot="smooth", foot_size=0.6)),
+                  (-1.0, dict(edge="round", edge_size=0.4, foot="round", foot_size=0.4))):
+        caps = OF.walls(cad_part, patch, max(d, 0.0), max(-d, 0.0))
+        field = OF.offset_faces(body, patch, d, d, d, caps=caps, **kw)
+        cpu = F.Context(grid).eval_full(field)
+        on_gpu = backend.to_host(F.Context(grid, xp=gpu).eval_full(field))
+        assert (np.sign(on_gpu) != np.sign(cpu))[np.abs(cpu) > 1e-2].sum() == 0
+        # within the part's exact band (beyond it the body's own distances are interpolated from a coarse pass,
+        # up to 0.46 mm apart on the GPU and the CPU: measured 2026-11-09, the same without Offset Faces)
+        near = np.abs(F.Context(grid).eval_full(body)) < 2.5
+        assert np.abs(on_gpu - cpu)[near].max() < 2e-3
+
+
+def _gpu_stage(i):
+    import sys
+    from engine.stages import cpu_stage
+    return cpu_stage(_cpu_side, cuda_here="cupy" in sys.modules)
+
+
+def _cpu_side(cuda_here):
+    import os
+    import sys
+    return cuda_here, "cupy" in sys.modules or "warp" in sys.modules, os.environ.get("DESIGN_ENGINE_GPU")
+
+
+@pytest.mark.parametrize("settings", [dict(keep=0.5), dict(tolerance=0.01), dict(method="dual contouring", keep=0.5),
+                                      dict(keep=0.5, blocks=True)])
+def test_two_stage_meshing_on_the_gpu_is_the_same(gpu, cad_part, settings, monkeypatch):
+    # GPU workers only compute the field and marching cubes; decimation, reduction and dual contouring are
+    # handed to CPU workers (engine/stages.py), which have no CUDA: the same meshes bit for bit as one stage
+    import sys
+    import cloudpickle
+    from engine import tiles
+    from engine.graph import Evaluator, Graph, Many, core, link
+    from engine.graph.workers import StickyPool
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    monkeypatch.setattr(core, "CPU_WORKERS_MAX", 2)
+    settings = dict(settings)
+    blocks = settings.pop("blocks", False)
+    if blocks:   # one body (meshed by this process, in blocks of 48 voxels by the workers)
+        monkeypatch.setattr(tiles, "BLOCK", 48)
+        monkeypatch.setattr(tiles, "TILE_MIN_VOXELS", 0)
+    monkeypatch.setenv("DESIGN_ENGINE_GPU", "1")
+    parts = Many(cad_part.copy().apply_translation((80 * i, 0, 0)) for i in range(1 if blocks else 2))
+    meshes = {}
+    for split in (False, True):
+        g = Graph()
+        g.add("src", "input.import_step", path="unused")
+        g.add("sdf", "implicit.from_cad", cad=link("src.bodies"), band=1.5)
+        g.add("noise", "field.noise", scale=40, octaves=1, seed=3)
+        g.add("wave", "math.multiply", a=link("noise.out"), b=0.3)
+        g.add("offset", "implicit.offset", body=link("sdf.out"), distance=link("wave.out"))
+        g.add("mesh", "mesh.from_implicit", body=link("offset.out"), voxel=0.3, padding=1.5, **settings)  # ~2M voxels
+        ev = Evaluator(g, workers=2, log=None)
+        ev.split = None if split else False   # (as the editor runs it: on the GPU it splits)
+        original = ev._call
+        ev._call = lambda node_id, ntype, kwargs: ({"bodies": parts} if ntype.type_id == "input.import_step"
+                                                   else original(node_id, ntype, kwargs))
+        try:
+            meshes[split] = ev.run()["mesh"]["mesh"]
+            assert ev._pool.gpu and (ev._pool.cpu_started() > 0) == split
+        finally:
+            ev.close()
+    for a, b in zip(meshes[False], meshes[True]):
+        assert np.array_equal(a.vertices, b.vertices) and np.array_equal(a.faces, b.faces)
+    monkeypatch.setenv("DESIGN_ENGINE_SPLIT", "1")   # (both stages handed over, though the CPU queue is full)
+    pool = StickyPool(1)   # (the GPU workers have CUDA, the CPU workers not)
+    try:
+        assert pool.map(_gpu_stage, [{"i": 0}, {"i": 1}], split=True, cpu_workers=1) == [(True, False, "0")] * 2
+    finally:
+        pool.close()

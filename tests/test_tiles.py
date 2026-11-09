@@ -11,7 +11,7 @@ from engine.cad_import import load_step, tessellate
 from engine.dualcontour import dual_contour
 from engine.graph import Evaluator, Graph, link
 from engine.grid import Grid
-from engine.meshing import field_to_mesh
+from engine.meshing import FIELD_NORMAL, NORMAL_SCALE, field_to_mesh
 
 TEST_STEP = Path(__file__).resolve().parents[1] / "samples" / "test_part.step"
 VOXEL = 0.25
@@ -37,7 +37,7 @@ def textured(part, smooth=False):
     return F.smoothen(out, 3, 0.2) if smooth else out
 
 
-def sequential(fn, arg_list, need=0, gpu=False, gpu_need=0):
+def sequential(fn, arg_list, need=0, gpu=False, gpu_need=0, cpu_need=None):
     return [fn(**a) for a in arg_list]
 
 
@@ -79,6 +79,62 @@ def test_tiled_mesh_matches_the_whole_grid(part, small_blocks, tmp_path):
     assert len(mesh.faces) == len(whole.faces)
     assert mesh.volume == pytest.approx(whole.volume, rel=1e-6)
     assert reload(mesh, tmp_path).is_watertight
+
+
+def unit_normals(mesh):
+    return mesh.vertex_attributes[FIELD_NORMAL] / NORMAL_SCALE
+
+
+def facet_normals(mesh):
+    """Area-weighted vertex normals of the triangles (as the editor's computeVertexNormals), unit length."""
+    V, T = mesh.vertices, mesh.faces
+    cross = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]])
+    out = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(out, T[:, k], cross)
+    return out / np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-30)
+
+
+@pytest.mark.parametrize("smooth", [False, True])   # (smoothing: blocks with a field halo)
+def test_block_normals_match_the_whole_grid(part, small_blocks, smooth):
+    # views carry the field's normals, central differences at the samples of each vertex's edge. They need a sample
+    # past a block's face, so each block's cells move one up (blockmesh.normals_block): a seam's vertex gets the same
+    # normal in both blocks, the whole grid's, and the triangles are the same as without normals
+    field = textured(part, smooth)
+    grid = Grid.from_bounds(field.bounds, VOXEL, 1.5)
+    whole = field_to_mesh(F.Context(grid).eval_full(field), grid, normals=True)
+    mesh, computed, _ = tiles.mesh_tiled(field, field.bounds, VOXEL, 1.5, 1.0, sequential, normals=True)
+    plain, _, _ = tiles.mesh_tiled(field, field.bounds, VOXEL, 1.5, 1.0, sequential)
+    assert computed > 1 and len(mesh.faces) == len(whole.faces) == len(plain.faces)
+    assert FIELD_NORMAL not in plain.vertex_attributes and same_vertices(mesh, plain)
+    dist, nearest = cKDTree(whole.vertices).query(mesh.vertices)
+    assert dist.max() < 1e-4 and len(np.unique(nearest)) == len(mesh.vertices) == len(whole.vertices)
+    ours, theirs = (m.vertex_attributes[FIELD_NORMAL].astype(np.int32) for m in (mesh, whole))
+    assert np.abs(ours - theirs[nearest]).max() <= 2   # (int16 steps of 3e-5: the positions' last float32 bits)
+    # unit length, and out of the body (the triangles' own normals agree, but for a few in the texture's creases)
+    n = unit_normals(mesh)
+    assert np.abs(np.linalg.norm(n, axis=1) - 1).max() < 1e-4
+    agree = (n * facet_normals(mesh)).sum(axis=1)
+    assert (agree > 0).mean() > 0.999 and np.median(agree) > 0.99
+    # Keep or Tolerance would move the vertices: no normals then
+    reduced, _, _ = tiles.mesh_tiled(field, field.bounds, VOXEL, 1.5, 0.5, sequential, normals=True)
+    assert FIELD_NORMAL not in reduced.vertex_attributes
+
+
+def test_normals_of_a_sphere_are_true_and_point_out():
+    grid = Grid((-6, -6, -6), (6, 6, 6), 0.25)
+    X, Y, Z = grid.coords()
+    mesh = field_to_mesh(np.sqrt(X ** 2 + Y ** 2 + Z ** 2) - np.float32(4.3), grid, normals=True)
+    radial = mesh.vertices / np.linalg.norm(mesh.vertices, axis=1, keepdims=True)
+    angle = lambda n: np.degrees(np.arctan2(np.linalg.norm(np.cross(n, radial), axis=1), (n * radial).sum(axis=1)))
+    # (0.15° at most, 0.02° on average: samples within 1% of a voxel of zero are moved off it, see extract_surface)
+    assert angle(unit_normals(mesh)).max() < 0.25 < 1.0 < angle(facet_normals(mesh)).max()   # (the triangles' 2.7°)
+    # a hollow (the body is cut flat by the box, closed by its pad): out of the body is towards the middle
+    hollow = field_to_mesh(np.float32(4.3) - np.sqrt(X ** 2 + Y ** 2 + Z ** 2), grid, normals=True)
+    n, r = unit_normals(hollow), np.linalg.norm(hollow.vertices, axis=1)
+    radial = hollow.vertices / r[:, None]
+    assert angle(-n)[np.abs(r - 4.3) < 0.1].max() < 0.25
+    assert (n * facet_normals(hollow)).sum(axis=1).min() > 0.5   # (on the box's faces too: the triangles agree)
 
 
 def test_empty_space_is_skipped(small_blocks, tmp_path):
@@ -189,6 +245,33 @@ def test_big_body_is_meshed_in_blocks_by_the_workers(small_blocks, tmp_path):
     assert any(e["type"] == "progress" and e["node"] == "mesh" for e in events)
     reloaded = trimesh.load(tmp_path / "big.stl")
     assert reloaded.is_watertight and len(reloaded.split()) == 1
+
+
+@pytest.mark.parametrize("settings", [dict(keep=0.5), dict(tolerance=0.01), dict(method="dual contouring", voxel=0.4)])
+def test_two_stage_blocks_give_the_same_mesh(small_blocks, settings, monkeypatch):
+    # blocks whose meshing reduces (or dual contours) are meshed by CPU workers from the samples the GPU
+    # workers computed (engine/stages.py; forced on here on the CPU): the same mesh bit for bit
+    from engine.graph import core
+    monkeypatch.setattr(core, "CPU_WORKERS_MAX", 2)
+    meshes = {}
+    for split in (False, True):
+        g = Graph()
+        g.add("import", "input.import_step", path=str(TEST_STEP))
+        g.add("part", "input.pick_body", bodies=link("import.bodies"))
+        g.add("sdf", "implicit.from_cad", cad=link("part.body"), band=1.5)
+        g.add("noise", "field.noise", scale=40, octaves=1, seed=3)
+        g.add("wave", "math.multiply", a=link("noise.out"), b=0.3)
+        g.add("offset", "implicit.offset", body=link("sdf.out"), distance=link("wave.out"))
+        g.add("mesh", "mesh.from_implicit", body=link("offset.out"), **{"voxel": VOXEL, "padding": 1.5, **settings})
+        ev = Evaluator(g, workers=2, log=None)
+        ev.split = split
+        try:
+            meshes[split] = ev.run()["mesh"]["mesh"]
+            assert (ev._pool.cpu_started() > 0) == split
+        finally:
+            ev.close()
+    assert np.array_equal(meshes[False].vertices, meshes[True].vertices)
+    assert np.array_equal(meshes[False].faces, meshes[True].faces)
 
 
 def vented(part):

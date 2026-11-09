@@ -180,6 +180,9 @@ export interface ViewMesh {
   faces: number
   positions: Float32Array
   indices: Uint32Array
+  /** the field's normals at the vertices, int16 x 3 (a normalized attribute: x / 32767), when the engine sent them
+   *  (views, pieces and details of implicit bodies); else the 3D view works them out from the triangles */
+  normals?: Int16Array
   bounds: [[number, number, number], [number, number, number]]
   /** what the shown output is made of (the engine's content key) and the quality it was made at: a
    *  later preview at this quality or coarser keeps it instead of computing it again */
@@ -360,6 +363,8 @@ export interface RunState {
   label?: string
   running: boolean
   startedAt: number
+  /** Date.now() when its run_done came */
+  endedAt?: number
   message?: string
   quality?: Quality
   /** undefined from an engine that does not send it back (one not restarted since an update) */

@@ -13,9 +13,9 @@ import numpy as np
 import trimesh
 import warp as wp
 
-from . import backend
+from . import backend, shared
 from .grid import upsample_linear
-from .sdf import arrays
+from .sdf import PREPARE_TRIANGLES, arrays
 
 wp.config.quiet = True
 wp.init()
@@ -110,41 +110,59 @@ MAX_EDGE = 2.0  # mm. Warp works in float32: on long thin triangles (CAD tessell
                 # Splitting them (geometry unchanged) brings the error to ~0.0005 mm.
 
 
+def gpu_arrays(V, F):
+    """What _GpuMesh uploads, worked out on the CPU: the mesh split to MAX_EDGE (float32 points, int32
+    indices), each split triangle's original one, per triangle whether it touches a crack, and the
+    pseudonormals (as engine/sdf.py's, computed in float64, kept as float32)."""
+    V, F, parent = trimesh.remesh.subdivide_to_size(np.asarray(V, dtype=np.float64), np.asarray(F),
+                                                    max_edge=MAX_EDGE, max_iter=12, return_index=True)
+    F = np.asarray(F)
+    edges = trimesh.Trimesh(V, F, process=False).edges_sorted
+    open_edges = edges[trimesh.grouping.group_rows(edges, require_count=1)]
+    on_crack = np.zeros(len(V), dtype=bool)
+    on_crack[open_edges.ravel()] = True
+    flags = on_crack[F].any(axis=1).astype(np.int8)
+    V64, F64 = np.ascontiguousarray(V, dtype=np.float64), np.ascontiguousarray(F, dtype=np.int64)
+    face_n = igl.per_face_normals(V64, F64)
+    vert_n = igl.per_vertex_normals(V64, F64, igl.PER_VERTEX_NORMALS_WEIGHTING_TYPE_ANGLE)
+    edge_n, _, emap = igl.per_edge_normals(V64, F64, igl.PER_EDGE_NORMALS_WEIGHTING_TYPE_UNIFORM)[:3]
+    f32 = lambda a: np.ascontiguousarray(a, dtype=np.float32)
+    return {"points": f32(V), "indices": np.ascontiguousarray(F, dtype=np.int32).ravel(),
+            "parent": np.asarray(parent, dtype=np.int32), "flags": flags, "has_cracks": int(flags.any()),
+            "face_n": f32(face_n), "vert_n": f32(vert_n), "edge_n": f32(edge_n),
+            "emap": np.asarray(emap, dtype=np.int32).ravel()}
+
+
 class _GpuMesh:
     """A mesh's Warp BVH plus a per-triangle flag for triangles that touch a crack."""
 
-    def __init__(self, V, F):
-        V, F, parent = trimesh.remesh.subdivide_to_size(np.asarray(V, dtype=np.float64), np.asarray(F),
-                                                        max_edge=MAX_EDGE, max_iter=12, return_index=True)
-        F = np.asarray(F)
-        self.parent = np.asarray(parent, dtype=np.int64)  # original triangle of each split one
-        edges = trimesh.Trimesh(V, F, process=False).edges_sorted
-        open_edges = edges[trimesh.grouping.group_rows(edges, require_count=1)]
-        on_crack = np.zeros(len(V), dtype=bool)
-        on_crack[open_edges.ravel()] = True
-        flags = on_crack[F].any(axis=1).astype(np.int8)
-        self.has_cracks = int(flags.any())
-        # pseudonormals, computed once on the CPU (same as engine/sdf.py)
-        V64, F64 = np.ascontiguousarray(V, dtype=np.float64), np.ascontiguousarray(F, dtype=np.int64)
-        face_n = igl.per_face_normals(V64, F64)
-        vert_n = igl.per_vertex_normals(V64, F64, igl.PER_VERTEX_NORMALS_WEIGHTING_TYPE_ANGLE)
-        edge_n, _, emap = igl.per_edge_normals(V64, F64, igl.PER_EDGE_NORMALS_WEIGHTING_TYPE_UNIFORM)[:3]
-        vec = lambda a: wp.array(np.ascontiguousarray(a, dtype=np.float32), dtype=wp.vec3)
-        self.face_n, self.vert_n, self.edge_n = vec(face_n), vec(vert_n), vec(edge_n)
-        self.emap = wp.array(np.asarray(emap, dtype=np.int32).ravel(), dtype=int)
-        self.nfaces = len(F)
-        self.points = wp.array(np.ascontiguousarray(V, dtype=np.float32), dtype=wp.vec3)
-        self.indices = wp.array(np.ascontiguousarray(F, dtype=np.int32).ravel(), dtype=int)
-        self.crack = wp.array(flags if self.has_cracks else np.zeros(1, np.int8), dtype=wp.int8)
+    def __init__(self, a):
+        """`a`: gpu_arrays(V, F), worked out by another process (shared.prepared) or here."""
+        self.parent = a["parent"]  # original triangle of each split one (host)
+        self.has_cracks = int(a["has_cracks"])
+        vec = lambda x: wp.array(x, dtype=wp.vec3)
+        self.face_n, self.vert_n, self.edge_n = vec(a["face_n"]), vec(a["vert_n"]), vec(a["edge_n"])
+        self.emap = wp.array(a["emap"], dtype=int)
+        self.nfaces = len(a["parent"])
+        self.points = vec(a["points"])
+        self.indices = wp.array(a["indices"], dtype=int)
+        self.crack = wp.array(a["flags"] if self.has_cracks else np.zeros(1, np.int8), dtype=wp.int8)
         # winding numbers need extra BVH data: only built for meshes that have cracks
         self.mesh = wp.Mesh(points=self.points, indices=self.indices, support_winding_number=bool(self.has_cracks))
         self.nbytes = self.nfaces * (CRACKED_MESH_BYTES if self.has_cracks else MESH_BYTES)   # GPU memory
 
 
+def _new_mesh(V, F, key):
+    V, F = arrays(V, F)  # Shared arrays are read from the SSD only here
+    if key is not None and len(F) >= PREPARE_TRIANGLES:  # split and analysed once for all processes
+        return _GpuMesh(shared.prepared("gpu mesh", (key, MAX_EDGE), lambda: gpu_arrays(V, F)))
+    return _GpuMesh(gpu_arrays(V, F))
+
+
 def _mesh(V, F, key):
     entry = _MESHES.get(key) if key is not None else None
     if entry is None:
-        entry = _GpuMesh(*arrays(V, F))  # Shared arrays are read from the SSD only here
+        entry = _new_mesh(V, F, key)
         if key is not None:
             _MESHES[key] = entry
             while len(_MESHES) > _MAX_MESHES or (len(_MESHES) > 1 and
@@ -178,7 +196,7 @@ def nearest_on_grid_gpu(V, F, grid, max_dist, key=None):
     wp.synchronize_device()
     face = face.numpy()
     near = np.nonzero(face >= 0)[0]
-    return near, mesh.parent[face[near]], closest.numpy()[near].astype(np.float64)
+    return near, mesh.parent[face[near]].astype(np.int64), closest.numpy()[near].astype(np.float64)
 
 
 def mesh_to_sdf_gpu(V, F, grid, band, key=None, coarse_factor=None):

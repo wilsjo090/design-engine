@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber'
 import { GizmoHelper, GizmoViewport, Grid, Html, OrbitControls } from '@react-three/drei'
@@ -31,6 +31,9 @@ import { BodyHint } from './BodyHint'
 import { CAD_ENV, CadBody, CadEdges, CadLookPanel, toggleCadEdges, useCadEnvironment, useLook, useLookGeometry } from './CadBody'
 import { CAP_COLOR, hideRanges, useBoxCut, type CutBox } from './viewCut'
 import { edgesShown, useCadLook } from '../cadLook'
+import { cancelBoundsTree, scheduleBoundsTree } from '../bvhBuild'
+import { ViewTimingOverlay, setFieldNormals, setViewTiming, useFieldNormals, useViewTiming, viewGeometry, viewNormals,
+  watchFirstFrame } from '../viewTiming'
 
 // CAD convention: Z is up.
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1)
@@ -52,12 +55,15 @@ const KIND_STYLE: Record<string, { color: string; opacity: number }> = {
   variant: { color: '#b4bfd6', opacity: 1 },
 }
 
-/** Builds the geometry's search tree for raycasts once. indirect: the default build re-sorts the
- *  index buffer in place, so triangle numbers (and the CAD face of each) no longer matched: clicking a
- *  side face selected scattered patches. (The option exists in three-mesh-bvh 0.7.8 but is missing
- *  from its type definitions.) */
+/** Builds the geometry's search tree for raycasts once, here and now, unless the worker has built it already
+ *  (bvhBuild.ts: shown bodies get theirs as soon as they are drawn; a build still going there is dropped).
+ *  indirect: the default build re-sorts the index buffer in place, so triangle numbers (and the CAD face of
+ *  each) no longer matched: clicking a side face selected scattered patches. (The option exists in
+ *  three-mesh-bvh 0.7.8 but is missing from its type definitions.) */
 function ensureBoundsTree(g: THREE.BufferGeometry) {
-  if (!g.boundsTree) g.computeBoundsTree({ indirect: true } as unknown as Parameters<THREE.BufferGeometry['computeBoundsTree']>[0])
+  if (g.boundsTree) return
+  cancelBoundsTree(g)
+  g.computeBoundsTree({ indirect: true } as unknown as Parameters<THREE.BufferGeometry['computeBoundsTree']>[0])
 }
 
 const read = <T,>(key: string, fallback: T): T => {
@@ -116,16 +122,29 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
   hide?: number[]
 }) {
   const cut = useBoxCut(box)
+  const fieldNormals = useFieldNormals((s) => s.on)
   const geometry = useMemo(() => {
     const g = new THREE.BufferGeometry()
     g.setAttribute('position', new THREE.BufferAttribute(view.positions, 3))
     g.setIndex(new THREE.BufferAttribute(view.indices, 1))
-    g.computeVertexNormals()
+    const t = performance.now()
+    // the engine's normals from the field (true surface normals, and no pass over the triangles here), else the
+    // triangles' own
+    const engine = fieldNormals && !!view.normals
+    if (engine) g.setAttribute('normal', new THREE.BufferAttribute(view.normals!, 3, true))
+    else g.computeVertexNormals()
+    viewNormals(view, performance.now() - t, engine ? 'engine' : 'browser')
     g.computeBoundingSphere()
+    viewGeometry(view)
     return g
-  }, [view])
-  useEffect(() => () => { geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
+  }, [view, fieldNormals])
+  useEffect(() => () => { cancelBoundsTree(geometry); geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
   useEffect(() => hideRanges(geometry, view.indices, view.parts, 3, hide), [geometry, view, hide])
+  // right-clicks and clicks raycast it: its search tree is built in a worker meanwhile (bvhBuild.ts)
+  const menuTarget = !patch && ((!!node && !ghost) || variant !== undefined)
+  useEffect(() => { if (menuTarget) scheduleBoundsTree(geometry, view.indices) }, [geometry, view, menuTarget])
+  const meshRef = useRef<THREE.Mesh>(null)
+  useLayoutEffect(() => watchFirstFrame(meshRef.current, view), [geometry, view])  // (before a frame can draw it)
   const colors = useMemo(() => paintColors(view, paint, cmap, range), [view, paint, cmap, range])
   useEffect(() => {
     if (colors) geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
@@ -147,7 +166,7 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
   }
   return (
     <group>
-      <mesh geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost || patch ? () => null : undefined}
+      <mesh ref={meshRef} geometry={geometry} renderOrder={transparent ? 1 : 0} raycast={ghost || patch ? () => null : undefined}
         // a guide shape's Place clicks on it (Guides.tsx); right-clicks open its node's menu
         userData={patch ? {} : { placeable: kind !== 'variant',
           menu: node && !ghost ? { view: node } : variant !== undefined ? { variant } : undefined }}
@@ -177,7 +196,9 @@ function faceSubset(geometry: THREE.BufferGeometry, count: number, keep: (triang
   const nor = new Float32Array(n * 9)
   const index = (geometry.userData.source ?? geometry.index!.array) as Uint32Array
   const positions = geometry.getAttribute('position').array as Float32Array
-  const src = (geometry.getAttribute('normal') as THREE.BufferAttribute | undefined)?.array as Float32Array | undefined
+  const attr = geometry.getAttribute('normal') as THREE.BufferAttribute | undefined
+  const src = attr?.array as ArrayLike<number> | undefined
+  const scale = attr?.normalized ? 1 / 32767 : 1   // (an engine view's normals are int16)
   let k = 0
   for (let t = 0; t < count; t++) {
     if (!keep(t)) continue
@@ -185,7 +206,7 @@ function faceSubset(geometry: THREE.BufferGeometry, count: number, keep: (triang
       const v = index[t * 3 + c] * 3
       for (let a = 0; a < 3; a++) {
         pos[k] = positions[v + a]
-        nor[k++] = src ? src[v + a] : 0
+        nor[k++] = src ? src[v + a] * scale : 0
       }
     }
   }
@@ -284,6 +305,7 @@ function MenuHighlight({ view, triangles, clip, box, color = PICK_HOVER }: {
   view: ViewMesh; triangles: Uint32Array; clip: THREE.Plane[]; box?: CutBox | null; color?: string
 }) {
   const cut = useBoxCut(box)
+  const fieldNormals = useFieldNormals((s) => s.on)
   const geometry = useMemo(() => {
     const index = new Uint32Array(triangles.length * 3)
     for (let k = 0; k < triangles.length; k++) {
@@ -292,9 +314,11 @@ function MenuHighlight({ view, triangles, clip, box, color = PICK_HOVER }: {
     const g = new THREE.BufferGeometry()
     g.setAttribute('position', new THREE.BufferAttribute(view.positions, 3))
     g.setIndex(new THREE.BufferAttribute(index, 1))
-    g.computeVertexNormals()
+    // shaded as the body under it
+    if (fieldNormals && view.normals) g.setAttribute('normal', new THREE.BufferAttribute(view.normals, 3, true))
+    else g.computeVertexNormals()
     return g
-  }, [view, triangles])
+  }, [view, triangles, fieldNormals])
   useEffect(() => () => geometry.dispose(), [geometry])
   if (!triangles.length) return null
   return (
@@ -1742,6 +1766,8 @@ export function Viewport() {
   // how CAD bodies are drawn (CadBody.tsx): Edges toggles their edges, ▾ opens the options
   const cadLook = useCadLook()
   const [lookOpen, setLookOpen] = useState(false)
+  const timingOn = useViewTiming((s) => s.on)
+  const fieldNormalsOn = useFieldNormals((s) => s.on)
   const [bounds, setBoundsState] = useState<THREE.Box3 | null>(null)
   // only a real change re-renders (a new but equal box each time looped with the variants' boxes)
   const setBounds = useMemo(() => (b: THREE.Box3) => {
@@ -2024,6 +2050,8 @@ export function Viewport() {
     ...(frames.length ? [toggle('Show bars', showFrames, () => setShowFrames(!showFrames))] : []),
     { kind: 'item', label: 'Measure', hint: 'M', checked: measure !== null, run: () => setMeasure((m) => (m ? null : [])) },
     toggle('Settings sliders', showSettings, () => setShowSettings(!showSettings)),
+    toggle('View timing', timingOn, () => setViewTiming(!timingOn)),
+    toggle('Field normals', fieldNormalsOn, () => setFieldNormals(!fieldNormalsOn)),
     { kind: 'separator' },
     { kind: 'item', label: 'Add node…', hint: 'Tab', run: () => useStore.getState().requestPalette(),
       disabled: picking ? 'Finish picking first' : undefined },
@@ -2425,6 +2453,7 @@ export function Viewport() {
           </div>
         ))}
         <VariantsList variants={variants} />
+        <ViewTimingOverlay />
       </div>
       <div className="viewport-bottom">
         {aim && !picking && (

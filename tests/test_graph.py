@@ -408,3 +408,38 @@ def test_face_selections_are_resolved_by_name():
     assert g.nodes["m"]["inputs"]["faces"] == "10, 11, 3 7"
     assert g.nodes["u"]["inputs"]["faces"] == "nope"           # the node reports unknown names
     assert recipe["nodes"]["m"]["inputs"]["faces"] == "top, rim 7"   # the recipe itself is untouched
+
+
+@pytest.mark.parametrize("settings", [dict(keep=0.4), dict(tolerance=0.01),
+                                      dict(method="dual contouring", keep=0.5)])
+def test_two_stage_meshing_gives_the_same_meshes(settings, monkeypatch):
+    # GPU workers hand decimation, reduction and dual contouring to CPU workers (engine/stages.py); forced on
+    # here on the CPU: the meshes must be the same bit for bit, in the same order
+    from engine.graph import core
+    monkeypatch.setattr(core, "CPU_WORKERS_MAX", 2)
+    boxes =Many(trimesh.creation.box((4, 4, 4 + i)).apply_translation((10 * i, 0, 0)) for i in range(3))
+    results, events = {}, {}
+    for split in (False, True):
+        g = Graph()
+        g.add("src", "input.import_step", path="unused")
+        g.add("sdf", "implicit.from_cad", cad=link("src.bodies"), band=1.0)
+        g.add("noise", "field.noise", scale=3, octaves=1, seed=3)
+        g.add("wave", "math.multiply", a=link("noise.out"), b=0.3)
+        g.add("offset", "implicit.offset", body=link("sdf.out"), distance=link("wave.out"))
+        g.add("mesh", "mesh.from_implicit", body=link("offset.out"), voxel=0.1, padding=1.0, **settings)
+        events[split] = []
+        ev = Evaluator(g, workers=2, log=None, on_event=events[split].append)
+        ev.split = split
+        original = ev._call
+        ev._call = lambda node_id, ntype, kwargs: ({"bodies": boxes} if ntype.type_id == "input.import_step"
+                                                   else original(node_id, ntype, kwargs))
+        try:
+            results[split] = ev.run()["mesh"]["mesh"]
+            assert (ev._pool.cpu_started() > 0) == split
+        finally:
+            ev.close()
+    assert len(results[True]) == 3
+    for a, b in zip(results[False], results[True]):
+        assert np.array_equal(a.vertices, b.vertices) and np.array_equal(a.faces, b.faces)
+    progress = [e["done"] for e in events[True] if e["type"] == "progress" and e["node"] == "mesh"]
+    assert progress == [1, 2, 3]

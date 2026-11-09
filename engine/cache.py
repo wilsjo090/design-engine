@@ -98,6 +98,75 @@ def memory_room():
     return commit_room() - COMMIT_TIGHT
 
 
+class _MemoryCounters(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX2 (Windows 10 1809 and later)
+    _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong), ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t), ("PrivateUsage", ctypes.c_size_t),
+                ("PrivateWorkingSetSize", ctypes.c_size_t), ("SharedCommitUsage", ctypes.c_ulonglong)]
+
+
+_PRIVATE_SET = sys.platform == "win32"  # False once the call failed (an older Windows)
+
+
+def resident_memory(pid=None):
+    """Bytes of RAM a process holds for itself: its private working set. Not its whole working set (RSS),
+    which also counts the pages of files it maps (memory-mapped SSD cache files and CAD arrays, shared by
+    every process and dropped by Windows for free) and of DLLs, in every process again: 8 workers mapping one
+    part's 0.3 GB of arrays counted 2.4 GB. Not committed memory either (see Evaluator.memory_in_use).
+    Elsewhere than on Windows: RSS. 0 when the process is gone or psutil is missing."""
+    global _PRIVATE_SET
+    pid = os.getpid() if pid is None else pid
+    if _PRIVATE_SET:
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            try:
+                info = _MemoryCounters()
+                info.cb = ctypes.sizeof(info)
+                if ctypes.windll.kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(info), info.cb):
+                    return int(info.PrivateWorkingSetSize)
+                _PRIVATE_SET = False
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        elif psutil is not None and not psutil.pid_exists(pid):
+            return 0
+    if psutil is None:
+        return 0
+    try:
+        return int(psutil.Process(pid).memory_info().rss)
+    except psutil.Error:
+        return 0
+
+
+MAP_BYTES = 1 << 20  # .npy files from this size are memory-mapped when read (read_npy)
+
+
+def read_npy(path, map_bytes=MAP_BYTES):
+    """A read-only array from an .npy file. From `map_bytes` memory-mapped: its pages are the file's, so every
+    process reading it shares one copy, no commit is charged and Windows drops them for free when RAM runs
+    short (np.load: a private copy in each process, written to the page file under pressure; measured +61
+    MB private for a 64 MB array, mapped and read whole +0). While mapped, the file cannot be deleted or
+    replaced (trimming skips it). Reading a mapped array whole the first time costs more than np.load (page
+    faults; measured with the file in Windows' cache: 1 MB 0.98 against 0.43 ms, 4 MB 2.6 / 1.4 ms, 32 MB
+    17 / 14 ms, 128 MB 74 / 60 ms), so smaller ones are read."""
+    if os.path.getsize(path) >= map_bytes:
+        return np.asarray(np.load(path, mmap_mode="r", allow_pickle=False))  # a plain ndarray view of the map
+    array = np.load(path, allow_pickle=False)
+    array.flags.writeable = False
+    return array
+
+
+def is_mapped(array):
+    """Whether an array's memory is a memory-mapped file (read_npy), so it costs no private RAM."""
+    import mmap
+    while array is not None:
+        if isinstance(array, (np.memmap, mmap.mmap)):
+            return True
+        array = getattr(array, "base", None)
+    return False
+
+
 _LIMIT = _CACHES = None
 
 
@@ -105,7 +174,7 @@ def memory_limit():
     """Bytes the whole engine (all its processes) should stay under in this run: set when each run starts
     (refresh_memory_limit; before the first run, from this process alone)."""
     if _LIMIT is None:
-        refresh_memory_limit(psutil.Process().memory_info().rss if psutil is not None else 0)
+        refresh_memory_limit(resident_memory())
     return _LIMIT
 
 
@@ -149,7 +218,13 @@ def default_cache_dir():
 class DiskCache:
     """Arrays as .npy files in one folder, shared by all processes, oldest deleted first."""
 
-    MIN_BYTES = 1 << 20  # smaller arrays are cheaper to recompute than to keep as files
+    # Smaller arrays are cheaper to recompute than to keep as files. Not 1 MB: a lamp petal's Draft distance
+    # field is ~0.4 MB and costs ~160 ms to compute against ~1 ms to read; when Medium and Final pushed the Draft
+    # arrays out of the workers' RAM, every edit's Draft computed all 144 again (5.1 s instead of 0.7 s, 2026-11-09)
+    MIN_BYTES = 64 << 10
+    # Hits from this size are memory-mapped (read_npy): no commit, shared, dropped for free. Not from 1 MB as
+    # Shared arrays are: a hit is read whole at once, and mapped small arrays read up to 2x slower
+    MAP_BYTES = 32 << 20
 
     def __init__(self, folder=None, max_bytes=None):
         self.folder = Path(folder) if folder else default_cache_dir()
@@ -188,11 +263,10 @@ class DiskCache:
     def load(self, key):
         path = self._path(key)
         try:
-            array = np.load(path, allow_pickle=False)
+            array = read_npy(path, self.MAP_BYTES)  # big ones memory-mapped: shared by the processes, no commit
             os.utime(path)  # mark as recently used
         except (OSError, ValueError, EOFError):
             return None
-        array.flags.writeable = False
         return array
 
     def trim(self):
@@ -225,7 +299,7 @@ class DiskCache:
 
     def clear(self):
         for f in [*self.folder.glob("*.npy"), *(self.folder / STEP_FOLDER).glob("*.npz"),
-                  *(self.folder / "shared").glob("*.npy"),  # engine/shared.py
+                  *(self.folder / "shared").glob("*.npy"), *(self.folder / "shared").glob("*.json"),  # engine/shared.py
                   *(self.folder / TOPOLOGY_FOLDER).glob("*.npz"), *(self.folder / FRAME_FOLDER).glob("*.npz")]:
             try:
                 f.unlink()

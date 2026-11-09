@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from .. import backend, facemask
+from .. import backend, facemask, trace
 from .. import fields as F
 from ..cache import load_topology, memory_limit, memory_room, save_topology
 from ..fea import analysis as FA
@@ -589,11 +589,13 @@ def _optimize(key, body, volume, conditions, material, keep, min_thickness, skin
             report_progress(o.iteration, max_iterations, "iteration")  # also where Stop takes effect
             if o.iteration % LIVE_EVERY == 0:
                 try:
-                    report_view(live(o.density()))
+                    with trace.span("live view", item=o.iteration):
+                        report_view(live(o.density()))
                 except (ConditionError, ValueError):
                     pass  # no surface yet (all densities on one side of 0.5)
             if o.iteration % CHECKPOINT_EVERY == 0:
-                save_topology(key, **o.state(stopped=True))
+                with trace.span("checkpoint", item=o.iteration):
+                    save_topology(key, **o.state(stopped=True))
             if o.iteration % 10 == 0:
                 local = (f", fullest neighbourhood {100 * o.local_max:.0f}% (max {100 * T.LOCAL_SHARE:.0f}%)"
                          if o.local_max is not None else "")

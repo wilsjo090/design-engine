@@ -17,13 +17,13 @@ Seams close exactly because:
 """
 import numpy as np
 import trimesh
-from skimage.measure import marching_cubes
 
-from . import backend
-from .dualcontour import BLOCK_HALO, contour_block, join_blocks, off_zero
+from . import backend, blockmesh, stages, trace
+from .blockmesh import dual_block_values as _dual_block_values, mesh_block_values as _mesh_block_values
+from .dualcontour import BLOCK_HALO, join_blocks
 from .fields import Context, halo as field_halo, mesh_triangles, release_mesh_caches
 from .grid import Grid
-from .meshing import decimate, finite_values, reduce, signed_volume, simplify, snap_float32
+from .meshing import FIELD_NORMAL, decimate, reduce, signed_volume, snap_float32
 
 BLOCK = 96             # voxels per block side; a multiple of ALIGN
 ALIGN = 12             # coarse sampling factors (noise 2-4, distance fields 2 and 4) all divide this
@@ -55,17 +55,27 @@ class Plan:
         return Grid.block(self.base, self.voxel, [i * self.block - self.halo - extra for i in b], (n, n, n))
 
 
-def worker_memory(plan, field, dual=False):
+def worker_memory(plan, field, dual=False, normals=False):
     """Bytes one worker needs for this body's blocks: the block's field arrays plus search
     structures for the CAD meshes the field reads (the same in every worker: a 2.4M-triangle part
     took ~1.2 GB per worker on the CPU, 0.8 GB on the GPU, so big parts get fewer workers); dual
-    contouring's block is bigger by its halo and needs more per sample."""
-    n = plan.block + 1 + 2 * (plan.halo + (BLOCK_HALO if dual else 0))
+    contouring's block is bigger by its halo and needs more per sample, one with normals by NORMAL_MORE."""
+    n = plan.block + 1 + 2 * (plan.halo + (BLOCK_HALO if dual else 0)) + (blockmesh.NORMAL_MORE if normals else 0)
     return int(WORKER_BASE + n ** 3 * (DUAL_BYTES if dual else 4 * 12) + MESH_BYTES * mesh_triangles(field))
 
 
+def cpu_memory(plan, dual=False):
+    """Bytes a CPU worker needs for one task's CPU stage (engine/stages.py): the task's blocks' samples,
+    handed over, and one block meshed and reduced (dual contoured) at a time."""
+    n = plan.block + 1 + (2 * BLOCK_HALO if dual else 0)
+    return int(BATCH * n ** 3 * 4 + n ** 3 * (DUAL_BYTES if dual else 4 * 12))
+
+
 WORKER_BASE = int(0.6 * 2**30)  # a worker process itself: libraries plus a CUDA context
-MESH_BYTES = 500      # RAM per triangle per worker for distance-field search structures
+# RAM per triangle per worker for distance-field search structures: mostly libigl's tree, since a big mesh's
+# vertices, triangles and normals are mapped from the shared folder, one copy for all (500 before: 1.31M
+# triangles held 0.48 GB per worker, now 0.32, 2026-11-09)
+MESH_BYTES = 370
 MESH_GPU_BYTES = 150  # GPU memory per triangle per worker (Warp BVH, normals)
 DUAL_BYTES = 200      # RAM per sample of a dual contouring block (its field arrays and the crossings' data)
 
@@ -77,7 +87,8 @@ def find_surface(field, plan):
     probe = Grid.block(plan.base, plan.voxel * step, (0, 0, 0), [n * PROBE + 1 for n in plan.blocks])
     xp = backend.cupy() if backend.use_gpu_for(probe.size) else np
     try:
-        values = backend.to_host(Context(probe, None, xp).eval_full(field))
+        with trace.span("probe", xp=xp):
+            values = backend.to_host(Context(probe, None, xp).eval_full(field))
     finally:
         release_mesh_caches()  # the workers do the real work; don't keep a big part's copy here
         if xp is not np:
@@ -91,94 +102,91 @@ def find_surface(field, plan):
     return found
 
 
-def mesh_blocks(field, plan, blocks, keep, gpu, tolerance=0.0, close=True):
+def mesh_blocks(field, plan, blocks, keep, gpu, tolerance=0.0, close=True, normals=False):
     """Mesh a few blocks (runs in a worker). One result per block: (block, vertices in global
     sample units, faces, border-vertex mask, crossings, (inside, nonfinite)), where
     crossings[axis][side] tells whether the surface runs into the neighbour on that side (side 0 =
     lower), inside[axis][side] whether the body reaches that face of the block, and nonfinite
-    counts the NaN and infinite samples (see meshing.finite_values)."""
+    counts the NaN and infinite samples (see meshing.finite_values). In a two-stage map (engine/stages.py)
+    blocks that are reduced (Keep, Tolerance) are meshed and reduced by a CPU worker: this worker only
+    computes their samples. normals (no Keep or Tolerance): the field's normals as a 7th item, each block's
+    cells one sample up (blockmesh.normals_block)."""
     xp = backend.cupy() if gpu and backend.gpu_enabled() else np
     try:
-        return [_mesh_block(field, plan, b, keep, xp, tolerance, close) for b in blocks]
+        if (tolerance > 0 or keep < 1.0) and stages.splitting():
+            values = []
+            for b in blocks:
+                with trace.span("block", item=b):
+                    values.append(_block_values(field, plan, b, xp))
+            return stages.cpu_stage(blockmesh.mesh_values, plan=blockmesh.layout(plan), blocks=blocks,
+                                    values=values, keep=keep, tolerance=tolerance, close=close)
+        out = []
+        for b in blocks:
+            with trace.span("block", item=b):
+                out.append(_mesh_block(field, plan, b, keep, xp, tolerance, close, normals))
+        return out
     finally:
         if xp is not np:
             backend.release_gpu_memory()
 
 
-def _mesh_block(field, plan, b, keep, xp, tolerance=0.0, close=True):
-    values = Context(plan.eval_grid(b), None, xp).eval_full(field)
+def _block_values(field, plan, b, xp, more=0):
+    """Block b's own samples (without the halo), on the host; `more`: that many more past its far faces (the
+    grid's start, a multiple of ALIGN, stays; the halo goes round them too)."""
+    grid = plan.eval_grid(b)
+    if more:
+        grid = Grid.block(grid.base, grid.voxel, grid.start, [s + more for s in grid.shape])
+    with trace.span("field", xp=xp):
+        values = Context(grid, None, xp).eval_full(field)
     h = plan.halo
     if h:
-        values = values[h:-h, h:-h, h:-h]
-    values, nonfinite = finite_values(backend.to_host(values), plan.voxel)
-    # same nudge off zero as meshing.field_to_mesh; identical in every block for a shared sample
-    eps = np.float32(0.01 * plan.voxel)  # float32: a Python float made the inner where float64
-    values = np.where(np.abs(values) < eps, np.where(values < 0, -eps, eps), values).astype(np.float32)
-    faces_ = [(values.take(0, axis=a), values.take(-1, axis=a)) for a in range(3)]
-    crossings = [[bool(f.min() < 0 < f.max()) for f in pair] for pair in faces_]
-    found = ([[bool(f.min() < 0) for f in pair] for pair in faces_], nonfinite)
-    del faces_
-    if values.min() > 0 or values.max() < 0:
-        return b, None, None, None, crossings, found
-    # close the surface on the outer faces of the whole box (inner faces are shared with neighbours)
-    pad = [(int(close and b[a] == 0), int(close and b[a] == plan.blocks[a] - 1)) for a in range(3)]
-    if any(lo or hi for lo, hi in pad):
-        values = np.pad(values, pad, mode="constant", constant_values=max(float(values.max()), plan.voxel))
-    verts, faces, _, _ = marching_cubes(values, level=0.0)
-    verts = verts.astype(np.float64) + np.array([b[a] * plan.block - pad[a][0] for a in range(3)], dtype=np.float64)
-    faces = faces.astype(np.int64)
-    if tolerance > 0:  # reduce to a tolerance here, in the worker: borders stay for the neighbours
-        verts, faces = reduce(verts, faces, tolerance / plan.voxel, snap=False)
-    elif keep < 1.0:
-        verts, faces = _simplify(verts, faces, keep, plan.voxel)
-    return b, verts, faces.astype(np.int32), _border(faces, len(verts)), crossings, found
+        n = plan.block + 1 + more
+        values = values[h:h + n, h:h + n, h:h + n]
+    return backend.to_host(values)
 
 
-def _simplify(verts, faces, keep, voxel):
-    """Keep about `keep` of the triangles without moving the block's open border, so it still
-    meets the neighbours (same algorithm and settings as meshing.decimate)."""
-    # The algorithm does not check that a collapse keeps the surface manifold: in ~1 block of 200
-    # it leaves an edge shared by 4 triangles. Such a block is kept as it was (~1% more triangles).
-    return simplify(verts, faces, keep, voxel, preserve_border=True) or (verts, faces)
+def _mesh_block(field, plan, b, keep, xp, tolerance=0.0, close=True, normals=False):
+    more = blockmesh.NORMAL_MORE if normals else 0
+    return _mesh_block_values(_block_values(field, plan, b, xp, more), plan, b, keep, tolerance, close, normals)
 
 
 def dual_blocks(field, plan, blocks, gpu):
     """Dual contouring of a few blocks (runs in a worker). One (block, piece) per block: the piece as
     from dualcontour.contour_block (only `needs` where the block has no surface), plus `nonfinite`
-    (its own samples that were not finite) and `clipped` (the body reaches the box's outer samples)."""
+    (its own samples that were not finite) and `clipped` (the body reaches the box's outer samples).
+    In a two-stage map (engine/stages.py) a CPU worker does the contouring: this worker only computes the
+    samples."""
     xp = backend.cupy() if gpu and backend.gpu_enabled() else np
     try:
-        return [_dual_block(field, plan, b, xp) for b in blocks]
+        if stages.splitting():
+            values = []
+            for b in blocks:
+                with trace.span("block", item=b):
+                    values.append(_dual_values(field, plan, b, xp))
+            return stages.cpu_stage(blockmesh.dual_contour_values, plan=blockmesh.layout(plan), blocks=blocks,
+                                    values=values)
+        out = []
+        for b in blocks:
+            with trace.span("block", item=b):
+                out.append(_dual_block(field, plan, b, xp))
+        return out
     finally:
         if xp is not np:
             backend.release_gpu_memory()
 
 
-def _dual_block(field, plan, b, xp):
-    values = Context(plan.eval_grid(b, BLOCK_HALO), None, xp).eval_full(field)
+def _dual_values(field, plan, b, xp):
+    """Block b's samples with dual contouring's halo (without the field's), on the host."""
+    with trace.span("field", xp=xp):
+        values = Context(plan.eval_grid(b, BLOCK_HALO), None, xp).eval_full(field)
     h = plan.halo
     if h:
         values = values[h:-h, h:-h, h:-h]
-    values = backend.to_host(values)
-    start = [i * plan.block - BLOCK_HALO for i in b]
-    top = [n * plan.block for n in plan.blocks]  # the box's last sample
-    own = tuple(slice(BLOCK_HALO, BLOCK_HALO + plan.block + int(b[a] == plan.blocks[a] - 1)) for a in range(3))
-    nonfinite = int(np.count_nonzero(~np.isfinite(values[own])))
-    values = off_zero(finite_values(values, plan.voxel)[0], plan.voxel)
-    clipped = False
-    for a in range(3):
-        index = np.arange(values.shape[a]) + start[a]
-        for edge in (0, top[a]):  # the box's outer samples: is the body cut off there?
-            if index[0] <= edge <= index[-1]:
-                clipped |= bool(values.take(edge - start[a], axis=a).min() < 0)
-        outside = (index < 0) | (index > top[a])  # beyond the box: outside, so the surface closes on it
-        if outside.any():
-            values[(slice(None),) * a + (outside,)] = plan.voxel
-    found = dict(needs=[], nonfinite=nonfinite, clipped=clipped)
-    if values.min() > 0 or values.max() < 0:
-        return b, found
-    found.update(contour_block(values, start, plan.block, b, plan.blocks, plan.voxel))
-    return b, found
+    return backend.to_host(values)
+
+
+def _dual_block(field, plan, b, xp):
+    return _dual_block_values(_dual_values(field, plan, b, xp), plan, b)
 
 
 def _neighbours(result, plan):
@@ -192,28 +200,28 @@ def _neighbours(result, plan):
                 yield tuple(n)
 
 
-def _border(faces, count):
-    """Mask of vertices on open edges: in a block's mesh, exactly the ones on shared faces."""
-    edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-    mask = np.zeros(count, dtype=bool)
-    mask[edges[trimesh.grouping.group_rows(edges, require_count=1)].ravel()] = True
-    return mask
-
-
 def stitch(results, plan, tolerance=0.0, close=True):
     """One mesh from the blocks' pieces (a dict, emptied on the way to save memory): border
     vertices that lie on the same grid edge are the same vertex. With a tolerance the blocks were
     reduced with their borders kept: the seams are reduced here (half the tolerance, as they now
     sit next to reduced surface). An open piece (close=False) has no volume to orient it by; marching
-    cubes already faces it outward."""
-    pieces = [(V, F, B) for _, V, F, B, *_ in results.values() if V is not None and len(F)]
+    cubes already faces it outward. Pieces with the field's normals (mesh_blocks(normals=True)) give them to
+    the mesh (meshing.FIELD_NORMAL; a seam's vertex has the same normal in both blocks)."""
+    with trace.span("stitch", blocks=len(results)):
+        return _stitch(results, plan, tolerance, close)
+
+
+def _stitch(results, plan, tolerance, close):
+    pieces = [(r[1], r[2], r[3], r[6] if len(r) > 6 else None) for r in results.values()
+              if r[1] is not None and len(r[2])]
     results.clear()
     if not pieces:
         raise ValueError("Field has no surface inside the grid (no sign change)")
-    offsets = np.cumsum([0] + [len(V) for V, _, _ in pieces])
+    offsets = np.cumsum([0] + [len(p[0]) for p in pieces])
     V = np.concatenate([p[0] for p in pieces])
     B = np.concatenate([p[2] for p in pieces])
     F = np.concatenate([p[1].astype(np.int64) + o for p, o in zip(pieces, offsets)])
+    N = np.concatenate([p[3] for p in pieces]) if tolerance <= 0 and all(p[3] is not None for p in pieces) else None
     del pieces
 
     idx = np.nonzero(B)[0]
@@ -239,35 +247,40 @@ def stitch(results, plan, tolerance=0.0, close=True):
         if seam.any():
             V, F = reduce(V, F, tolerance / 2 / plan.voxel, frozen=~seam, snap=False)
     if close and signed_volume(V, F) < 0:
-        F = F[:, ::-1]  # same as meshing.field_to_mesh: outward-facing triangles
-    mesh = trimesh.Trimesh(plan.base + V * plan.voxel, F, process=False)
-    del V, F
-    mesh.remove_unreferenced_vertices()
+        F = F[:, ::-1]  # same as meshing.field_to_mesh: outward-facing triangles (the normals point out already)
+    mesh = trimesh.Trimesh(plan.base + V * plan.voxel, F, process=False,
+                           vertex_attributes=None if N is None else {FIELD_NORMAL: N})
+    del V, F, N
+    mesh.remove_unreferenced_vertices()  # (trimesh keeps vertex_attributes in step, also in snap_float32)
     return snap_float32(mesh)
 
 
 def mesh_tiled(field, bounds, voxel, padding, keep, map_fn, tolerance=0.0, close=True, surface=None,
-               method="marching cubes"):
+               method="marching cubes", normals=False):
     """Mesh `field` block by block. `map_fn(fn, arg_list, need=, gpu=, gpu_need=)` runs the block tasks
     (in parallel when it can). Returns (mesh, blocks computed, blocks in the box); `mesh.metadata`
     has `nonfinite`, `clipped` and `voxel` as from meshing.field_to_mesh. close=False leaves the surface
     open where it leaves the box (a piece of a body: the editor's detail view; marching cubes only);
     `surface`: the blocks find_surface gave for the same layout, if already known. Dual contouring
     (`method`) joins its blocks by vertex names (dualcontour.contour_block) and reduces the whole mesh
-    here, in this process, for `tolerance` or `keep`."""
+    here, in this process, for `tolerance` or `keep`. normals: the field's normals at the vertices
+    (meshing.FIELD_NORMAL; the editor's views and details: marching cubes, no Keep or Tolerance)."""
     dual = method == "dual contouring"
     if dual and not close:
         raise ValueError("dual contouring in blocks makes closed meshes only")
+    normals = bool(normals) and not dual and keep >= 1.0 and tolerance <= 0
     plan = Plan(field, bounds, voxel, padding)
     gpu = backend.gpu_enabled()
     done, todo = {}, (find_surface(field, plan) if surface is None else list(surface))
     while todo:
         tasks = [dict(field=field, plan=plan, blocks=todo[i:i + BATCH], gpu=gpu) if dual else
                  dict(field=field, plan=plan, blocks=todo[i:i + BATCH], keep=keep, gpu=gpu, tolerance=tolerance,
-                      close=close)
+                      close=close, **({"normals": True} if normals else {}))
                  for i in range(0, len(todo), BATCH)]
-        for results in map_fn(dual_blocks if dual else mesh_blocks, tasks, need=worker_memory(plan, field, dual),
-                              gpu=gpu, gpu_need=MESH_GPU_BYTES * mesh_triangles(field)):
+        for results in map_fn(dual_blocks if dual else mesh_blocks, tasks,
+                              need=worker_memory(plan, field, dual, normals),
+                              gpu=gpu, gpu_need=MESH_GPU_BYTES * mesh_triangles(field),
+                              cpu_need=cpu_memory(plan, dual)):
             for r in results:
                 done[r[0]] = r
         missing = set()

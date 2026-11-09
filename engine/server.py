@@ -12,6 +12,7 @@ Exports queue up: an export never cancels another, and preview requests that arr
 export wait until the queue is done (only the newest one runs).
 """
 import asyncio
+import concurrent.futures
 import copy
 import gc
 import hashlib
@@ -34,8 +35,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .graph import REGISTRY, Cancelled, Evaluator, Graph, GraphError, compatibility, node_catalog
 from .graph.core import COMMIT_TIGHT, FREE_TIGHT, GROUP_SEP
-from . import backend, native_dialog
+from . import backend, native_dialog, trace
 from .cache import available_memory, commit_room, default_cache_dir, memory_limit
+from .meshing import FIELD_NORMAL
 from .slice import field_slice
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -223,12 +225,16 @@ def pack_slice(image):
 
 
 def display_arrays(value):
-    """(vertices float32, triangles uint32, triangles per list item) of a mesh or a list of meshes, as
-    shown in the 3D view (decimated if too big to display). Each item's triangles follow the one's
-    before."""
+    """(vertices float32, triangles uint32, triangles per list item, normals int16 x 3 or None) of a mesh or a list
+    of meshes, as shown in the 3D view (decimated if too big to display). Each item's triangles follow the one's
+    before. Normals: the field's (meshing.FIELD_NORMAL, views of implicit bodies), when every item has them and
+    nothing was decimated; else the editor works them out from the triangles."""
     items = list(value) if isinstance(value, list) else [value]
     total = sum(len(m.faces) for m in items)
     keep = min(1.0, DISPLAY_MAX_FACES / total) if total else 1.0
+    normals = [getattr(m, "vertex_attributes", {}).get(FIELD_NORMAL) for m in items] if keep >= 1.0 else [None]
+    if not items or any(n is None or len(n) != len(m.vertices) for n, m in zip(normals, items)):
+        normals = None
     verts, faces, offset = [], [], 0
     for m in items:
         if keep < 1.0:
@@ -238,15 +244,21 @@ def display_arrays(value):
         offset += len(m.vertices)
     V = np.concatenate(verts) if verts else np.zeros((0, 3), np.float32)
     F = np.concatenate(faces) if faces else np.zeros((0, 3), np.uint32)
-    return V, F, [len(f) for f in faces]
+    N = None if normals is None else np.concatenate(normals).astype(np.int16, copy=False)
+    return V, F, [len(f) for f in faces], N
 
 
 def pack_meshes(value, counts=False):
-    """One binary blob for a mesh or a list of meshes. Returns (blob, vertices, triangles), and with
-    `counts` the triangles of each list item (None for a single mesh)."""
-    V, F, per_item = display_arrays(value)
-    header = np.array([len(V), len(F)], dtype=np.uint32)
-    packed = header.tobytes() + V.tobytes() + F.tobytes(), len(V), len(F)
+    """One binary blob for a mesh or a list of meshes: uint32 vertex and triangle counts, float32 positions, uint32
+    triangles, and when display_arrays has them the field's normals, int16 x 3 per vertex (x NORMAL_SCALE; an older
+    editor reads by the counts and never looks there; packed_normals tells). Returns (blob, vertices, triangles),
+    and with `counts` the triangles of each list item (None for a single mesh)."""
+    with trace.span("pack") as span:
+        V, F, per_item, N = display_arrays(value)
+        header = np.array([len(V), len(F)], dtype=np.uint32)
+        blob = header.tobytes() + V.tobytes() + F.tobytes() + (b"" if N is None else N.tobytes())
+        packed = blob, len(V), len(F)
+        span.set(triangles=len(F), normals=N is not None)
     return (*packed, per_item if isinstance(value, list) else None) if counts else packed
 
 
@@ -256,6 +268,24 @@ def unpack_meshes(blob):
     V = np.frombuffer(blob, dtype=np.float32, count=nv * 3, offset=8).reshape(-1, 3)
     F = np.frombuffer(blob, dtype=np.uint32, count=nf * 3, offset=8 + nv * 12).reshape(-1, 3)
     return V, F
+
+
+NORMALS_FORMAT = "i16x3"  # what view_ready / view_part / detail_ready say (`normals`) when a view carries normals
+
+
+def packed_normals(blob):
+    """NORMALS_FORMAT when a packed view carries normals (its bytes run exactly 6 per vertex past the triangles: how
+    the editor tells too, api.parseMesh), else None."""
+    nv, nf = (int(x) for x in np.frombuffer(blob, dtype=np.uint32, count=2))
+    return NORMALS_FORMAT if nv and len(blob) == 8 + nv * 12 + nf * 12 + nv * 6 else None
+
+
+def unpack_normals(blob):
+    """The normals of a packed view (int16, n x 3, x NORMAL_SCALE; a view into the blob), or None."""
+    if packed_normals(blob) is None:
+        return None
+    nv, nf = (int(x) for x in np.frombuffer(blob, dtype=np.uint32, count=2))
+    return np.frombuffer(blob, dtype=np.int16, count=nv * 3, offset=8 + nv * 12 + nf * 12).reshape(-1, 3)
 
 
 def pack_faces(value, shown):
@@ -335,6 +365,39 @@ def _range(values):
     return (float(finite.min()), float(finite.max())) if finite.size else (0.0, 0.0)
 
 
+class ViewPublisher:
+    """Packs views and tells the editor (view_ready, view_part) in a thread of its own, one at a time in the
+    order they were handed in, so a run's next node starts at once: packing a Final view (0.1-0.2 s for
+    145 MB) held up every node after it. One per session. The run's thread calls `wait()` before anything
+    that reads the packed views (colours, the views left for the end) and before run_done, so a run's
+    views are all out when it ends, also when it was stopped, and none of them after the next run started
+    (the next run's thread starts only once this one has ended)."""
+
+    def __init__(self):
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="views")
+        self._pending = []
+        self._lock = threading.Lock()
+
+    def submit(self, fn, *args):
+        future = self._pool.submit(self._guarded, fn, *args)
+        with self._lock:
+            self._pending.append(future)
+        return future
+
+    @staticmethod
+    def _guarded(fn, *args):
+        try:
+            fn(*args)
+        except Exception:  # (showing it early failed: the rest go on, the run's end shows it)
+            traceback.print_exc()
+
+    def wait(self):
+        """Returns when everything handed in so far is out."""
+        with self._lock:
+            pending, self._pending = self._pending, []
+        concurrent.futures.wait(pending)
+
+
 class Session:
     def __init__(self, hub):
         self.hub = hub
@@ -351,6 +414,8 @@ class Session:
         self.face_infos = {}  # (node id, view version, body, face) -> /api/faceinfo answer (newest few)
         self.view_sources = {}  # node id -> (version, graph of that run, node id, port, quality, detail floor): what its view shows
         self.view_version = 0
+        self._views_out = ViewPublisher()  # packs and announces a run's views beside the run (ViewPublisher)
+        self._done = {}  # node id -> (seconds, cached, when) of the nodes done in this run, for the views' timing
         self._job_ids = itertools.count(1)
         self._owners = {}     # node id inside a group -> group node (events are shown on the group)
         self._group_out = set()  # inner nodes that give a group's outputs
@@ -376,6 +441,8 @@ class Session:
 
     def _on_event(self, event):
         node = event.get("node", "")
+        if event.get("type") == "node_done":  # (its outputs go to on_result right after this)
+            self._done[node] = (float(event.get("time") or 0.0), bool(event.get("cached")), time.perf_counter())
         if event.get("type") == "live_view":  # a shape while optimizing, shown as the node's view
             node = self._owners.get(node, node)
             data, nv, nf = pack_meshes(event["mesh"])
@@ -385,7 +452,7 @@ class Session:
                 self.view_faces.pop(node, None)
                 version = self.view_version
             self.hub.publish({"type": "view_ready", "node": node, "version": version, "verts": nv, "faces": nf,
-                              "kind": "mesh", "live": True, "run": self.run_id})
+                              "kind": "mesh", "live": True, "run": self.run_id, "normals": packed_normals(data)})
             return
         detail = (self.current or {}).get("mode") == "detail"
         if detail and event.get("type") == "node_done" and event.get("cached"):
@@ -473,6 +540,13 @@ class Session:
             if mode not in LONG_JOBS and ticket != self._requests:
                 return self.run_id
             self.cancel()
+            if any(self.views.get(n, (None,))[0] != h.get("version") for n, h in have.items()):
+                # the stopped run sent a newer view of a node the editor says it shows (its views go out as it
+                # ends, ViewPublisher): plan again without that one, so it is made again for this graph
+                have = {n: h for n, h in have.items() if self.views.get(n, (None,))[0] == h.get("version")}
+                graph, targets, views, slices = build_run_graph(graph_dict, mode, quality, visible, optimize,
+                                                                self.stamp, have, only)
+                job.update(graph=graph, targets=targets, views=views, slices=slices, have=have)
             self._launch(job)
             return self.run_id
 
@@ -612,9 +686,11 @@ class Session:
                 self._start_lock.release()
 
     def _run(self, run_id, job):
+        traced = trace.begin_run(f"{job.get('mode')} {job.get('quality')}")  # (DESIGN_ENGINE_TRACE=1: the job's timeline)
         try:
             self._run_job(run_id, job)
         finally:
+            trace.end_run(traced)
             if job["mode"] in LONG_JOBS:
                 self.stamp += 1
                 if job["mode"] == "optimize":
@@ -676,6 +752,7 @@ class Session:
         with self._lock:  # pieces of an earlier run's lists (one that was stopped)
             for key in [k for k in self.views if k.startswith("part:")]:
                 del self.views[key]
+        self._done = {}
         if not targets:
             publish(type="run_done", ok=True, time=0.0, files={}, sharper=sharper, shown=shown)
             return
@@ -684,36 +761,40 @@ class Session:
         # views shown as soon as their node is done (a run of many bodies showed nothing until its last);
         # coloured ones wait for their colours at the end. Their lists are shown item by item while they
         # are made (the lamp's 144 petals took 13-24 s at Final): the editor draws each item's piece
-        # instead of that item in the view it shows
+        # instead of that item in the view it shows. Packed and announced by the session's ViewPublisher,
+        # in this order, while the run goes on with its next node
         early = {}  # node computed -> [(node shown, view)]
         for node_id, view in views.items():
             if not view.kept and view.paint is None and not (surface and job["slices"]):
                 early.setdefault(view.src, []).append((node_id, view))
-        published = {}  # node shown -> (version, packed view)
+        published = {}  # node shown -> version of the view sent when its node was done
+
+        def show_early(shown_id, view, value, timing):
+            published[shown_id] = self._publish_view(publish, graph, shown_id, view, value, quality, timing)[0]
 
         def on_result(node_id, outputs):
             for shown_id, view in early.get(node_id, ()):
                 value = outputs.get(view.port)
                 if value is not None:
-                    published[shown_id] = self._publish_view(publish, graph, shown_id, view, value, quality)
+                    self._views_out.submit(show_early, shown_id, view, value, self._timing(node_id, t0))
 
         def on_item(node_id, index, total, outputs):
             for shown_id, view in early.get(node_id, ()):
                 piece = outputs.get(view.port)
                 if total < 2 or view.type == "cad" or not hasattr(piece, "faces"):
                     continue
-                data, _, nf = pack_meshes(piece)
-                with self._lock:
-                    self.view_version += 1
-                    self.views[f"part:{index}:{shown_id}"] = (self.view_version, data)
-                    version = self.view_version
-                publish(type="view_part", node=shown_id, index=index, total=total, version=version, kind=view.type,
-                        faces=nf)
+                self._views_out.submit(self._publish_piece, publish, shown_id, view, index, total, piece)
 
         self.evaluator.graph = graph
         self.evaluator.on_result, self.evaluator.on_item = (on_result, on_item) if early else (None, None)
         try:  # previews show what still works when a node fails (exports and optimizations stop)
-            results = self.evaluator.run(targets, keep_going=mode == "preview")
+            try:
+                results = self.evaluator.run(targets, keep_going=mode == "preview")
+            finally:
+                self.evaluator.on_result = self.evaluator.on_item = None
+                # the views of the nodes done so far are out before anything reads them and before run_done
+                # (also when stopped: they would have been out before too)
+                self._views_out.wait()
         except Cancelled:
             publish(type="run_done", ok=False, cancelled=True, time=time.perf_counter() - t0)
             return
@@ -726,8 +807,6 @@ class Session:
             publish(type="run_done", ok=False, error=f"{type(err).__name__}: {err}",
                     time=time.perf_counter() - t0)
             return
-        finally:
-            self.evaluator.on_result = self.evaluator.on_item = None
 
         if job.get("detail"):
             d = job["detail"]
@@ -738,7 +817,8 @@ class Session:
                 self.views[f"detail:{d['node']}"] = (self.view_version, data)
                 version = self.view_version
             publish(type="detail_ready", node=d["node"], version=version, view_version=d["view_version"],
-                    lo=d["lo"], hi=d["hi"], voxel=float(mesh.metadata.get("voxel", 0.0)), verts=nv, faces=nf)
+                    lo=d["lo"], hi=d["hi"], voxel=float(mesh.metadata.get("voxel", 0.0)), verts=nv, faces=nf,
+                    normals=packed_normals(data))
             publish(type="run_done", ok=True, time=time.perf_counter() - t0, files={}, label=job["label"],
                     voxel=float(mesh.metadata.get("voxel", 0.0)))
             return
@@ -768,7 +848,7 @@ class Session:
             if value is None:
                 continue
             publish(type="phase", text=f"preparing the view of {node_id}")
-            version, data = self._publish_view(publish, graph, node_id, view, value, quality)
+            version, data = self._publish_view(publish, graph, node_id, view, value, quality, self._timing(view.src, t0))
             own = results.get(view.paint[0], {}).get(view.paint[1]) if view.paint else None
             if own is not None:  # a result coloured onto the node's own body (Static Analysis)
                 publish(type="phase", text=f"colouring {node_id}")
@@ -791,7 +871,8 @@ class Session:
             hi = np.asarray(settings.get("hi", (50, 50, 50)), dtype=float)
             position = float(settings.get("position", (lo["xyz".index(axis)] + hi["xyz".index(axis)]) / 2))
             try:
-                image, rect = field_slice(value, axis, position, lo, hi, SLICE_RES[quality])
+                with trace.span("slice", node=node_id):
+                    image, rect = field_slice(value, axis, position, lo, hi, SLICE_RES[quality])
             except Exception as err:
                 publish(type="node_error", node=node_id, message=f"cannot show this field: {err}")
                 continue
@@ -822,11 +903,35 @@ class Session:
         results = None
         gc.collect()
 
-    def _publish_view(self, publish, graph, node_id, view, value, quality):
+    def _timing(self, node_id, t0):
+        """What the engine knows of how the node behind a view went, for the editor's view timing: the node's
+        own seconds (0 when cached), whether it was cached, seconds into the run when it was done, and (a
+        private `_done`, taken out by _publish_view) when, to tell how long its view waited to be packed."""
+        took, cached, done = self._done.get(node_id, (None, None, None))
+        return {"node_s": None if took is None else round(took, 4), "cached": cached,
+                "run_s": None if done is None else round(done - t0, 4), "_done": done}
+
+    def _publish_piece(self, publish, node_id, view, index, total, piece):
+        """Keep item `index` of a list being made as a piece of the view of `node_id` and tell the editor."""
+        data, _, nf = pack_meshes(piece)
+        with self._lock:
+            self.view_version += 1
+            self.views[f"part:{index}:{node_id}"] = (self.view_version, data)
+            version = self.view_version
+        publish(type="view_part", node=node_id, index=index, total=total, version=version, kind=view.type, faces=nf,
+                normals=packed_normals(data))
+
+    def _publish_view(self, publish, graph, node_id, view, value, quality, timing=None):
         """Keep `value` (a run's result) packed as the view of `node_id` and tell the editor (view_ready, with
-        the triangles of each list item, `parts`, so it can draw a later run's items over it as they come).
+        the triangles of each list item, `parts`, so it can draw a later run's items over it as they come;
+        `timing`: see _timing, with how long packing took and waited, for the editor's view timing).
         Returns (version, packed)."""
+        timing = dict(timing or {})
+        done = timing.pop("_done", None)
+        start = time.perf_counter()
         data, nv, nf, counts = pack_meshes(value, counts=True)
+        timing.update(pack_ms=round((time.perf_counter() - start) * 1000, 2), bytes=len(data),
+                      wait_ms=None if done is None else round((start - done) * 1000, 2))
         # voxel: what the view was meshed with; floor: how fine a detail of it may go (None: no detail)
         voxel = None if view.exact else view_voxel(value)
         floor = None if view.exact else detail_floor(graph, view.src, quality, voxel)
@@ -845,7 +950,8 @@ class Session:
                 del self.views[key]  # its items' pieces: the whole view is here
         publish(type="view_ready", node=node_id, version=version, verts=nv, faces=nf, kind=view.type,
                 key=view.key, level=LEVELS[-1] if view.exact else quality, exact=view.exact,
-                voxel=voxel, floor=floor, parts=counts if counts and len(counts) > 1 else None)
+                voxel=voxel, floor=floor, parts=counts if counts and len(counts) > 1 else None, timing=timing,
+                normals=packed_normals(data))
         return version, data
 
     def _paint(self, publish, node_id, view_version, data, paint, quality, source="field", key=None):
@@ -858,7 +964,8 @@ class Session:
         field_node, field = paint
         V, _ = unpack_meshes(data)
         try:
-            values = field_at_points(field, V, PAINT_CELLS[quality], ARRAY_CACHE, array_module, PAINT_MAX_VOXELS)
+            with trace.span("paint", node=node_id, field=field_node):
+                values = field_at_points(field, V, PAINT_CELLS[quality], ARRAY_CACHE, array_module, PAINT_MAX_VOXELS)
         except Exception as err:
             publish(type="node_error", node=field_node, message=f"cannot colour the surfaces with this field: {err}")
             return

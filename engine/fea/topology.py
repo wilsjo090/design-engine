@@ -28,7 +28,7 @@ from scipy.optimize import brentq
 from scipy.spatial import cKDTree
 from scipy.special import erfinv
 
-from .. import backend
+from .. import backend, trace
 from ..backend import gaussian_filter, to_host, xp_of
 from ..fields import Context, _digest
 from .analysis import _drop_loose, plan_grid
@@ -936,13 +936,14 @@ class Optimizer:
         xv = p.filter_empty(self.x)
         scale, rho = self._scale(self.carrying(xv, xb))
         warm = self.power if self.iteration >= WARM_LMAX_AFTER else []
-        try:
-            H, u, its = self._solve(scale, self.u, solver_callback, warm)
-        except NotConverged:
-            if not warm:
-                raise
-            # a warm lmax estimate too low (the smoothers then amplify what they should damp)
-            H, u, its = self._solve(scale, self.u, solver_callback, [])
+        with trace.span("solve", xp=xp):
+            try:
+                H, u, its = self._solve(scale, self.u, solver_callback, warm)
+            except NotConverged:
+                if not warm:
+                    raise
+                # a warm lmax estimate too low (the smoothers then amplify what they should damp)
+                H, u, its = self._solve(scale, self.u, solver_callback, [])
         self.power = H.power
         self.u = u
         level = H.exact or H.levels[0]
@@ -971,14 +972,15 @@ class Optimizer:
                 dc = dc - (p.prefer_strength * scale) * reward
         if p.mirror:
             dc, dv = p.symmetric(dc), p.symmetric(dv)
-        if p.local_sigma or p.section_sigma:
-            g, dg_xb = self._local_constraint(xb)
-            dg = p.filter_transpose(xp.where(free, dg_xb, 0.0) * slope)
-            if p.mirror:
-                dg = p.symmetric(dg)
-            x_new = self._update_two(self.x, dc, dv, dg, p.volume(xb), g)
-        else:
-            x_new = self._update(self.x, dc, dv)
+        with trace.span("oc update", xp=xp):
+            if p.local_sigma or p.section_sigma:
+                g, dg_xb = self._local_constraint(xb)
+                dg = p.filter_transpose(xp.where(free, dg_xb, 0.0) * slope)
+                if p.mirror:
+                    dg = p.symmetric(dg)
+                x_new = self._update_two(self.x, dc, dv, dg, p.volume(xb), g)
+            else:
+                x_new = self._update(self.x, dc, dv)
         if p.section_sigma:
             self._track_moves(x_new - self.x)
         change = float(xp.max(xp.abs(x_new - self.x)[free])) if bool(xp.any(free)) else 0.0
@@ -1013,7 +1015,8 @@ class Optimizer:
         iteration (progress, live view, checkpoints; it may raise to stop)."""
         while not self.done and (hand_over is None or self.beta < hand_over):
             t = time.perf_counter()
-            c, v, ch = self.step(solver_callback)
+            with trace.span("iteration", item=self.iteration + 1, xp=self.p.xp):
+                c, v, ch = self.step(solver_callback)
             if on_iteration is not None:
                 on_iteration(self, c, v, ch, time.perf_counter() - t)
         return self

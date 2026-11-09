@@ -19,7 +19,7 @@ def body():
     return F.body_from_mesh(BOX, band=2.0)
 
 
-def sequential(fn, arg_list, need=0, gpu=False, gpu_need=0):
+def sequential(fn, arg_list, need=0, gpu=False, gpu_need=0, cpu_need=None):
     return [fn(**a) for a in arg_list]
 
 

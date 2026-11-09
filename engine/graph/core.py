@@ -46,12 +46,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .. import backend
+from .. import backend, stages, trace
 from ..cache import (COMMIT_LAST_RESORT, COMMIT_STOP, COMMIT_TIGHT, available_memory, commit_room, memory_limit,
-                     memory_room, psutil, ram_cache_budget, refresh_memory_limit)
+                     memory_room, psutil, ram_cache_budget, refresh_memory_limit, resident_memory)
 from .workers import StickyPool
 
 REQUIRED = object()
+
+# Two-stage maps (engine/stages.py): a map on the GPU hands its items' CPU stages (decimation, reduction,
+# dual contouring) to CPU workers. DESIGN_ENGINE_SPLIT=0 never splits, =1 always (also on the CPU: for
+# tests and measuring); otherwise maps that use the GPU do (Evaluator.split overrides it).
+SPLIT = {"0": False, "off": False, "no": False, "1": True, "on": True, "yes": True}.get(
+    os.environ.get("DESIGN_ENGINE_SPLIT", "").strip().lower(), "auto")
+CPU_WORKERS_MAX = int(os.environ.get("DESIGN_ENGINE_CPU_WORKERS") or 10)  # CPU workers at most (Evaluator._cpu_slots)
+CPU_WORKER_BYTES = int(0.12 * 2**30)  # RAM of a CPU worker itself (meshing's libraries only: 0.09-0.14 GB resident)
 
 # Free RAM (whole PC) at which the memory watchdog acts. With the page file on a mechanical hard disk
 # the PC froze long before memory ran out (with ~1 GB still "free"), so runs stopped at 1.5 GB free.
@@ -96,19 +104,21 @@ def check_cancel():
         ctx[0]._check_cancel()
 
 
-def parallel_map(fn, arg_list, need=0, gpu=False, title="Blocks", gpu_need=0, parts=None):
+def parallel_map(fn, arg_list, need=0, gpu=False, title="Blocks", gpu_need=0, parts=None, cpu_need=None):
     """Run fn(**args) for every item, in the evaluator's worker processes when called by a node
     running in the main process (one big body split into pieces); one by one inside a worker or
     outside a run. `need`: bytes one item needs (limits how many run at once); `gpu`: the items
     use the GPU (limits how many run at once by free GPU memory, `gpu_need` = extra GPU bytes per
     worker). `parts`: the node's output (a port name) is the list of the results, in order: each is
-    passed on as it comes (Evaluator.on_item; the 3D view shows them before the last is done)."""
+    passed on as it comes (Evaluator.on_item; the 3D view shows them before the last is done).
+    `cpu_need`: bytes an item's CPU stage needs (stages.cpu_stage; sizes the CPU workers), default need."""
     ctx = getattr(_current, "ctx", None)
     if ctx is None:
-        return [fn(**a) for a in arg_list]
+        with stages.allow(False):  # (inside a worker's item: the results are used here, not handed over)
+            return [fn(**a) for a in arg_list]
     evaluator, node_id = ctx
     return evaluator._map_in_workers(node_id, fn, arg_list, need, gpu, title, gpu_need, step=title,
-                                     parts=(lambda value: {parts: value}) if parts else None)
+                                     parts=(lambda value: {parts: value}) if parts else None, cpu_need=cpu_need)
 
 
 def report_view(mesh):
@@ -137,12 +147,13 @@ def report_message(text, level="info"):
     the node's result from the cache. In a worker process the lines go back with the item's result."""
     ctx = getattr(_current, "ctx", None)
     if ctx is None:
-        sink = getattr(_current, "sink", None)  # set by the worker process around each item
-        if sink is not None:
-            sink.append((text, level))
+        stages.to_sink(text, level)  # (set by the worker process around each item)
         return
     evaluator, node_id = ctx
     evaluator._message(node_id, text, level)
+
+
+stages.reporter = report_message  # (stage functions report through engine.stages, which a CPU worker has alone)
 
 
 def stop_idle_workers():
@@ -645,6 +656,7 @@ class Evaluator:
         self.failed = []    # run(keep_going=True): a GraphError per node that failed or has a problem
         self.memory_peak = 0
         self._notices = set()  # lines already sent this run (_notice)
+        self.split = None  # two-stage maps: None = as SPLIT says (on the GPU), True = always, False = never
 
     def cancel(self):
         self._cancel = True
@@ -740,7 +752,9 @@ class Evaluator:
 
     # --- memory ------------------------------------------------------------------------------
     def memory_in_use(self):
-        """Resident bytes of this process plus its worker processes (0 if psutil is missing).
+        """Resident bytes of this process plus its worker processes (0 if psutil is missing): each one's
+        private working set (cache.resident_memory), so files they all map (CAD arrays, SSD cache hits) are
+        not counted once per process.
 
         When RAM runs short, Windows pages memory out and this drops while a process keeps
         growing (a runaway import showed 5 GB resident with 23 GB committed). Committed memory is
@@ -750,13 +764,7 @@ class Evaluator:
         if psutil is None:
             return 0
         pids = [os.getpid()] + (self._pool.pids() if self._pool is not None else [])
-        total = 0
-        for pid in pids:
-            try:
-                total += psutil.Process(pid).memory_info().rss
-            except psutil.Error:
-                pass
-        return total
+        return sum(resident_memory(pid) for pid in pids)
 
     def _watch_memory(self, stop):
         """Runs during a run: frees caches when memory gets tight, and as a last resort stops
@@ -837,9 +845,11 @@ class Evaluator:
         stop = threading.Event()
         watchdog = threading.Thread(target=self._watch_memory, args=(stop,), daemon=True)
         watchdog.start()
+        traced = trace.begin_run("run")  # (None when off, or inside a server job, which traces its whole run)
         try:
             return self._run(targets, keep_going)
         finally:
+            trace.end_run(traced)
             stop.set()
             watchdog.join()
             self.clear_stop()
@@ -879,6 +889,7 @@ class Evaluator:
             cached = self._cache.get(node_id)
             if cached and cached[0] == sig and not ntype.side_effect:
                 results[node_id] = cached[1]
+                trace.mark("cached", node=node_id)
                 self._emit(type="node_done", node=node_id, time=0.0, cached=True, range=_output_range(cached[1]),
                            messages=cached[2], **_output_extras(cached[1]))
                 self._result(node_id, cached[1])
@@ -888,7 +899,8 @@ class Evaluator:
             _current.ctx = (self, node_id)
             self._warnings, self._collect = [], None
             try:
-                outputs = self._call(node_id, ntype, kwargs)
+                with trace.span("node", node=node_id, type=spec["type"]):
+                    outputs = self._call(node_id, ntype, kwargs)
             except Cancelled:
                 raise
             except Exception as err:
@@ -936,7 +948,8 @@ class Evaluator:
             try:
                 for i in range(count):
                     self._check_cancel()
-                    items.append(self._normalise(ntype, ntype.fn(**args_for(i))))
+                    with trace.span("item", item=i):
+                        items.append(self._normalise(ntype, ntype.fn(**args_for(i))))
                     self._item(node_id, i, count, items[-1])
                     self._emit(type="progress", node=node_id, done=i + 1, total=count)
             finally:  # also the lines of the items done before one failed
@@ -957,7 +970,33 @@ class Evaluator:
                                      parts=lambda result: self._normalise(ntype, result))
         return [self._normalise(ntype, r) for r in items]
 
-    def _map_in_workers(self, node_id, fn, arg_list, need, uses_gpu, title, gpu_need=0, step=None, parts=None):
+    def _splits(self, on_gpu):
+        """Whether a map hands its items' CPU stages to CPU workers: when it runs on the GPU (unless
+        DESIGN_ENGINE_SPLIT or `split` say otherwise). On the CPU every worker does both stages anyway."""
+        split = self.split if self.split is not None else SPLIT
+        return bool(on_gpu) if split == "auto" else bool(split)
+
+    def _cpu_slots(self, need, cpu_need, active, items):
+        """How many CPU workers a splitting map may use: the cores the GPU workers and this process leave,
+        CPU_WORKERS_MAX at most (16 cores are full at ~14 working processes, and then each stage just takes
+        longer: hex studs' block reductions took 49 ms each with 8 workers, 56 with 8 GPU + 6 CPU workers, 104
+        with 8 + 12, meshing 17.4 and 17.2 s; the lamp's petals with 4 GPU workers 10.4 s with 10 CPU workers
+        and with 12), and as many as fit in the memory still free under the limit beside the map's GPU workers
+        (`need` each): a new one CPU_WORKER_BYTES plus a stage (`cpu_need`), one already running a stage."""
+        pool = self._pool
+        cores = (os.cpu_count() or 4) - active - 1
+        have = pool.cpu_started()
+        room = min(memory_limit() - self.memory_in_use(), memory_room()) - active * need - have * cpu_need
+        more = max(0, int(room // (CPU_WORKER_BYTES + cpu_need)))
+        # ... and new ones only in the RAM that is free now: CPU workers only speed a map up, and the limits above
+        # allow paging out (commit room). The lamp's Final in the editor beside the user's other programs: 8 GPU
+        # + 10 CPU workers took the PC under 2 GB free (2026-11-09), where paging costs more than they gain
+        ram = available_memory() - FREE_TIGHT - active * need
+        more = max(0, min(more, int(ram // (CPU_WORKER_BYTES + cpu_need))))
+        return max(0, min(CPU_WORKERS_MAX, cores, items, have + more))
+
+    def _map_in_workers(self, node_id, fn, arg_list, need, uses_gpu, title, gpu_need=0, step=None, parts=None,
+                        cpu_need=None):
         # Separate processes: most of the work holds the GIL, so threads barely help. Item i
         # always goes to the same worker, whose caches then stay warm across edits.
         # `parts(result)`: the node's outputs of one item, when the results are its output list
@@ -967,7 +1006,8 @@ class Evaluator:
             try:
                 for i, args in enumerate(arg_list):
                     self._check_cancel()
-                    out.append(fn(**args))
+                    with trace.span("item", item=i):
+                        out.append(fn(**args))
                     if parts and self.on_item:
                         self._item(node_id, i, len(arg_list), parts(out[-1]))
                     self._emit(type="progress", node=node_id, done=i + 1, total=len(arg_list), step=step)
@@ -983,7 +1023,7 @@ class Evaluator:
             os.environ["DESIGN_ENGINE_GPU"] = "1" if gpu else "0"  # inherited by the workers
             self._pool = StickyPool(self.workers)
             self._pool.gpu = gpu
-        active = min(self._parallel_slots(need), self._pool.n)
+        active = slots = min(self._parallel_slots(need), self._pool.n)
         if active < self._pool.n:
             self._notice(f"{title}: running {active} at a time to stay within the memory limit", node_id)
         if gpu and uses_gpu:
@@ -995,10 +1035,19 @@ class Evaluator:
                 self._notice(f"{title}: {n_gpu} on the GPU at a time (limited by free GPU memory)", node_id)
             active = n_gpu
             self._pool.gpu_contexts = max(self._pool.gpu_contexts, active)
+        # Items whose function ends in a CPU stage (stages.cpu_stage) hand it to CPU workers, so the few
+        # GPU workers go on to their next item at once (started when the first stage is handed over).
+        cpu = 0
+        if self._splits(gpu and uses_gpu):
+            cpu = self._cpu_slots(need, need if cpu_need is None else cpu_need, active, len(arg_list))
+        # (memory: how many the memory limit allows; active: how many run, fewer when the GPU limits them;
+        # cpu: CPU workers for the items' CPU stages, 0 = no split)
+        trace.mark("map plan", items=len(arg_list), workers=self._pool.n, memory=slots, active=active,
+                   gpu=bool(gpu and uses_gpu), cpu=cpu, step=title)
         lines = []
         try:
             items = self._pool.map(
-                fn, arg_list, active=active,
+                fn, arg_list, active=active, split=cpu > 0, cpu_workers=cpu,
                 on_progress=lambda done, total: self._emit(type="progress", node=node_id, done=done, total=total,
                                                            step=step),
                 should_stop=lambda: self._cancel, lines=lines,

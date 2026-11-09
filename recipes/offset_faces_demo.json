@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/test_part.step",
+        "tolerance": 0.01
+      },
+      "pos": [0, 0]
+    },
+    "part": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "cad": {"link": "import.bodies"},
+        "band": 3.0
+      },
+      "pos": [320, 0]
+    },
+    "raised": {
+      "type": "implicit.offset_faces",
+      "inputs": {
+        "body": {"link": "part.out"},
+        "cad": {"link": "import.bodies"},
+        "faces": "top",
+        "distance": 1.5,
+        "sides": "straight",
+        "edge": "chamfer",
+        "edge_size": 0.5,
+        "foot": "smooth",
+        "foot_size": 0.8
+      },
+      "pos": [640, 0]
+    },
+    "recessed": {
+      "type": "implicit.offset_faces",
+      "inputs": {
+        "body": {"link": "raised.out"},
+        "cad": {"link": "import.bodies"},
+        "faces": "front",
+        "distance": -0.8,
+        "sides": "straight",
+        "edge": "round",
+        "edge_size": 0.3,
+        "foot": "round",
+        "foot_size": 0.3
+      },
+      "pos": [960, 0]
+    },
+    "vents": {
+      "type": "pattern.holes",
+      "inputs": {
+        "cad": {"link": "import.bodies"},
+        "faces": "top",
+        "shape": "round",
+        "size": 3.0,
+        "layout": "staggered",
+        "spacing": 7.0,
+        "margin": 3.0,
+        "moved": 1.5
+      },
+      "pos": [960, 420]
+    },
+    "vented": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {"link": "recessed.out"},
+        "b": {"link": "vents.out"}
+      },
+      "pos": [1280, 0],
+      "visible": true
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "body": {"link": "vented.out"},
+        "voxel": 0.15,
+        "padding": 1.5
+      },
+      "pos": [1600, 0]
+    }
+  },
+  "selections": {
+    "top": "10",
+    "front": "7"
+  }
+}

@@ -38,19 +38,38 @@ function InactiveBanner() {
 /** A pause before each finer preview: a change made meanwhile starts from Draft again instead of
  *  waiting for a heavy run to stop. */
 const REFINE_DELAY = 800
+/** A preview done in this long (ms, from its run_start to its run_done as the editor saw them) was quick: the
+ *  next finer one starts as soon as the graph has been left alone for REFINE_DELAY (counted from the last
+ *  change, not from the end of the preview), but at least SHORT_PAUSE after it. Hex studs: Draft 0.03 s, Medium
+ *  1.7 s, Final 0.55 s, and the two full pauses added 1.6 s (so not 1.5 s here: its Medium would miss it).
+ *  After a slower preview the pause stays REFINE_DELAY: the next quality is heavier still, and a change made
+ *  meanwhile would have to wait for it to stop. */
+const QUICK_RUN = 2500
+const SHORT_PAUSE = 150
 
 /** Refine the view (Refine on): when a preview is done and nothing has changed since it was asked
- *  for, the next finer quality runs, up to the chosen one (the store sets `run.next`). */
+ *  for, the next finer quality runs, up to the chosen one (the store sets `run.next`). Never while a number is
+ *  being dragged (`valueDrag`: the pointer may rest on a slider for a moment): only once it is let go. */
 function useRefine() {
   const run = useStore((s) => s.run)
+  const dragging = useStore((s) => s.valueDrag)
+  const changedAt = useRef(0)   // performance.now() of the last graph change
+  useEffect(() => useStore.subscribe((s, prev) => {
+    if (s.graphVersion !== prev.graphVersion) changedAt.current = performance.now()
+  }), [])
   useEffect(() => {
-    if (!run || run.running || !run.next) return
+    if (!run || run.running || !run.next || dragging) return
+    const took = (run.endedAt ?? Date.now()) - run.startedAt
+    const quiet = performance.now() - changedAt.current
+    const delay = took <= QUICK_RUN ? Math.max(SHORT_PAUSE, REFINE_DELAY - quiet) : REFINE_DELAY
     const t = setTimeout(() => {
       const s = useStore.getState()
-      if (s.run === run && s.refine && s.connected && run.tag?.version === s.graphVersion) startRun('preview', run.next)
-    }, REFINE_DELAY)
+      if (s.run === run && s.refine && s.connected && !s.valueDrag && run.tag?.version === s.graphVersion) {
+        startRun('preview', run.next)
+      }
+    }, delay)
     return () => clearTimeout(t)
-  }, [run])
+  }, [run, dragging])
 }
 
 function useSplit() {

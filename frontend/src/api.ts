@@ -1,6 +1,7 @@
 ﻿import { CLIENT, isClip, useStore, type Clip } from './store'
 import type { Axis, Catalog, FaceData, Paint, Quality, QueueState, Recipe, RunTag, ViewMesh } from './types'
 import { QUALITIES } from './types'
+import { viewArrived, viewFetched, type EngineTiming } from './viewTiming'
 
 async function check(res: Response) {
   if (!res.ok) {
@@ -406,6 +407,19 @@ export async function requestDetail(node: string, view: ViewMesh, lo: number[], 
   }
 }
 
+/** A packed mesh (server.pack_meshes): uint32 vertex and triangle counts, float32 positions, uint32 indices, then,
+ *  when the engine made them (views of implicit bodies: view_ready's `normals` is "i16x3"), the field's normals as
+ *  int16 x 3, 6 bytes a vertex. Told by the length, so a view served newer than announced is read right; anything
+ *  else after the indices is left alone (no normals: they are worked out from the triangles). */
+export function parseMesh(buf: ArrayBuffer) {
+  const [nv, nf] = new Uint32Array(buf, 0, 2)
+  const positions = new Float32Array(buf, 8, nv * 3)
+  const indices = new Uint32Array(buf, 8 + nv * 12, nf * 3)
+  const at = 8 + nv * 12 + nf * 12
+  const normals = nv > 0 && buf.byteLength === at + nv * 6 ? new Int16Array(buf, at, nv * 3) : undefined
+  return { nf, positions, indices, normals }
+}
+
 async function fetchDetail(e: { node: string; version: number; view_version: number; lo: number[]; hi: number[];
   voxel: number }) {
   const s = useStore.getState()
@@ -413,14 +427,11 @@ async function fetchDetail(e: { node: string; version: number; view_version: num
   if (!view?.key || view.version !== e.view_version) return
   const res = await fetch(`/api/view/${encodeURIComponent(`detail:${e.node}`)}`)
   if (!res.ok) return
-  const buf = await res.arrayBuffer()
-  const [nv, nf] = new Uint32Array(buf, 0, 2)
-  const positions = new Float32Array(buf, 8, nv * 3)
-  const indices = new Uint32Array(buf, 8 + nv * 12, nf * 3)
+  const { nf, positions, indices, normals } = parseMesh(await res.arrayBuffer())
   const lo = e.lo as [number, number, number], hi = e.hi as [number, number, number]
   useStore.getState().setDetail(e.node, { version: Number(res.headers.get('X-View-Version') ?? e.version),
     viewVersion: e.view_version, key: view.key, lo, hi, voxel: e.voxel,
-    mesh: { version: e.version, kind: view.kind, faces: nf, positions, indices, bounds: [lo, hi] } })
+    mesh: { version: e.version, kind: view.kind, faces: nf, positions, indices, normals, bounds: [lo, hi] } })
 }
 
 function boundsOf(positions: Float32Array): ViewMesh['bounds'] {
@@ -437,18 +448,27 @@ function boundsOf(positions: Float32Array): ViewMesh['bounds'] {
 }
 
 async function fetchView(e: { node: string; version: number; kind: string; key?: string; level?: Quality; exact?: boolean;
-  voxel?: number | null; floor?: number | null; parts?: number[] | null }) {
+  voxel?: number | null; floor?: number | null; parts?: number[] | null; faces?: number; run?: number;
+  timing?: EngineTiming | null }) {
+  const timing = viewArrived(e)   // (window.__viewTiming; the 3D view's View ▸ View timing shows it)
+  const t0 = performance.now()
   const res = await fetch(`/api/view/${encodeURIComponent(e.node)}`)
-  if (!res.ok) return
+  if (!res.ok) {
+    viewFetched(timing, null, { download_ms: performance.now() - t0 })
+    return
+  }
   const buf = await res.arrayBuffer()
-  const [nv, nf] = new Uint32Array(buf, 0, 2)
-  const positions = new Float32Array(buf, 8, nv * 3)
-  const indices = new Uint32Array(buf, 8 + nv * 12, nf * 3)
+  const t1 = performance.now()
+  const { nf, positions, indices, normals } = parseMesh(buf)
   const served = Number(res.headers.get('X-View-Version') ?? e.version)
   // what it is made of belongs to the version announced; a newer one served instead is announced itself
   const own = served === e.version
-  useStore.getState().setView(e.node, { version: served, kind: e.kind, faces: nf, positions, indices, bounds: boundsOf(positions),
-    ...(own ? { key: e.key, level: e.level, exact: e.exact, voxel: e.voxel, floor: e.floor, parts: e.parts } : {}) })
+  const view: ViewMesh = { version: served, kind: e.kind, faces: nf, positions, indices, normals,
+    bounds: boundsOf(positions),
+    ...(own ? { key: e.key, level: e.level, exact: e.exact, voxel: e.voxel, floor: e.floor, parts: e.parts } : {}) }
+  viewFetched(timing, view, { download_ms: t1 - t0, bytes: buf.byteLength, parse_ms: performance.now() - t1 })
+  useStore.getState().setView(e.node, view)
+  if (useStore.getState().views[e.node] !== view) timing.skipped = true   // (a newer one is shown)
 }
 
 /** Items of lists being made (view_part), fetched and waiting to go to the store together: one update and
@@ -460,12 +480,9 @@ let pieceTimer: ReturnType<typeof setTimeout> | null = null
 async function fetchPiece(e: { node: string; index: number; total: number; version: number; kind: string }) {
   const res = await fetch(`/api/view/${encodeURIComponent(`part:${e.index}:${e.node}`)}`)
   if (!res.ok) return  // the whole view is there already
-  const buf = await res.arrayBuffer()
-  const [nv, nf] = new Uint32Array(buf, 0, 2)
-  const positions = new Float32Array(buf, 8, nv * 3)
-  const indices = new Uint32Array(buf, 8 + nv * 12, nf * 3)
+  const { nf, positions, indices, normals } = parseMesh(await res.arrayBuffer())
   pieceBatch.push({ node: e.node, index: e.index, total: e.total,
-    mesh: { version: e.version, kind: e.kind, faces: nf, positions, indices, bounds: boundsOf(positions) } })
+    mesh: { version: e.version, kind: e.kind, faces: nf, positions, indices, normals, bounds: boundsOf(positions) } })
   pieceTimer ??= setTimeout(() => {
     const batch = pieceBatch
     pieceBatch = []

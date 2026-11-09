@@ -206,8 +206,10 @@ class Holes:
 def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD", angle=0.0,
           offset=(0.0, 0.0), margin=2.0, depth=0.0, size_scale=1.0, height=0.0, rotation=None, check=None,
           surface=False, randomness=0.0, seed=0, min_size=0.0, morph_to=None, morph=0.0, alternate="none",
-          tilt=0.0, join="tangent"):
+          tilt=0.0, join="tangent", moved=0.0):
     """The holes of a pattern on CAD faces `chosen` (face numbers) of a tessellated body.
+    moved: how far an Offset Faces moved those faces out (negative: in), mm, a number or a field
+    read at each centre: holes start from the moved surface (`_depths`).
     join: "tangent" = faces joined smoothly share one pattern, unfolded flat; "no" = one per face.
     min_size: shapes narrower than this after Size scale (mm, inner width) are left out.
     morph_to: a second shape each hole blends into by `morph` (0..1, a number or a field read at its
@@ -347,7 +349,15 @@ def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD
         no_wall = np.zeros(len(holes), dtype=bool)
         holes.wall = _walls(holes, V, Fc)
     else:
-        no_wall = _depths(holes, V, Fc, pocket=amount if pockets else None, height=amount if raised else None)
+        shift = None
+        if isinstance(moved, Field) or moved != 0:
+            shift = np.nan_to_num(read_at(moved, holes.centre, check)) if isinstance(moved, Field) else \
+                np.full(len(holes), float(moved))
+            if len(shift):
+                holes.note(f"faces moved by {shift.min():.2f} to {shift.max():.2f} mm" if isinstance(moved, Field)
+                           else f"faces moved by {float(moved):g} mm: {what} start from the moved surface")
+        no_wall = _depths(holes, V, Fc, pocket=amount if pockets else None, height=amount if raised else None,
+                          moved=shift)
         holes.take(~no_wall)
 
     n = len(holes)
@@ -1058,16 +1068,22 @@ def _walls(holes, V, F):
     return ray_thickness(V, F, holes.centre, holes.normal, reach).astype(np.float64)
 
 
-def _depths(holes, V, F, pocket=None, height=None):
+def _depths(holes, V, F, pocket=None, height=None, moved=None):
     """Sets each shape's depth below and reach above the face. pocket: per-shape pocket depths
     (None: through holes); height: per-shape heights of raised shapes (None: cut into the part).
-    Returns the mask of through holes that found no wall behind them."""
+    moved: per shape, how far an Offset Faces moved the face (None: not), so the shapes start from
+    the moved surface: through holes reach that much higher (their far side stays), pockets and
+    raised shapes are measured from it. Depths and reaches stay measured from the CAD face (rays
+    are cast on the CAD mesh). Returns the mask of through holes that found no wall behind them."""
     from .checks import ray_first_hit, ray_thickness  # Warp: only needed here
     n = len(holes)
     if not n:
         return np.zeros(0, dtype=bool)
     axis = holes.normal
     face_n = holes.face_normal if holes.face_normal is not None else axis
+    # the moved surface lies `moved` off the face along its normal: farther along a tilted axis
+    moved = np.zeros(n) if moved is None else \
+        np.asarray(moved, dtype=np.float64) / np.maximum(np.einsum("nd,nd->n", axis, face_n), 0.1)
     # samples around the outline (in the plane across the axis), moved along the axis onto the
     # face's tangent plane: the same points unless the hole is tilted; `s` = how far along the axis
     around = holes.outlines(np.arange(n), RAYS, shrink=0.9)                    # (n, RAYS, 3)
@@ -1081,13 +1097,14 @@ def _depths(holes, V, F, pocket=None, height=None):
         hit, sign = ray_first_hit(V, F, around.reshape(-1, 3), -up, float(2 * r.max() + 1.0))
         drop = np.where((hit >= 0) & (sign > 0), hit, 0.0).reshape(n, RAYS)
         wall = ray_thickness(V, F, holes.centre, axis, reach)
-        sink = np.maximum((drop - s).max(axis=1), 0.0) + JOIN
+        sink = np.maximum((drop - s).max(axis=1), 0.0) + JOIN - moved
         holes.depth = np.where(np.isfinite(wall), np.minimum(sink, 0.9 * wall), sink)
-        holes.outer = np.asarray(height, dtype=np.float64)
+        holes.outer = np.asarray(height, dtype=np.float64) + moved
         return np.zeros(n, dtype=bool)
     hit, sign = ray_first_hit(V, F, around.reshape(-1, 3), up, float(2 * r.max() + OUTSIDE))
     rise = np.where((hit >= 0) & (sign < 0), hit, 0.0).reshape(n, RAYS)      # the face curves up there
-    holes.outer = OUTSIDE + np.maximum((rise + s).max(axis=1), 0.0)
+    holes.outer = OUTSIDE + np.maximum((rise + s).max(axis=1), 0.0) + (moved if pocket is not None else
+                                                                        np.maximum(moved, 0.0))
     starts = np.concatenate([holes.centre, around.reshape(-1, 3)])
     t = ray_thickness(V, F, starts, np.concatenate([axis, up]), reach)
     centre, ring = t[:n], t[n:].reshape(n, RAYS)
@@ -1095,7 +1112,7 @@ def _depths(holes, V, F, pocket=None, height=None):
     through = deepest + EXTRA
     ring_most = np.fmax(centre, np.where(np.isfinite(ring), ring, -np.inf).max(axis=1))
     if pocket is not None:  # a pocket as deep as the wall (or deeper) goes through, but no further
-        pocket = np.asarray(pocket, dtype=np.float64)
+        pocket = np.asarray(pocket, dtype=np.float64) - moved   # below the CAD face
         deeper = np.isfinite(deepest) & (pocket > deepest - 0.05)
         holes.depth = np.where(deeper, through, pocket)
         if deeper.any():

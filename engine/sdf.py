@@ -5,6 +5,8 @@ import igl
 import numpy as np
 import trimesh
 
+from . import shared
+from .cache import is_mapped
 from .grid import upsample_linear
 
 _WINDING = igl.SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER
@@ -15,15 +17,20 @@ class _Cracks:
     """Open edges of a mesh (e.g. T-junctions at fillet corners). The pseudonormal sign is only
     unreliable for query points whose closest surface point lies on one of these edges."""
 
-    def __init__(self, mesh, tol=1e-3):
-        edges = mesh.edges_sorted[trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)]
-        self.a = mesh.vertices[edges[:, 0]]
-        self.b = mesh.vertices[edges[:, 1]]
-        touched = np.zeros(len(mesh.vertices), dtype=bool)
-        touched[edges.ravel()] = True
-        self.faces = touched[mesh.faces].any(axis=1)
+    def __init__(self, a, b, faces, tol=1e-3):
+        self.a, self.b = a, b  # each crack edge's ends
+        self.faces = faces     # per triangle: touches a crack
         self.tol = tol
-        self.count = len(edges)
+        self.count = len(a)
+
+    @staticmethod
+    def arrays(V, F):
+        """(a, b, faces) for a mesh (V, F)."""
+        sorted_edges = trimesh.Trimesh(V, F, process=False).edges_sorted
+        edges = sorted_edges[trimesh.grouping.group_rows(sorted_edges, require_count=1)]
+        touched = np.zeros(len(V), dtype=bool)
+        touched[edges.ravel()] = True
+        return V[edges[:, 0]], V[edges[:, 1]], touched[F].any(axis=1)
 
     def near(self, face, closest):
         """Mask of points whose closest point (on `face`) lies on a crack edge."""
@@ -45,23 +52,22 @@ class MeshQuery:
     """Signed-distance queries against one mesh. The search tree and normals are built once and
     reused: rebuilding them costs ~0.1 s per call, which dominated small (preview) grids."""
 
-    def __init__(self, V, F):
+    def __init__(self, V, F, prepared=None):
+        """`prepared`: query_arrays(V, F), worked out by another process (shared.prepared), else here."""
         self.V = np.ascontiguousarray(V, dtype=np.float64)
         self.F = np.ascontiguousarray(F, dtype=np.int64)
         self.tree = igl.AABB()
         self.tree.init(self.V, self.F)
-        self.FN = igl.per_face_normals(self.V, self.F)
-        self.VN = igl.per_vertex_normals(self.V, self.F, igl.PER_VERTEX_NORMALS_WEIGHTING_TYPE_ANGLE)
-        self.EN, _, emap = igl.per_edge_normals(self.V, self.F, igl.PER_EDGE_NORMALS_WEIGHTING_TYPE_UNIFORM)[:3]
-        self.EMAP = np.asarray(emap).ravel()
-        self.cracks = _Cracks(trimesh.Trimesh(self.V, self.F, process=False))
+        p = prepared if prepared is not None else query_arrays(self.V, self.F)
+        self.FN, self.VN, self.EN, self.EMAP = p["FN"], p["VN"], p["EN"], p["EMAP"]
+        self.cracks = _Cracks(p["crack_a"], p["crack_b"], p["crack_faces"])
         self._fwn = None  # winding-number tree, built on first need
 
     @property
     def nbytes(self):
-        """RAM it holds: the arrays, plus TREE_BYTES per triangle for each search tree (libigl's are
-        not numpy arrays)."""
-        arrays = sum(a.nbytes for a in (self.V, self.F, self.FN, self.VN, self.EN, self.EMAP))
+        """RAM of its own: the arrays not mapped from the shared folder, plus TREE_BYTES per triangle for
+        each search tree (libigl's are not numpy arrays)."""
+        arrays = sum(a.nbytes for a in (self.V, self.F, self.FN, self.VN, self.EN, self.EMAP) if not is_mapped(a))
         return arrays + TREE_BYTES * len(self.F) * (1 if self._fwn is None else 2)
 
     def _inside(self, points):
@@ -130,19 +136,46 @@ MAX_QUERY_BYTES = 768 * 2**20
 TREE_BYTES = 450
 
 
+# Meshes from this many triangles get their normals and cracks worked out once for all processes and mapped
+# from the shared folder (shared.prepared): per worker ~96 B per triangle kept and ~240 B while finding the
+# cracks, ~2.5 GB over 8 workers for a 2.4M-triangle part. Smaller ones (a lamp petal) are quicker built
+# than written and read.
+PREPARE_TRIANGLES = 100_000
+
+
+def query_arrays(V, F):
+    """A mesh's normals (face, angle-weighted vertex, edge; libigl's edge map) and cracks, for MeshQuery."""
+    V = np.ascontiguousarray(V, dtype=np.float64)
+    F = np.ascontiguousarray(F, dtype=np.int64)
+    EN, _, emap = igl.per_edge_normals(V, F, igl.PER_EDGE_NORMALS_WEIGHTING_TYPE_UNIFORM)[:3]
+    a, b, faces = _Cracks.arrays(V, F)
+    return {"FN": igl.per_face_normals(V, F),
+            "VN": igl.per_vertex_normals(V, F, igl.PER_VERTEX_NORMALS_WEIGHTING_TYPE_ANGLE),
+            "EN": EN, "EMAP": np.asarray(emap).ravel(), "crack_a": a, "crack_b": b, "crack_faces": faces}
+
+
 def arrays(*items):
     """Plain arrays from arrays or shared.Shared arrays (those are read from the SSD here)."""
     return [a.get() if hasattr(a, "get") else a for a in items]
 
 
+def _new_query(V, F, key):
+    V, F = arrays(V, F)
+    prepared = None
+    if key is not None and len(F) >= PREPARE_TRIANGLES:
+        prepared = shared.prepared("mesh query", key, lambda: query_arrays(V, F))
+    return MeshQuery(V, F, prepared)
+
+
 def mesh_query(V, F, key=None):
     """Search structures for the mesh (V, F), built once per process for each `key`. V and F
-    may be shared.Shared arrays: they are only read when the structures have to be built."""
+    may be shared.Shared arrays: they are only read when the structures have to be built. For a
+    big mesh with a key, everything but the search tree is worked out once for all processes."""
     if key is None:
         return MeshQuery(*arrays(V, F))
     query = _QUERIES.get(key)
     if query is None:
-        query = _QUERIES[key] = MeshQuery(*arrays(V, F))
+        query = _QUERIES[key] = _new_query(V, F, key)
         while len(_QUERIES) > _MAX_QUERIES or (len(_QUERIES) > 1 and
                                                sum(q.nbytes for q in _QUERIES.values()) > MAX_QUERY_BYTES):
             _QUERIES.popitem(last=False)

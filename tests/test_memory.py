@@ -240,3 +240,21 @@ def test_big_arrays_travel_to_workers_once(tmp_path, monkeypatch):
     copy = cloudpickle.loads(data)
     assert np.array_equal(F.Context(grid).eval_full(copy), F.Context(grid).eval_full(body))
     assert len(cloudpickle.dumps(body)) == len(data)                  # written once, then reused
+
+
+def test_cpu_workers_start_only_in_free_ram(monkeypatch):
+    # two-stage maps: new CPU workers only in the RAM free now (the limits allow paging out, where they would
+    # cost more than they gain); ones already running stay in use
+    from types import SimpleNamespace
+    from engine.graph import core
+    ev = Evaluator(Graph(), workers=1, log=None)
+    gb = 2**30
+    monkeypatch.setattr(core, "memory_limit", lambda: 64 * gb)
+    monkeypatch.setattr(core, "memory_room", lambda: 64 * gb)
+    monkeypatch.setattr(Evaluator, "memory_in_use", lambda self: 0)
+    monkeypatch.setattr(core.os, "cpu_count", lambda: 32)
+    for started, free, want in ((0, 40 * gb, core.CPU_WORKERS_MAX), (0, core.FREE_TIGHT + 4 * gb, 2), (3, 1 * gb, 3)):
+        ev._pool = SimpleNamespace(cpu_started=lambda: started)
+        monkeypatch.setattr(core, "available_memory", lambda: free)
+        # 4 GPU workers needing 0.5 GB each leave 2 GB; a CPU worker with its stage takes 0.12 + 0.8 GB
+        assert ev._cpu_slots(gb // 2, int(0.8 * gb), 4, 100) == want

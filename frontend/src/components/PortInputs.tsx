@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type MutableRefObject, type PointerEvent, type ReactNode } from 'react'
+import { startValueDrag } from '../store'
 import type { PortSpec } from '../types'
 import { ChoicePicture, PICTURES } from './choicePictures'
 
@@ -45,6 +46,7 @@ export function ScrubLabel({ label, value, integer, range, onChange }: {
     const v = Number(value) || 0
     start.current = { x: e.clientX, v, step: range ? sliderStep(range, integer) : scrubStep(v, integer) }
     document.body.classList.add('scrubbing')
+    startValueDrag()
   }
   const move = (e: PointerEvent<HTMLSpanElement>) => {
     const s = start.current
@@ -95,6 +97,7 @@ function Slider({ value, range, integer, onChange }: {
         e.preventDefault()
         e.currentTarget.setPointerCapture(e.pointerId)
         dragging.current = true
+        startValueDrag()
         set(e)
       }}
       onPointerMove={(e) => { if (dragging.current) set(e) }}

@@ -126,7 +126,7 @@ def test_step_import_is_kept_on_the_ssd(tmp_path, monkeypatch):
     step = tmp_path / "part.step"
     shutil.copy(ROOT / "samples" / "test_part.step", step)
     original, reads = cad_import.load_step, []
-    monkeypatch.setattr(cad_import, "load_step", lambda p: reads.append(p) or original(p))
+    monkeypatch.setattr(cad_import, "load_step", lambda p, **kw: reads.append(p) or original(p, **kw))
 
     first = import_step(str(step), 0.01, 1, 0.5)
     again = import_step(str(step), 0.01, 1, 0.5)

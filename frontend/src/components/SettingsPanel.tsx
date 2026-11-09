@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useShallow } from 'zustand/react/shallow'
-import { useStore } from '../store'
+import { startValueDrag, useStore } from '../store'
 import { GROUP_PREFIX, SETTING_TYPE } from '../types'
 
 /** One setting: a Number node's value, or a group node's setting (a Number node inside it). */
@@ -37,6 +37,7 @@ function SettingRow({ s }: { s: Setting }) {
         {s.label}
       </button>
       <input type="range" min={span[0]} max={span[1]} step={stepFor(span)} value={s.value}
+        onPointerDown={(e) => { if (e.button === 0) startValueDrag() }}
         onChange={(e) => { setText(fmt(Number(e.target.value))); set(Number(e.target.value)) }}
         onDoubleClick={() => setSpan(spanFor(s.value))} title="Drag to change (double-click: span around the value)" />
       <input className="value-input setting-value" value={text} inputMode="decimal"

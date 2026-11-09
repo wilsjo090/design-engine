@@ -3,6 +3,7 @@
 Port types: number (plain value), int, scalar (number or field), implicit (body field),
 cad (tessellated CAD body), mesh (output triangles), path, text.
 """
+import os
 import re
 from pathlib import Path
 
@@ -13,14 +14,18 @@ from .. import backend
 from .. import facemask
 from .. import fields as F
 from .. import lattice as LAT
+from .. import offset_faces as OF
 from .. import tiles
+from .. import trace
 from ..cache import (LIMIT_OF_TOTAL, ArrayCache, DiskCache, load_step_meshes, load_step_names, memory_room,
                      physical_memory, ram_cache_budget, save_step_meshes, save_step_names)
 from ..dualcontour import dual_contour
 from ..grid import Grid
-from ..meshing import decimate, export, field_to_mesh
+from .. import meshing
+from ..meshing import export, extract_surface, field_to_mesh
 from ..meshing import reduce as reduce_mesh
 from ..meshing import fuse as fuse_meshes
+from ..stages import cpu_stage, splitting
 from ..transform import anchor_point, face_plane, scale_about, transformed
 from .core import GraphError, Many, Port, check_cancel, node, parallel_map, report_message, report_progress
 
@@ -583,6 +588,134 @@ def texture(body, pattern, height, fade, invert_fade="no", stretch="auto"):
     return F.offset(body, distance)
 
 
+_STEP_SIDES = ["straight", "round"]
+_SHAPED = ["chamfer", "round", "smooth"]
+
+
+@node("implicit.offset_faces", "Offset Faces", "Implicit",
+      [Port("body", "implicit", doc="The part: Implicit Body from CAD Body of the CAD body below (its Band at least "
+                                    "Distance plus the Foot size), or the part after other changes."),
+       Port("cad", "cad", label="Faces of", doc="The CAD body the faces are on, the one the part is made from (e.g. "
+                                                 "the Import STEP's bodies): Pick shows it."),
+       Port("faces", "faces", "", doc="The CAD faces to move. Click Pick, then in the 3D view: click a face to add or "
+                                      "remove it, Ctrl+drag to paint over several, Shift+click for every face joined to "
+                                      "it tangentially. Face numbers, or names of saved selections."),
+       Port("distance", S, 1.0, unit="mm",
+            doc="How far the faces move, mm: positive raises them (a panel, a label area, a thicker lip), negative sinks "
+                "them (a recess for an inlay, a thinner wall; deeper than the wall makes a hole). A field moves every "
+                "part of the faces by its value there (a ramp, a bulge; positive in one place and negative in another "
+                "works too)."),
+       Port("sides", "text", "straight", choices=list(OF.SIDES),
+            doc="How the moved faces meet the faces around them. straight = walls along the faces' normals, as if the "
+                "faces were pushed out of (or into) the part; where a neighbouring face folds away (a box's sides when "
+                "its top is raised, a hole's wall) the walls simply continue it. round = the faces' own offset, as "
+                "Offset Body: the side is a quarter circle Distance wide, reaching that far past the faces' border. "
+                "blend = a soft ramp Width wide just inside the border, no step (a Face Mask under a Texture). Where "
+                "chosen faces meet at an outward fold they stay joined, rounded as Offset Body does."),
+       Port("width", "number", 2.0, unit="mm", when={"sides": ["blend"]},
+            doc="Blend only: how wide the ramp is, mm, inside the faces' border."),
+       Port("edge", "text", "sharp", choices=list(OF.EDGES), when={"sides": _STEP_SIDES},
+            doc="The step's outside edge: a raised face's top rim, a recess's rim. sharp; chamfer = cut at 45°, Edge "
+                "size along both faces; round = a circular fillet of radius Edge size, tangent to both (G1); smooth = "
+                "curvature continuous (G2): it starts more gently, reaches farther along the faces and is as deep in "
+                "its middle as round. Chamfers stay crisp with Mesh from Implicit Body's dual contouring; a smooth "
+                "edge needs a voxel of about Edge size / 4 to show. Left out where the step has no such edge (a "
+                "pocket's floor raised or deepened: its walls continue the pocket's). Round sides have no top rim."),
+       Port("edge_size", "number", 0.5, unit="mm", when={"sides": _STEP_SIDES, "edge": _SHAPED},
+            doc="mm: the chamfer's legs or the fillet's radius. At most the step's height (larger is cut to it)."),
+       Port("foot", "text", "sharp", choices=list(OF.EDGES), when={"sides": _STEP_SIDES},
+            doc="The step's inside edge: where a raised face's walls meet the part, or a recess's floor meets its "
+                "walls. The same choices as Edge, e.g. a chamfered top with a smooth foot. Left out where the walls just "
+                "continue a neighbouring face (a box's top raised: its sides run on up, and a fillet would bulge out "
+                "there); it runs out over 1.5 mm where the border meets such a place. A recess with round sides has "
+                "no floor corner."),
+       Port("foot_size", "number", 0.5, unit="mm", when={"sides": _STEP_SIDES, "foot": _SHAPED},
+            doc="mm: the chamfer's legs or the fillet's radius. At most the step's height (larger is cut to it)."),
+       Port("apply", "text", "chosen faces", choices=list(facemask.APPLY), label="Apply to", advanced=True,
+            doc="chosen faces = the faces you pick move. all other faces = every face except those moves (the part "
+                "thickened all round except where you picked)."),
+       Port("max_distance", "number", 0.0, unit="mm", zero="auto", advanced=True,
+            doc="Only for a field Distance: the largest distance in or out it gives, mm (larger values are cut to it). "
+                "auto = from the field's range, shown on its card; set it when the range cannot be told (a field "
+                "built from a Coordinate or a distance).")],
+      [Port("out", "implicit", doc="The part with the faces moved. Texture it, cut holes in it, mesh it.")],
+      doc="Move picked CAD faces out or in by a distance, as one piece: a raised panel or label area, a thicker lip, a "
+          "recess for an inlay, a thinner wall. Straight sides stand on the faces' border; Edge and Foot shape the "
+          "step's rim and its inside corner. Put it before textures and holes: a Face Mask or Surface Pattern on "
+          "the same faces still finds the moved faces when its Band is at least Distance (plus the texture's "
+          "height), and a Hole Pattern on them needs Faces moved by = Distance.")
+def offset_faces(body, cad, faces, distance, sides, width, edge, edge_size, foot, foot_size, apply="chosen faces",
+                 max_distance=0.0):
+    ids = facemask.cad_faces(cad)
+    if ids is None:
+        raise GraphError("this body has no CAD faces: connect a body from Import STEP")
+    unknown = re.findall(r"[A-Za-z_][\w-]*", str(faces or ""))
+    if unknown:
+        raise GraphError(f"no face selection named '{unknown[0]}' in this recipe")
+    number = facemask.cad_body(cad)
+    chosen = facemask.faces_for_body(faces, number)
+    wrong = [f for f in chosen if f > ids.max()]
+    if wrong:
+        raise GraphError(f"face {wrong[0]} does not exist (body {number} has faces 0-{ids.max()})")
+    for name, value, choices in (("Sides", sides, OF.SIDES), ("Edge", edge, OF.EDGES), ("Foot", foot, OF.EDGES),
+                                 ("Apply to", apply, facemask.APPLY)):
+        if value not in choices:
+            raise GraphError(f"{name} must be one of: {', '.join(choices)}")
+    if edge_size < 0 or foot_size < 0 or max_distance < 0:
+        raise GraphError("Edge size, Foot size and Max distance must be 0 or more")
+    if isinstance(distance, F.Field):
+        if max_distance > 0:
+            low, high = -float(max_distance), float(max_distance)
+        elif distance.range is not None:
+            low, high = distance.range
+        else:
+            raise GraphError("Distance is a field whose range cannot be told (it depends on the part): set Max "
+                             "distance (under the card's more settings) to the largest distance it gives")
+    else:
+        low = high = float(distance)
+    invert = apply == "all other faces"
+    if max(abs(low), abs(high)) < 1e-9 or (not chosen and not invert):
+        return body  # nothing moves
+    if sides == "blend":
+        if width <= 0:
+            raise GraphError("Width must be more than 0 mm")
+        mask = facemask.face_mask(cad, ids, chosen, width, "inside", max(abs(low), abs(high)) + 0.5, "surface",
+                                  invert=invert)
+        return F.offset(body, mask * distance)
+    patch = OF.Patch(cad, ids, chosen, invert)
+    if not len(patch):
+        return body
+    caps = OF.walls(cad, patch, max(high, 0.0), max(-low, 0.0))
+    out = OF.offset_faces(body, patch, distance, low, high, sides, edge, edge_size, foot, foot_size, caps)
+    out.note = _offset_note(patch, low, high, sides, edge, edge_size, foot, foot_size)
+    return out
+
+
+def _offset_note(patch, low, high, sides, edge, edge_size, foot, foot_size):
+    """The card's note: what moved, and where Edge or Foot are left out or cut to the step."""
+    count = len(set(patch.ids.tolist()))
+    what = f"{count} face{'s' if count != 1 else ''}"
+    if low == high:
+        lines = [f"{what} {'raised' if high > 0 else 'sunk'} {abs(high):g} mm"]
+    else:
+        lines = [f"{what} moved {low:g} to {high:g} mm"]
+    step = max(abs(low), abs(high))
+    for name, kind, size, test, why in (
+            ("foot", foot, foot_size, lambda s: s > 0.99, "the walls continue a neighbour"),
+            ("edge", edge, edge_size, lambda s: s < -0.99, "the walls continue a neighbour")):
+        if kind == "sharp" or sides != "straight" or size <= 0:
+            continue
+        share = patch.border_share(test)
+        if share > 0.005:
+            lines.append(f"no {name} along {share:.0%} of the border: {why}")
+        most = step / OF.SMOOTH_SIZE if kind == "smooth" else step   # a smooth blend reaches 1.76 x its size
+        if size > most + 1e-9:
+            lines.append(f"{name} size cut to {most:.2g} mm (the step's height{' / 1.76 for smooth' * (kind == 'smooth')})")
+    if patch.unmatched:
+        lines.append(f"{patch.unmatched} border edges without a neighbouring face (cracks in the mesh)")
+    return "\n".join(lines)
+
+
 @node("implicit.shell", "Shell", "Implicit",
       [Port("body", "implicit", doc="The body to hollow out."),
        Port("thickness", S, 1.0, unit="mm", doc="Wall thickness, mm (a number or a field).")],
@@ -817,8 +950,6 @@ PEAK_ARRAYS = 12          # grid-sized float32 arrays alive at once while meshin
 TILED_ESTIMATE = int(1.5 * 2**30)  # a body meshed in blocks: one block at a time plus its result
 # how Mesh from Implicit Body finds the surface between the samples
 MESHERS = {"marching cubes": field_to_mesh, "dual contouring": dual_contour}
-FOLDS_TO_WARN = 1e-3  # share of triangles folded over (dual contouring) worth a warning: CAD parts with holes
-                      # had ~3e-5, the lamp center at 0.3 mm 2e-4, a lamp-like texture on the test part at 0.4 4e-3
 
 
 def grid_memory(voxels):
@@ -836,76 +967,78 @@ def array_module(voxels):
     return np
 
 
-def _finish(mesh, keep, voxel, tolerance):
-    """Reduce a whole body's mesh: to a tolerance if one is given, else keep a share."""
-    if tolerance > 0:
-        V, F = reduce_mesh(mesh.vertices, mesh.faces, float(tolerance), check=check_cancel)
-        return trimesh.Trimesh(V, F, process=False)
-    return decimate(mesh, keep, voxel)
+def _cut_hint(body, cut_hint):
+    """What to do about a body cut off by its box (see meshing.report_mesh), None when cutting is intended."""
+    return None if getattr(body, "fills_box", False) else cut_hint
 
 
-def _report_mesh(mesh, body, cut_hint):
-    """Warnings about a body just meshed (see meshing.field_to_mesh): samples that were not numbers,
-    and a body cut off by its box (`cut_hint`: what to do about it; None = cutting is intended)."""
-    bad = mesh.metadata.get("nonfinite", 0)
-    if bad:
-        report_message(f"{bad:,} samples were not a number (NaN) or infinite and were meshed as outside "
-                       "(inside for minus infinity). Usually a Divide by 0 upstream.", "warning")
-    if mesh.metadata.get("clipped") and cut_hint and not getattr(body, "fills_box", False):
-        report_message(f"The body reaches the edge of the box it is meshed in and is cut flat there: {cut_hint}",
-                       "warning")
-    folded = mesh.metadata.get("folded", 0)
-    if folded > FOLDS_TO_WARN * len(mesh.faces):
-        report_message(f"Dual contouring left {folded:,} small folded-over triangles where the texture is finer "
-                       "than the voxel: a smaller voxel, or marching cubes (which has none), avoids them.", "warning")
-
-
-def _mesh(body, bounds, voxel, padding, keep, tolerance=0.0, cut_hint=None, method="marching cubes"):
+def _mesh(body, bounds, voxel, padding, keep, tolerance=0.0, cut_hint=None, method="marching cubes", normals=False):
+    """A body's mesh (in blocks when big). normals: with the field's normals at its vertices
+    (meshing.FIELD_NORMAL; the editor's views only, never a node's mesh: marching cubes, no Keep or Tolerance)."""
     if voxel <= 0:
         raise GraphError("voxel size must be greater than 0")
     if method not in MESHERS:
         raise GraphError(f"Method must be one of: {', '.join(MESHERS)}")
     grid = Grid.from_bounds(bounds, voxel, padding)
+    hint = _cut_hint(body, cut_hint)
     if grid.size > tiles.TILE_MIN_VOXELS:  # big body: in blocks, only where its surface is
         if grid.size > tiles.MAX_TILED_VOXELS:
             raise GraphError(f"grid too large ({grid.size / 1e9:,.0f} billion voxels); increase the voxel size")
         try:
             mesh, computed, total = tiles.mesh_tiled(body, bounds, voxel, padding, keep, parallel_map, tolerance,
-                                                     method=method)
+                                                     method=method, normals=normals)
         except ValueError as err:
             raise GraphError(str(err)) from err
-        _report_mesh(mesh, body, cut_hint)
+        meshing.report_mesh(mesh, hint)
         report_message(f"Meshed in blocks: {computed} of {total} blocks have surface "
                        f"({grid.size / 1e6:,.0f} million voxels in the box)")
         return mesh
     if grid.size > MAX_VOXELS:
         raise GraphError(f"grid too large ({grid.size / 1e6:,.0f} million voxels); increase the voxel size")
     xp = array_module(grid.size)
+    finish = dict(grid=grid, method=method, cut_hint=hint, keep=keep, voxel=voxel, tolerance=tolerance)
+    # (normals only for what is not reduced afterwards: a view)
+    more = {"normals": True} if normals and method == "marching cubes" and keep >= 1.0 and tolerance <= 0 else {}
     if xp is not np:
         try:
-            return _finish(_mesh_on(body, grid, xp, cut_hint, method), keep, voxel, tolerance)
+            sampled = _mesh_on(body, grid, xp, method, **more)
         except Exception as err:
             if not backend.is_out_of_memory(err):
                 raise
             # another program (or worker) took the GPU memory: do this body on the CPU instead
+        else:
+            return _finish_body(sampled, finish)
     # (also in a worker, which has no run's limit: what the PC can still give out, and the engine's share of RAM)
     need, room = grid_memory(grid.size), min(memory_room(), LIMIT_OF_TOTAL * physical_memory())
     if need > room:
         raise GraphError(f"this needs about {need / 2**30:.1f} GB of memory but only {max(room, 0) / 2**30:.1f} GB "
                          f"can be used; use a larger voxel size or close other programs")
-    return _finish(_mesh_on(body, grid, np, cut_hint, method), keep, voxel, tolerance)
+    return _finish_body(_mesh_on(body, grid, np, method, **more), finish)
 
 
-def _mesh_on(body, grid, xp, cut_hint, method="marching cubes"):
+def _mesh_on(body, grid, xp, method="marching cubes", normals=False):
+    """The first stage of meshing a body, where the field is computed (the GPU for CuPy): its samples,
+    and for marching cubes the surface through them (normals: and the field's normals at its vertices, computed
+    beside the samples). Plain host arrays, for meshing.finish_body."""
     try:
-        values = F.Context(grid, ARRAY_CACHE, xp).eval_full(body)
-        mesh = MESHERS[method](values, grid)
-        _report_mesh(mesh, body, cut_hint)
-        return mesh
+        with trace.span("field", xp=xp, voxels=grid.size):
+            values = F.Context(grid, ARRAY_CACHE, xp).eval_full(body)
+        if method == "marching cubes":
+            return {"surface": extract_surface(values, grid, normals)}
+        return {"values": backend.to_host(values)}
     finally:
         values = None
         if xp is not np:
             backend.release_gpu_memory()  # hand GPU memory back between bodies
+
+
+def _finish_body(sampled, finish):
+    """The rest of meshing a body (meshing.finish_body): in a CPU worker when the map splits (engine/stages.py)
+    and there is real work left (dual contouring, Keep, Tolerance); marching cubes alone only makes the mesh."""
+    if finish["method"] == "marching cubes" and finish["keep"] >= 1.0 and finish["tolerance"] <= 0:
+        return meshing.finish_body(**sampled, **finish)
+    # (a CPU worker has no run to stop: Stop skips the stages still queued)
+    return cpu_stage(meshing.finish_body, **sampled, **finish, check=None if splitting() else check_cancel)
 
 
 def _mesh_estimate(body=None, voxel=0.1, padding=2.0, domain=None, coarser=1.0, **_):
@@ -991,7 +1124,14 @@ def _view_one(body, voxel, padding):
     bounds, room = F.mesh_box(body, padding, voxel)
     return _mesh(body, bounds, voxel, room, 1.0, cut_hint=(
         f"it reaches more than {padding:g} mm beyond its own box (an offset by a field whose size is not known?). "
-        "Mesh from Implicit Body needs at least that much Padding."))
+        "Mesh from Implicit Body needs at least that much Padding."), normals=view_normals())
+
+
+def view_normals():
+    """Whether views and details carry the field's normals (meshing.field_normals; the editor then draws with them
+    instead of working out the triangles' own): on unless DESIGN_ENGINE_VIEW_NORMALS=0 (for comparing; the workers
+    read it from their environment)."""
+    return os.environ.get("DESIGN_ENGINE_VIEW_NORMALS", "1") != "0"
 
 
 DETAIL_MAX_BLOCKS = 40   # blocks in one detail piece (a few seconds with the workers); the voxel grows to fit
@@ -1034,14 +1174,17 @@ def detail_mesh(body, lo, hi, voxel):
         if not todo:
             continue
         try:
-            mesh, _, _ = tiles.mesh_tiled(b, box, voxel, 0.0, 1.0, parallel_map, close=False, surface=todo)
+            mesh, _, _ = tiles.mesh_tiled(b, box, voxel, 0.0, 1.0, parallel_map, close=False, surface=todo,
+                                          normals=view_normals())
         except ValueError:  # no surface after all
             continue
         pieces.append(mesh)
+    # (concatenate keeps the field's normals when every piece has them)
     out = trimesh.util.concatenate(pieces) if len(pieces) > 1 else pieces[0] if pieces else trimesh.Trimesh()
     if len(out.faces):  # whole blocks reach past the box: only what the editor shows (it clips at the box)
         near = np.all((out.vertices >= lo - 2 * voxel) & (out.vertices <= hi + 2 * voxel), axis=1)
-        out = trimesh.Trimesh(out.vertices, out.faces[near[out.faces].any(axis=1)], process=False)
+        out = trimesh.Trimesh(out.vertices, out.faces[near[out.faces].any(axis=1)], process=False,
+                              vertex_attributes=dict(out.vertex_attributes))
         out.remove_unreferenced_vertices()
     out.metadata["voxel"] = voxel
     return out
