@@ -15,6 +15,7 @@ from .. import facemask
 from .. import fields as F
 from .. import lattice as LAT
 from .. import offset_faces as OF
+from .. import pipe as PIPE
 from .. import tiles
 from .. import trace
 from ..cache import (LIMIT_OF_TOTAL, ArrayCache, DiskCache, load_step_meshes, load_step_names, memory_room,
@@ -541,7 +542,7 @@ def from_cad(cad, band):
 def offset(body, distance):
     """Grow (positive) or shrink (negative) a body. Drive the distance with a field for textures
     (the Texture node does the height, the range and the fade of a texture in one)."""
-    return F.offset(body, distance)
+    return F.offset(_exact_to(body, distance), distance)
 
 
 TEXTURE_RANGES = ("auto", "as is")
@@ -722,7 +723,7 @@ def _offset_note(patch, low, high, sides, edge, edge_size, foot, foot_size):
       [Port("out", "implicit", doc="A wall of that thickness, centred on the original surface.")])
 def shell(body, thickness):
     """Hollow wall of the given thickness, centred on the surface."""
-    return F.shell(body, thickness)
+    return F.shell(_exact_to(body, thickness if isinstance(thickness, F.Field) else 0.5 * float(thickness)), thickness)
 
 
 _EDGE_PORTS = [
@@ -734,11 +735,18 @@ _EDGE_PORTS = [
 
 
 def _regrown(body, edge, radius):
-    """A Hole Pattern computes its holes only a little way around them: grown as far as the edge
-    reaches when it is rounded or chamfered."""
-    if edge != "sharp" and radius > 0 and callable(getattr(body, "regrow", None)):
-        return body.regrow(radius)
-    return body
+    """A Hole Pattern's cutter or a Pipe is computed only a little way around its surface: grown as far
+    as the edge reaches when it is rounded or chamfered."""
+    return _exact_to(body, radius) if edge != "sharp" else body
+
+
+def _exact_to(body, distance):
+    """`body` with exact distances at least `distance` mm out, for a body computed only near its surface
+    (a Hole Pattern's cutter, a Pipe: `regrow`) when `distance` is a plain number; else `body`."""
+    if isinstance(distance, F.Field) or not callable(getattr(body, "regrow", None)):
+        return body
+    distance = float(distance)
+    return body.regrow(distance) if distance > 0 else body
 
 
 @node("implicit.union", "Boolean Union", "Implicit",
@@ -779,7 +787,7 @@ def intersect(a, b):
       [Port("out", "implicit", doc="Both bodies joined, with a fillet-like blend between them.")])
 def smooth_union(a, b, radius):
     """Union with a fillet-like blend of about `radius` mm."""
-    return F.smooth_union(a, b, radius)
+    return F.smooth_union(_exact_to(a, radius), _exact_to(b, radius), radius)
 
 
 @node("implicit.smoothen", "Smoothen Body", "Implicit",
@@ -842,6 +850,51 @@ def box(centre, size, rounding):
     if min(dims) <= 0:
         raise GraphError("size must be more than 0 mm along x, y and z")
     return F.box(_point(centre, "centre"), dims, float(rounding))
+
+
+@node("implicit.pipe", "Pipe", "Implicit",
+      [Port("points", "text", "0, 0, 0; 30, 0, 15; 60, 0, 0",
+            doc="The path: points x, y, z in mm, separated by ; (Place adds them one click at a time on a shown "
+                "body, each in the middle of the wall under the click; select the node to drag them)."),
+       Port("radius", "number", 3.0, unit="mm", doc="mm: half the pipe's width (at the first point)."),
+       Port("end_radius", "number", 0.0, unit="mm", zero="same", advanced=True,
+            doc="mm at the last point; the radius changes evenly along the path (0 = the same all along)."),
+       Port("path", "text", "smooth", choices=list(PIPE.PATHS),
+            doc="smooth = a smooth curve through the points. straight = straight from point to point, round at "
+                "the bends."),
+       Port("section", "text", "round", choices=list(PIPE.SECTIONS),
+            doc="round, or teardrop: the roof comes to a point (rising at Roof from horizontal), so a channel "
+                "inside a printed part needs no supports, whichever way it runs."),
+       Port("up", "text", "0, 0, 1", when={"section": ["teardrop"]}, advanced=True,
+            doc="Teardrop: where the roof points: the printer's up (the build direction), x, y, z."),
+       Port("roof", "number", 45.0, unit="°", slider=(30, 70), when={"section": ["teardrop"]}, advanced=True,
+            doc="Teardrop: how steeply the roof rises, degrees from horizontal. 45° prints on most printers; more "
+                "for one whose overhangs sag (10-80)."),
+       Port("ends", "text", "round", choices=list(PIPE.ENDS), advanced=True,
+            doc="round = rounded ends (teardrop: a dome that prints too). flat = cut square to the path at the "
+                "first and last point.")],
+      [Port("out", "implicit", doc="The pipe.")],
+      doc="A pipe along a path through points: cut it out of a part with Boolean Subtract for a channel (a cable, "
+          "cooling, a hidden duct), or add it with Boolean Union for a stem or a handle. One point gives a ball "
+          "(or a drop)." + _SHAPE_USE)
+def pipe(points, radius, end_radius, path, section, up, roof, ends):
+    for name, value, allowed in (("path", path, PIPE.PATHS), ("section", section, PIPE.SECTIONS),
+                                 ("ends", ends, PIPE.ENDS)):
+        if value not in allowed:
+            raise GraphError(f"{name} must be one of: {', '.join(allowed)}")
+    try:
+        pts = PIPE.parse_points(points)
+    except ValueError as e:
+        raise GraphError(f"points: {e}") from None
+    size = _size(radius, "radius")
+    if float(end_radius) < 0:
+        raise GraphError("end radius must be 0 (the same as Radius) or more")
+    direction = _point(up, "up") if section == "teardrop" else (0.0, 0.0, 1.0)
+    if section == "teardrop" and not np.linalg.norm(direction) > 0:
+        raise GraphError("up must be a direction, like 0, 0, 1")
+    if section == "teardrop" and not PIPE.ROOF_RANGE[0] <= float(roof) <= PIPE.ROOF_RANGE[1]:
+        raise GraphError(f"roof must be {PIPE.ROOF_RANGE[0]:g}-{PIPE.ROOF_RANGE[1]:g}° from horizontal")
+    return PIPE.pipe(pts, size, float(end_radius), section, direction, float(roof), path == "smooth", ends)
 
 
 # --- lattices ------------------------------------------------------------------------------

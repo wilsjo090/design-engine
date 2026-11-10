@@ -20,6 +20,7 @@ export const QUICK_INPUTS: Record<string, string[]> = {
   'implicit.ball': ['centre', 'radius'],
   'implicit.box': ['centre', 'size', 'rounding'],
   'implicit.bar': ['start', 'end', 'radius'],
+  'implicit.pipe': ['radius', 'path', 'section', 'ends'],
   'input.number': ['value'],
 }
 

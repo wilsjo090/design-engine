@@ -215,7 +215,7 @@ layout's Delaunay triangles (holes on the triangles' centroids); Alternate turns
 (the triangle tiling needs odd polygons centred half way up, `Shape._lift`); Tilt leans hole axes
 (depths from where each sample's axis meets the face). Boolean Subtract/Union take Edge round /
 chamfer (`fields.subtract_edged`, `union_edged`); a cutter must be exact as far out as the radius,
-so the Booleans call its `regrow`. Picture and Text (`engine/picture.py`) project an image onto a
+so the Booleans call its `regrow` (`nodes._exact_to`; Smooth Union, Offset and Shell by a number do too). Picture and Text (`engine/picture.py`) project an image onto a
 face (flat, or around a cylinder's axis) as a 0..1 field. Standard patterns ship as presets in
 `presets/` (25).
 
@@ -241,6 +241,24 @@ stand `GAP` × s² beyond the border (else a sheet of zeros the mesher took for 
 band's end the slab and recess grow smoothly to FAR. Above a sunk face values are a lower bound, as Boolean
 Subtract's. Hole Pattern's `moved` ("Faces moved by", `holes._depths(moved=)`) starts its shapes from the moved
 surface; a Face Mask finds moved faces when its Band ≥ Distance. Demo: `recipes/offset_faces_demo.json`.
+
+**Pipes** (`engine/pipe.py`, node `implicit.pipe` Pipe; after LEAP 71's ShapeKernel BasePipe / LatticeManifold):
+a tube along points (Points "x, y, z; ..."), a channel to subtract or a stem to add. Path smooth = a cubic Hermite
+spline through the points (bisector tangents, each span's as long as its chord, parabolic end spans; the editor's
+`pipeShape.ts` draws the same curve), cut into straight pieces within `TOLERANCE` (Douglas-Peucker) and at most
+`_max_piece` long; straight = the polyline. Radius linear along the length to End radius. Section round = a ball,
+teardrop = the ball with a cone on top along Up, sides at Roof from horizontal (apex r / cos Roof): the sweep keeps
+the apex on Up everywhere, so a horizontal channel's roof prints without supports and a curved one has no notches.
+Each piece is the convex hull of its end sections, its distance exact: the section's distance (iq's uneven capsule)
+is that of the ball, the apex or the cone side, each minimized over the piece in closed form (`_argmin_parameter`,
+c = beta / (A D) is per piece), the smallest of the section at those three parameters is the exact minimum. Values are
+exact `reach` (`REACH`, at least `PAD` samples) out and that beyond, computed per piece on its box's samples only (a
+pure function of position, the same in blocks and on the GPU bit for bit; 7.7M samples of a teardrop in 0.5 s);
+`regrow(distance)` reaches farther. Flat ends: max with the end plane within a ball reaching `far` past every
+section. One point = a ball or drop. Drawn by the viewport (`DRAWN_BY_VIEWPORT`, Guides: handles per point and
+a middle one; Place adds a point per click, `placing.count`, the first click starts a new path, Backspace takes
+one back); a body's *Modify ▸ Cut out / Add shape ▸ Channel (pipe)… / Pipe…* adds it with the Boolean at the click
+and starts placing. Demo: `recipes/pipe_demo.json`.
 
 **Lattices** (`engine/lattice.py`): TPMS (value / |grad|, exact gradients in `TPMS_GRADIENT`, so
 thickness is in mm), periodic strut lattices (points folded into one octant of a cell,
@@ -769,8 +787,8 @@ then the categories in build order (`ORDER`), groups and presets; each opens a p
 sentence of the doc, input → output type chips without plain settings); a click adds at the canvas
 centre, a drag (`NODE_DRAG_TYPE`) where it is dropped (`NodeEditor` onDrop, `addFromLibrary`); "/"
 focuses its search; tabs drop counts, then names, as the pane narrows (`data-fit`). The viewport is three.js / react-three-fiber with Z up (section
-plane via `clippingPlanes`, variants drawn to the left of the result, check panel). Ball, Bar and Box
-nodes (`fields.ball/bar/box`, exact distances) are drawn by the viewport itself (`Guides.tsx`; the server
+plane via `clippingPlanes`, variants drawn to the left of the result, check panel). Ball, Bar, Box and Pipe
+nodes (`fields.ball/bar/box`, `pipe.pipe`, exact distances) are drawn by the viewport itself (`Guides.tsx`; the server
 runs them but adds no view, `server.DRAWN_BY_VIEWPORT`), translucent and faintly through the bodies:
 Place (`store.placing`) puts a point in the middle of the wall under a click on a shown body (meshes
 marked `userData.placeable`), the selected one's yellow handles drag in the view's plane.

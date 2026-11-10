@@ -5,7 +5,7 @@ import { api, startOptimize, stopRun } from '../api'
 import { LOAD_CASE, loadCases } from '../loadCases'
 import { isFieldNode, useStore } from '../store'
 import { useBrowser } from './FileBrowser'
-import { PLACE_PORTS } from './Guides'
+import { PIPE, PLACE_PORTS } from './Guides'
 import { BodyChip, BodyPick, FontPick, IntSwitch, SeedInput } from './PickLists'
 import { ChoiceInput, NumberInput, ScrubLabel, Vec3Input, fmt, isVec3, parseVec3 } from './PortInputs'
 import type { EngineNode, PortSpec } from '../types'
@@ -220,17 +220,21 @@ function OptimizeBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
   )
 }
 
-/** Ball, Bar and Box: click on a shown body to put the shape there (a Bar: its start, then its end). */
+/** Ball, Bar, Box and Pipe: click on a shown body to put the shape there (a Bar: its start, then its end; a
+ *  Pipe: its points, one per click, until Done). */
 function PlaceBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
   const placing = useStore((s) => s.placing?.node === nodeId)
   const setPlacing = useStore((s) => s.setPlacing)
   const editing = useStore((s) => !!s.editing)
   const bar = typeId === 'implicit.bar'
+  const pipe = typeId === PIPE
   return (
     <div className="enode-row optimize-row">
       <button className={`nodrag optimize-btn ${placing ? 'stop' : ''}`} disabled={editing}
         title={editing ? 'Place shapes outside the group'
           : placing ? 'Stop placing (Esc)'
+          : pipe ? 'Click on a shown body in the 3D view for each point of the path, in order (each in the middle of the ' +
+            'wall under the click; the first click starts a new path), then Done. Select the node to drag its points.'
           : `Click on a shown body in the 3D view to put the ${bar ? "bar's start, then its end" : 'shape'} there (in the ` +
             'middle of the wall under the click). Select the node to drag it by its yellow handles.'}
         onClick={() => {
@@ -239,7 +243,7 @@ function PlaceBar({ nodeId, typeId }: { nodeId: string; typeId: string }) {
           if (!s.visible.includes(nodeId)) s.toggleVisible(nodeId)
           setPlacing({ node: nodeId, port: PLACE_PORTS[typeId][0] })
         }}>
-        {placing ? 'Done' : bar ? 'Place (2 clicks)' : 'Place'}
+        {placing ? 'Done' : bar ? 'Place (2 clicks)' : pipe ? 'Place points' : 'Place'}
       </button>
     </div>
   )

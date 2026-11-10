@@ -98,9 +98,9 @@ interface State {
   sceneBounds: Bounds
   /** face picking in the 3D view: the Face Mask node being edited and the node whose CAD body is picked on */
   picking: { node: string; source: string } | null
-  /** placing a guide shape (Ball, Bar, Box) by clicking on a shown body: its node and the point input
-   *  the next click sets (a Bar: start, then end) */
-  placing: { node: string; port: string } | null
+  /** placing a guide shape (Ball, Bar, Box, Pipe) by clicking on a shown body: its node and the point input
+   *  the next click sets (a Bar: start, then end; a Pipe: every click adds a point to Points, `count` so far) */
+  placing: { node: string; port: string; count?: number } | null
   /** a body of a list hovered in a card's body list (PickLists.BodyPick): its box, drawn in the 3D view */
   bodyHint: { lo: number[]; hi: number[]; label: string } | null
   /** which CAD face and body each triangle of a shown CAD view is (face picking, right-click menus) */
@@ -167,7 +167,7 @@ interface State {
   pasteClip: (clip: Clip, at: { x: number; y: number } | null, keepExternal: boolean) => number
   /** start picking faces for a Face Mask node (shows its CAD body), or stop (null) */
   setPicking: (p: { node: string; source: string } | null) => void
-  setPlacing: (p: { node: string; port: string } | null) => void
+  setPlacing: (p: State['placing']) => void
   /** make a group from the selected nodes; returns an error message or null */
   createGroup: (name: string) => string | null
   ungroup: (id: string) => void

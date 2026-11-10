@@ -6,14 +6,21 @@ import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '../store'
 import { isLink, type EngineNode, type NodeSpec } from '../types'
+import { parsePoints, pipeGeometry, pointsText, type PipeDraw } from './pipeShape'
 
 /** Simple shapes the 3D view draws itself (the engine does not mesh them for the view: server.py
- *  DRAWN_BY_VIEWPORT), so they follow a drag at once. Used as Topology Optimization's guides. */
-export const GUIDE_TYPES = ['implicit.ball', 'implicit.bar', 'implicit.box']
-/** the point inputs Place sets, one click each */
+ *  DRAWN_BY_VIEWPORT), so they follow a drag at once. Used as Topology Optimization's guides, and the
+ *  Pipe (a channel or stem) while its path is placed. */
+export const GUIDE_TYPES = ['implicit.ball', 'implicit.bar', 'implicit.box', 'implicit.pipe']
+export const PIPE = 'implicit.pipe'
+/** the point inputs Place sets, one click each (a Pipe's Points: every click adds one) */
 export const PLACE_PORTS: Record<string, string[]> = {
-  'implicit.ball': ['centre'], 'implicit.bar': ['start', 'end'], 'implicit.box': ['centre'],
+  'implicit.ball': ['centre'], 'implicit.bar': ['start', 'end'], 'implicit.box': ['centre'], [PIPE]: ['points'],
 }
+/** a Pipe's points as handle names, in order */
+const pipeKeys = (points: Record<string, THREE.Vector3>) =>
+  Object.keys(points).filter((k) => /^p\d+$/.test(k)).sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))
+export const pipePoints = (points: Record<string, THREE.Vector3>) => pipeKeys(points).map((k) => points[k])
 const GUIDE_COLOR = '#ff8c1a'
 const HANDLE_COLOR = '#ffc93c'
 const HANDLE_HOVER = '#ffe9a8'
@@ -31,10 +38,11 @@ interface Shape {
   id: string
   type: string
   selected: boolean
-  points: Record<string, THREE.Vector3>   // centre, or start and end
+  points: Record<string, THREE.Vector3>   // centre, or start and end, or a Pipe's p0, p1, ...
   radius: number
   size: THREE.Vector3
   rounding: number
+  pipe?: Omit<PipeDraw, 'points'>
 }
 
 /** A guide node's shape from its inputs (defaults from its spec), or null when an input is linked or
@@ -42,6 +50,20 @@ interface Shape {
 function shapeOf(node: EngineNode, spec: NodeSpec | undefined, selected: boolean): Shape | null {
   const value = (name: string) => node.data.inputs[name] ?? spec?.inputs.find((p) => p.name === name)?.default
   const points: Record<string, THREE.Vector3> = {}
+  if (node.data.typeId === PIPE) {
+    const raw = value('points')
+    const list = isLink(raw) ? null : parsePoints(raw)
+    const number = (name: string) => { const v = value(name); return isLink(v) ? NaN : Number(v) }
+    const up = isLink(value('up')) ? null : parseVec(value('up'))
+    const roof = number('roof')
+    if (!list || !(number('radius') > 0) || !(number('end_radius') >= 0)) return null
+    list.forEach((p, i) => { points[`p${i}`] = p })
+    return { id: node.id, type: PIPE, selected, points, radius: number('radius'), size: new THREE.Vector3(), rounding: 0,
+      pipe: { radius: number('radius'), endRadius: number('end_radius'), teardrop: value('section') === 'teardrop',
+        up: up && up.lengthSq() > 0 ? up.normalize() : new THREE.Vector3(0, 0, 1),
+        roof: Number.isFinite(roof) ? Math.min(Math.max(roof, 10), 80) : 45,
+        smooth: value('path') !== 'straight', flat: value('ends') === 'flat' } }
+  }
   for (const port of PLACE_PORTS[node.data.typeId]) {
     const v = value(port)
     const p = isLink(v) ? null : parseVec(v)
@@ -59,9 +81,20 @@ function shapeOf(node: EngineNode, spec: NodeSpec | undefined, selected: boolean
 
 const Y_UP = new THREE.Vector3(0, 1, 0)
 
+/** A Pipe's triangles, made again when its points or settings change (also while a handle is dragged). */
+function usePipeGeometry(shape: Shape) {
+  const pipe = shape.pipe
+  const points = pipe ? pipePoints(shape.points) : []
+  const text = pipe ? `${pointsText(points)}|${JSON.stringify(pipe)}` : ''
+  const geometry = useMemo(() => (pipe ? pipeGeometry({ ...pipe, points }) : null), [text]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => geometry?.dispose(), [geometry])
+  return geometry
+}
+
 /** A guide shape, drawn twice: as it is where nothing is in front, and faintly through the bodies
  *  (guides sit inside the part, where it would hide them). */
 function ShapeMesh({ shape, onSelect }: { shape: Shape; onSelect?: () => void }) {
+  const pipeGeometry = usePipeGeometry(shape)
   const click = onSelect ? (e: ThreeEvent<MouseEvent>) => { e.stopPropagation(); onSelect() } : undefined
   const pass = (xray: boolean) => {
     const material = (
@@ -71,6 +104,13 @@ function ShapeMesh({ shape, onSelect }: { shape: Shape; onSelect?: () => void })
     )
     const order = xray ? 6 : 5
     const events = xray ? { raycast: () => null } : { onClick: click }
+    if (shape.type === PIPE) {
+      return pipeGeometry && (
+        <mesh geometry={pipeGeometry} renderOrder={order} {...events}>
+          {material}
+        </mesh>
+      )
+    }
     if (shape.type === 'implicit.ball') {
       return (
         <mesh position={shape.points.centre} renderOrder={order} {...events}>
@@ -102,8 +142,13 @@ function ShapeMesh({ shape, onSelect }: { shape: Shape; onSelect?: () => void })
   return <group>{pass(false)}{pass(true)}</group>
 }
 
-/** The yellow balls of the selected shape: drag one to move that point (a Bar's middle one moves the
- *  whole bar) in the plane facing the camera, in whole steps; Esc cancels. */
+const middleOf = (points: Record<string, THREE.Vector3>) => {
+  const all = Object.values(points)
+  return all.reduce((a, v) => a.add(v), new THREE.Vector3()).divideScalar(Math.max(all.length, 1))
+}
+
+/** The yellow balls of the selected shape: drag one to move that point (the smaller middle one of a Bar
+ *  or Pipe moves all of it) in the plane facing the camera, in whole steps; Esc cancels. */
 function Handles({ shape, size, step, onDrag, onCommit }: {
   shape: Shape; size: number; step: number
   onDrag: (id: string, points: Record<string, THREE.Vector3> | null) => void
@@ -119,7 +164,7 @@ function Handles({ shape, size, step, onDrag, onCommit }: {
   const handles = useMemo(() => {
     const p = shape.points
     const list: [string, THREE.Vector3][] = Object.entries(p)
-    if (shape.type === 'implicit.bar') list.push(['middle', p.start.clone().add(p.end).multiplyScalar(0.5)])
+    if (shape.type === 'implicit.bar' || (shape.type === PIPE && list.length > 1)) list.push(['middle', middleOf(p)])
     return list
   }, [shape])
 
@@ -139,15 +184,16 @@ function Handles({ shape, size, step, onDrag, onCommit }: {
         Math.round(v.z / step) * step)
       const moved = Object.fromEntries(Object.entries(g.points).map(([k, v]) =>
         [k, g.handle === 'middle' || g.handle === k ? v.clone().add(shift) : v.clone()]))
-      if (g.handle === 'middle') {   // keep the bar's length and direction: snap its start, move the end along
-        const before = moved.start.clone()
-        snap(moved.start)
-        moved.end.add(moved.start.clone().sub(before))
+      if (g.handle === 'middle') {   // keep the shape as it is: snap its first point, move the others along
+        const [first, ...others] = Object.keys(moved)
+        const before = moved[first].clone()
+        snap(moved[first])
+        const correction = moved[first].clone().sub(before)
+        for (const k of others) moved[k].add(correction)
       } else snap(moved[g.handle])
       g.result = moved
       onDrag(shape.id, moved)
-      setDragging({ handle: g.handle, at: g.handle === 'middle' ? moved.start.clone().add(moved.end).multiplyScalar(0.5)
-        : moved[g.handle].clone() })
+      setDragging({ handle: g.handle, at: g.handle === 'middle' ? middleOf(moved) : moved[g.handle].clone() })
     }
     const finish = (commit: boolean) => {
       if (controls) controls.enabled = true
@@ -282,8 +328,16 @@ export function Guides({ sceneSize }: { sceneSize: number }) {
     const s = useStore.getState()
     if (!s.placing) return
     const { node, port } = s.placing
-    const type = s.nodes.find((n) => n.id === node)?.data.typeId ?? ''
+    const found = s.nodes.find((n) => n.id === node)
+    const type = found?.data.typeId ?? ''
     const snapped = p.clone().set(Math.round(p.x / step) * step, Math.round(p.y / step) * step, Math.round(p.z / step) * step)
+    if (type === PIPE) {   // the first click starts a new path, every later one adds a point to it
+      const count = s.placing.count ?? 0
+      const before = count > 0 ? parsePoints(found?.data.inputs.points) ?? [] : []
+      setInput(node, port, pointsText([...before, snapped]))
+      setPlacing({ node, port, count: count + 1 })
+      return
+    }
     setInput(node, port, vectorText(snapped))
     const ports = PLACE_PORTS[type] ?? []
     const next = ports[ports.indexOf(port) + 1]
@@ -292,6 +346,8 @@ export function Guides({ sceneSize }: { sceneSize: number }) {
   const onDrag = useMemo(() => (id: string, points: Record<string, THREE.Vector3> | null) =>
     setPreview(points ? { id, points } : null), [])
   const onCommit = useMemo(() => (id: string, points: Record<string, THREE.Vector3>) => {
+    const type = useStore.getState().nodes.find((n) => n.id === id)?.data.typeId
+    if (type === PIPE) { setInput(id, 'points', pointsText(pipePoints(points))); return }
     for (const [port, v] of Object.entries(points)) setInput(id, port, vectorText(v))
   }, [setInput])
 

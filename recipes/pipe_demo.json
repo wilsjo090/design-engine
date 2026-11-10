@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "nodes": {
+    "block": {
+      "type": "implicit.box",
+      "inputs": {
+        "centre": "0, 0, 10",
+        "size": "80, 40, 20",
+        "rounding": 2.0
+      },
+      "pos": [0, 0]
+    },
+    "channel": {
+      "type": "implicit.pipe",
+      "inputs": {
+        "points": "-45, -6, 8; -15, 8, 8; 15, -8, 11; 45, 4, 9",
+        "radius": 3.0,
+        "path": "smooth",
+        "section": "teardrop",
+        "ends": "round"
+      },
+      "pos": [0, 260],
+      "visible": true
+    },
+    "cut": {
+      "type": "implicit.subtract",
+      "inputs": {
+        "a": {"link": "block.out"},
+        "b": {"link": "channel.out"},
+        "edge": "round",
+        "radius": 1.0
+      },
+      "pos": [340, 100]
+    },
+    "mesh": {
+      "type": "mesh.from_implicit",
+      "inputs": {
+        "body": {"link": "cut.out"},
+        "voxel": 0.25
+      },
+      "pos": [660, 100],
+      "visible": true
+    }
+  }
+}

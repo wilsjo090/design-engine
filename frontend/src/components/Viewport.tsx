@@ -26,7 +26,8 @@ import { ViewportMenu, ViewportToast } from './ViewportMenu'
 import {
   SliceObject, SlicePanel, fieldPaintRange, fmt, gradientCss, lut, normalise, sliceBox, type HoverValue,
 } from './SliceView'
-import { GUIDE_TYPES, Guides, offsetStep, parseVec, vectorText } from './Guides'
+import { GUIDE_TYPES, Guides, PIPE, offsetStep, parseVec, vectorText } from './Guides'
+import { parsePoints, pointsText } from './pipeShape'
 import { BodyHint } from './BodyHint'
 import { CAD_ENV, CadBody, CadEdges, CadLookPanel, toggleCadEdges, useCadEnvironment, useLook, useLookGeometry } from './CadBody'
 import { CAP_COLOR, hideRanges, useBoxCut, type CutBox } from './viewCut'
@@ -1982,19 +1983,32 @@ export function Viewport() {
     writeFaces(next)
   }
 
-  // --- placing a guide shape (a Ball, Bar or Box node's Place button) ---
+  // --- placing a guide shape (a Ball, Bar, Box or Pipe node's Place button) ---
   const placing = useStore((s) => s.placing)
   const setPlacing = useStore((s) => s.setPlacing)
   const placeNodeExists = useStore((s) => !s.placing || s.nodes.some((n) => n.id === s.placing!.node))
-  const placingBar = useStore((s) => !!s.placing && s.nodes.find((n) => n.id === s.placing!.node)?.data.typeId === 'implicit.bar')
+  const placingType = useStore((s) => (s.placing ? s.nodes.find((n) => n.id === s.placing!.node)?.data.typeId : undefined))
+  const placingBar = placingType === 'implicit.bar'
+  const placingPipe = placingType === PIPE
   const guideIds = useStore((s) => s.nodes.filter((n) => GUIDE_TYPES.includes(n.data.typeId)).map((n) => n.id).join(' '))
   useEffect(() => { if (!placeNodeExists) setPlacing(null) }, [placeNodeExists, setPlacing])
   useEffect(() => {
     if (!placing) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPlacing(null) }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPlacing(null)
+      // a Pipe's last point back (not while typing in a field)
+      const typing = e.target instanceof HTMLElement && (e.target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName))
+      if (e.key === 'Backspace' && placingPipe && !typing && (placing.count ?? 0) > 1) {
+        e.preventDefault()
+        const s = useStore.getState()
+        const points = parsePoints(s.nodes.find((n) => n.id === placing.node)?.data.inputs.points) ?? []
+        s.setInput(placing.node, placing.port, pointsText(points.slice(0, -1)))
+        setPlacing({ ...placing, count: (placing.count ?? 1) - 1 })
+      }
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [placing, setPlacing])
+  }, [placing, placingPipe, setPlacing])
 
   // Grid scaled to the part: ~10 cells across, snapped to 1/2/5 x 10^n mm.
   const size = bounds ? bounds.getSize(new THREE.Vector3()) : new THREE.Vector3(100, 100, 100)
@@ -2492,10 +2506,13 @@ export function Viewport() {
       )}
       {placing && (
         <div className="pick-banner">
-          <span>Placing <b>{placing.node}</b>{placingBar ? (placing.port === 'start' ? ': its start' : ': its end') : ''}</span>
+          <span>Placing <b>{placing.node}</b>{placingBar ? (placing.port === 'start' ? ': its start' : ': its end')
+            : placingPipe ? (placing.count ? `: ${placing.count} ${placing.count === 1 ? 'point' : 'points'}, click for the next`
+              : ': click for its first point') : ''}</span>
           <span className="muted">
             {views.length
-              ? 'click on a shown body: the point goes in the middle of the wall under the click · drag to turn the view'
+              ? `click on a shown body: the point goes in the middle of the wall under the click · drag to turn the view${
+                placingPipe ? ' · Backspace takes the last point back · Done or Esc when the path is complete' : ''}`
               : 'show a body to click on (its ○ eye on a node)'}
           </span>
           <button onClick={() => setPlacing(null)} title="Esc">Done</button>

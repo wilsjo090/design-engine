@@ -902,8 +902,21 @@ function modifyEntries(st: State, view: string, cad: Source | null, ctx: MenuCon
       ...(type === 'implicit.box' ? [{ node: ids.shape, port: 'size' }, { node: ids.shape, port: 'rounding' }] : [{ node: ids.shape, port: 'radius' }]),
       { node: ids.new, port: 'edge', label: 'Edge' }, { node: ids.new, port: 'radius', label: 'Edge radius' }] })
   }, { disabled: ctx.point ? undefined : 'Right-click on the body' })
-  const shapes = (op: 'implicit.subtract' | 'implicit.union') =>
-    [['implicit.ball', 'Ball'], ['implicit.box', 'Box'], ['implicit.bar', 'Bar']].map(([t, l]) => shape(op, t, l))
+  /** a Pipe starting at the click, cut out (a channel) or added (a stem): placing its next points follows */
+  const pipe = (op: 'implicit.subtract' | 'implicit.union', label: string) => item(label, () => {
+    const p = ctx.point ?? [0, 0, 0]
+    const chain: GraphEdit = { add: [{ key: 'shape', type: 'implicit.pipe', inputs: { points: vec(p), radius: shapeSize(ctx, 0.02) },
+      near }, { key: 'new', type: op, near: 'shape' }], links: [{ from: 'shape', port: 'out', to: 'new', input: 'b' }], select: ['shape'] }
+    const verb = op === 'implicit.subtract' ? 'Cut out' : 'Added'
+    const ids = apply(modifyEdit(slot, chain, { key: 'new', input: 'a' }, { key: 'new', port: 'out' }), `${verb} ${label}`,
+      { text: (ids) => `${verb} ${ids.shape} with ${ids.new}: click on the body for the path's next points, then Done ` +
+        '(Esc). Its card sets the radius and a teardrop section that prints without supports' })
+    if (ids) useStore.getState().setPlacing({ node: ids.shape, port: 'points', count: 1 })
+  }, { disabled: ctx.point ? undefined : 'Right-click on the body',
+    title: 'A pipe along points you click, starting here (each point in the middle of the wall under the click)' })
+  const shapes = (op: 'implicit.subtract' | 'implicit.union') => [
+    ...[['implicit.ball', 'Ball'], ['implicit.box', 'Box'], ['implicit.bar', 'Bar']].map(([t, l]) => shape(op, t, l)),
+    pipe(op, op === 'implicit.subtract' ? 'Channel (pipe)…' : 'Pipe…')]
   const off = editingReason(st)
   return [item('Modify', undefined, {
     disabled: off,

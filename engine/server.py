@@ -52,7 +52,7 @@ LEVELS = list(QUALITY)  # coarse to fine
 QUALITY_TYPES = ("mesh.from_implicit", "mesh.merge", "mesh.reduce")
 DISPLAYABLE = ("mesh", "cad", "implicit")
 # simple shapes the editor draws itself (Viewport's guide shapes), so they follow a drag at once
-DRAWN_BY_VIEWPORT = ("implicit.ball", "implicit.bar", "implicit.box")
+DRAWN_BY_VIEWPORT = ("implicit.ball", "implicit.bar", "implicit.box", "implicit.pipe")
 # The 3D view gets a decimated copy above this. The browser draws ~12M triangles fine on this
 # PC; the careful decimation used for files reached only 10.6M of a 2.5M target on the lamp and
 # took 24 s, so display copies use the fast setting and only when really needed.
