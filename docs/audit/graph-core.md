@@ -231,7 +231,7 @@ engine either ignore literal inputs that do not exist (log a warning once per no
 ### [IMPROVEMENT] Recipe save is not atomic
 Severity: low · Status: SUSPECTED (from code)
 Evidence: `engine/server.py:619` `p.write_text(...)` writes the recipe in place (the autosave right above uses tmp + `os.replace`, `:635-638`). The recipes live in the repo and
-partly on OneDrive; a crash, a full disk or OneDrive locking the file mid-write leaves a truncated JSON, and the editor then cannot open it (`/api/file` returns 400).
+partly in a cloud-synced folder; a crash, a full disk or the sync client locking the file mid-write leaves a truncated JSON, and the editor then cannot open it (`/api/file` returns 400).
 Suggestion: same tmp + `os.replace` pattern, and keep one `.bak` of the previous version.
 
 ---

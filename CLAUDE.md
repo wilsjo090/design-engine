@@ -10,8 +10,9 @@ Read it before changing performance, memory, meshing or the lamp recipes.
 
 ## Commands
 
-Python is the conda env `synkad` (3.12), not on PATH:
-`%USERPROFILE%\miniconda3\envs\synkad\python.exe` (below: `python`).
+Python 3.12 in a conda env, not on PATH (below: `python`): the one `start.bat` finds
+(`DESIGN_ENGINE_PYTHON`, also from an untracked `local.bat`, else an env named `design-engine`).
+This machine's exact path is in `CLAUDE.local.md` (untracked).
 
 | Task | Command |
 |---|---|

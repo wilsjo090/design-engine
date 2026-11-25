@@ -54,7 +54,19 @@ More pictures: [pattern presets](docs/pattern_presets.png) · [patterns sized by
 
 ## Getting started
 
-Double-click the **Design Engine** shortcut on the desktop, or run `start.bat` in this folder. The
+**Install once** (Windows, Python 3.12; an NVIDIA card is optional):
+
+```
+conda create -n design-engine python=3.12
+conda activate design-engine
+pip install -r requirements.txt
+```
+
+`start.bat` finds a conda environment named `design-engine` by itself. To use another Python, put
+`set "DESIGN_ENGINE_PYTHON=C:\path\to\python.exe"` in a `local.bat` next to `start.bat` (it stays out
+of the repo). Rebuilding the UI needs Node.js.
+
+**Start** by double-clicking the **Design Engine** shortcut on the desktop, or run `start.bat` in this folder. The
 editor opens at http://127.0.0.1:8765. Close the console window to stop it.
 
 - Already running? Starting it again just opens the editor.
@@ -105,8 +117,7 @@ after the first preview an edit typically takes well under a second.
 
 ## Command line
 
-`python` is the engine's conda environment (`synkad`, Python 3.12):
-`%USERPROFILE%\miniconda3\envs\synkad\python.exe`.
+`python` is the engine's environment (see *Getting started*), e.g. after `conda activate design-engine`.
 
 ```
 python run_graph.py recipes\lamp_noise.json --set amplitude.value=0.5

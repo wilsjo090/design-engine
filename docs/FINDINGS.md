@@ -8,7 +8,7 @@ finding changes.
 
 - Windows 11 Pro, 16 cores / 32 threads, RTX 3080 Ti (12 GB), 31.9 GB RAM. Other programs
   typically use 14–17 GB of RAM, so only ~15–17 GB is free. C: has ~93 GB free.
-- Conda env `synkad`, Python 3.12. Key versions: cadquery-ocp 8.0.1, libigl 2.6.3 (nanobind API),
+- A conda env, Python 3.12. Key versions: cadquery-ocp 8.0.1, libigl 2.6.3 (nanobind API),
   trimesh 5.1.1, numpy 2.5. Node 24 / npm 11; React 18.3, @xyflow/react 12, three 0.169,
   @react-three/fiber 8, drei 9, zustand 4.5, vite 5, TypeScript 5.6.
 - OCP 8 API: `TopoDS.Edge(...)` / `TopoDS.Face(...)` (no `_s` suffix), but

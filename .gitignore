@@ -18,3 +18,7 @@ parts/
 .claude/settings.local.json
 
 *.tmp
+
+# This machine's settings: start.bat's Python, Claude Code's local notes
+local.bat
+CLAUDE.local.md

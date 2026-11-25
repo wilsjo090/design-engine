@@ -301,8 +301,8 @@ Severity: low · Status: VERIFIED by reading
     log errors (Halftone 0.3 mm web, Knurl 0.1 mm gap); Parquet preset is not a tiling; silent clamps; no-face selections only info-level.
 
 ## What I could not or did not test
-- Presets "Static analysis" and "Topology" (FEA, other agent's area). GPU path (CPU only by rule). The key box / lamp files on OneDrive (rule: never). Block meshing (grids > 32M voxels) of patterns: runs stayed
+- Presets "Static analysis" and "Topology" (FEA, other agent's area). GPU path (CPU only by rule). The key box / lamp files outside the repo (rule: never). Block meshing (grids > 32M voxels) of patterns: runs stayed
   under 12M voxels; `tests/test_tiles.py` and `tests/test_holes.py::test_hole_pattern_node` cover bit-exactness (the targeted tests I ran, test_text_and_picture_nodes,
   test_a_picture_lies_on_the_face_and_wraps_round_ones, test_tangent_faces_share_one_pattern, test_hole_pattern_node, pass).
 - The editor UI itself (only code-read: EngineNode.tsx, types.ts); the UI agent owns that. Face picking in the 3D view not exercised.
-- Join Faces on large B-spline sheets beyond the test_part fillets (the key box is on OneDrive); performance of the as-rigid-as-possible loop at 100k+ triangles is untested (300 iterations x 2 sparse solves, factorised once).
+- Join Faces on large B-spline sheets beyond the test_part fillets (the key box is outside the repo); performance of the as-rigid-as-possible loop at 100k+ triangles is untested (300 iterations x 2 sparse solves, factorised once).
