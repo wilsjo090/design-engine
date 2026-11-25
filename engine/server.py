@@ -56,6 +56,7 @@ DRAWN_BY_VIEWPORT = ("implicit.ball", "implicit.bar", "implicit.box", "implicit.
 # The 3D view gets a decimated copy above this. The browser draws ~12M triangles fine on this
 # PC; the careful decimation used for files reached only 10.6M of a 2.5M target on the lamp and
 # took 24 s, so display copies use the fast setting and only when really needed.
+GC_DELAY = 0.3   # s after a run before its garbage is collected (see _run_job's end)
 DISPLAY_MAX_FACES = 15_000_000
 # A field painted on surfaces is sampled on a grid with this many cells along the longest side
 # of the bodies (at most PAINT_MAX_VOXELS in all) and interpolated at their vertices: smooth
@@ -898,10 +899,15 @@ class Session:
         else:
             publish(type="run_done", ok=True, time=time.perf_counter() - t0, files=files, label=job["label"],
                     sharper=sharper, shown=shown)
-        # Replaced meshes hold reference cycles; free them now (after the result is out, so
-        # nobody waits for it) instead of letting them pile up until Python gets round to it.
+        # Replaced meshes hold reference cycles; free them soon (after the result is out, so nobody waits
+        # for it) instead of letting them pile up until Python gets round to it. Not on this thread, right
+        # now: it took 60-70 ms after a 71 ms Draft with the GIL held, while the browser fetched the view and
+        # the next run waited to start; a moment later instead, unless another run has begun by then (it
+        # collects when it ends).
         results = None
-        gc.collect()
+        timer = threading.Timer(GC_DELAY, lambda: gc.collect() if self.run_id == run_id else None)
+        timer.daemon = True
+        timer.start()
 
     def _timing(self, node_id, t0):
         """What the engine knows of how the node behind a view went, for the editor's view timing: the node's
@@ -1211,6 +1217,11 @@ def create_app():
     async def lifespan(app):
         hub.loop = asyncio.get_running_loop()
         from .graph.nodes import ARRAY_CACHE
+        # What the engine has imported never becomes garbage: frozen, a collection after a run does not walk
+        # its ~100k objects again (35-45 ms each time; the workers do the same, `workers._freeze_imports`).
+        # Only now, before any run: an object frozen while alive is never collected as part of a cycle.
+        gc.collect()
+        gc.freeze()
         if ARRAY_CACHE.disk is not None:  # bring the SSD cache back under its size limit
             threading.Thread(target=ARRAY_CACHE.disk.trim, daemon=True).start()
         stop_watch = threading.Event()

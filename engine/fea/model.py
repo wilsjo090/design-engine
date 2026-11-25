@@ -34,10 +34,15 @@ LOAD_KINDS = ("force", "pressure", "bearing", "torque")
 OFFSET_KINDS = ("force", "bearing")   # loads acting at a point, which Offset moves off the faces
 
 
-# A bearing load's pressure is scaled to give the force along its direction, so it adds up to more than that the
-# further the direction turns from square to the faces (1 / sine of its angle to a hole's axis: 1.1-1.2 in use). Over
-# this much it no longer stands for the force asked for: the direction runs along the faces (19 degrees to an axis).
+# A bearing load on the wall of a hole (or round a pin) presses square to the hole's axis: of a direction that is
+# not, only the part across the axis is applied, amount x the sine of its angle to the axis (a pin cannot push
+# along its hole; `Condition.bearing`). Until 2026-11-10 the pressure was scaled to give the whole amount along the
+# typed direction: 200 N at 45 degrees pressed 283 N on the wall, while the arrow and an Offset's moment used
+# the typed vector. Faces that are no such wall keep that rule. Under a third across (19 degrees to the axis,
+# 1 / MAX_BEARING_GROWTH) the direction runs along the faces and is refused.
 MAX_BEARING_GROWTH = 3.0
+AXIS_FLAT = 1e-3     # faces count as a hole's wall when their normals leave this little (of their area) along one axis
+OFF_SQUARE = 1e-6    # ... and a direction as square to that axis within this
 
 
 class ConditionError(ValueError):
@@ -134,11 +139,30 @@ def estimate_volume(part, bounds, cells=64):
     return float(np.clip(0.5 - d / v, 0, 1).sum() * v ** 3)
 
 
-def element_fill(part, grid, xp=np, cache=None):
+FILL_SLAB = 24   # elements along x per pass of a sub-sampled fill (x sub: a multiple of the lattices' 12)
+
+
+def element_fill(part, grid, xp=np, cache=None, sub=1):
     """How full each element is (0..1), from the part's signed distance at its centre: exact for a
-    flat surface parallel to the element's faces, close otherwise."""
-    d = to_host(Context(grid.centres(), cache, xp).eval_full(part)).astype(np.float64)
-    phi = np.clip(0.5 - d / grid.h, 0.0, 1.0)
+    flat surface parallel to the element's faces, close otherwise. `sub` > 1: the mean of that many
+    samples along each side instead (each one's own little cube). An element an edge runs through is
+    then as full as it is (at its centre alone a quarter-full one counts as half: a 10 x 10 mm bar half
+    an element off the grid weighed 1-4% too much and bent 5.7% too little at 10 elements across, 2.9%
+    with sub = 2; a flat wall's fill, and its error, stay the same, 2026-11-10)."""
+    if sub <= 1:
+        d = to_host(Context(grid.centres(), cache, xp).eval_full(part)).astype(np.float64)
+        phi = np.clip(0.5 - d / grid.h, 0.0, 1.0)
+    else:
+        nx, ny, nz = grid.shape
+        fine = grid.h / sub
+        base = np.asarray(grid.origin, dtype=np.float64) + fine / 2
+        phi = np.empty(grid.shape, dtype=np.float64)
+        for x0 in range(0, nx, FILL_SLAB):       # in slabs: 8 samples per element are not held at once
+            x1 = min(x0 + FILL_SLAB, nx)
+            block = Grid.block(base, fine, (sub * x0, 0, 0), (sub * (x1 - x0), sub * ny, sub * nz))
+            d = to_host(Context(block, None, xp).eval_full(part))
+            full = np.clip(0.5 - d / np.float32(fine), 0.0, 1.0)
+            phi[x0:x1] = full.reshape(x1 - x0, sub, ny, sub, nz, sub).mean(axis=(1, 3, 5), dtype=np.float64)
     phi[phi < PHI_MIN] = 0.0
     return phi
 
@@ -178,6 +202,8 @@ class Condition:
                  self.direction, tuple(float(v) for v in self.vector))
         if self.offset_moment() is not None:  # (loads without an offset keep their keys)
             parts += (tuple(float(v) for v in self.offset),)
+        if self.kind == "load" and self.load == "bearing" and self._off_square():
+            parts += ("radial part",)   # (results from before only that part was applied are not reused)
         if self.case is not None:
             parts += (("case", self.case),)
         return _digest(*parts)
@@ -217,9 +243,9 @@ class Condition:
             # a pin pressing on the side of a hole the force points to: pressure square to the face,
             # largest where the face looks straight against the force, falling as the cosine to 0 at
             # the sides, none on the far side (as SolidWorks' bearing load); total = the force
-            d = self.bearing_direction()
+            d, amount = self.bearing()
             w = np.maximum(-(normals @ d), 0.0)
-            t = (float(self.amount) / self._bearing_norm(d)) * w[:, None] * -normals
+            t = (amount / self._bearing_norm(d)) * w[:, None] * -normals
         else:
             per_area = float(self.amount) / max(self.area, 1e-12)
             if self.direction == "into the face":
@@ -238,7 +264,10 @@ class Condition:
         if self.load == "pressure":
             area, _, _, mean_normal = self.geometry
             return -float(self.amount) * area * mean_normal
-        if self.load == "bearing" or self.direction not in ("into the face", "out of the face"):
+        if self.load == "bearing":
+            d, amount = self.bearing()
+            return amount * d
+        if self.direction not in ("into the face", "out of the face"):
             return float(self.amount) * direction_vector(self.direction, self.vector)
         sign = -1.0 if self.direction == "into the face" else 1.0
         return sign * float(self.amount) * self.geometry[3]
@@ -293,7 +322,7 @@ class Condition:
         """Where the load acts on its own (not counting an offset's moment): a bearing load only on
         the contact side, the others everywhere."""
         if self.kind == "load" and self.load == "bearing":
-            return -(normals @ self.bearing_direction()) > 0
+            return -(normals @ self.bearing()[0]) > 0
         return np.ones(len(normals), dtype=bool)
 
     def bearing_direction(self):
@@ -301,6 +330,54 @@ class Condition:
             raise ConditionError("a bearing load needs a direction (e.g. -Z): the side of the hole the pin "
                                  "presses on")
         return direction_vector(self.direction, self.vector)
+
+    @cached_property
+    def hole_axis(self):
+        """The axis of the hole (or pin) these faces are the wall of, a unit vector, or None when they
+        are no such wall: the direction their normals have next to nothing of, while they do span the
+        plane across it (a flat face has two such directions, a ball's none)."""
+        t = np.asarray(self.triangles, dtype=np.float64).reshape(-1, 3, 3)
+        cross = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+        double = np.linalg.norm(cross, axis=1)
+        if double.sum() <= 0:
+            return None
+        n = cross / np.maximum(double, 1e-300)[:, None]
+        values, vectors = np.linalg.eigh(np.einsum("k,ki,kj->ij", double, n, n) / double.sum())
+        if values[0] > AXIS_FLAT or values[1] < 10 * AXIS_FLAT:
+            return None
+        return vectors[:, 0]
+
+    def bearing(self):
+        """(unit direction, N) a bearing load presses with: across the hole's axis, the part of the
+        typed force that is (see MAX_BEARING_GROWTH); the typed ones on faces that are no hole's wall."""
+        d = self.bearing_direction()
+        axis = self.hole_axis
+        if axis is None:
+            return d, float(self.amount)
+        across = d - (d @ axis) * axis
+        share = float(np.linalg.norm(across))
+        if share < 1.0 / MAX_BEARING_GROWTH:
+            raise ConditionError(BEARING_ALONG)
+        if share > 1.0 - OFF_SQUARE:
+            return d, float(self.amount)
+        return across / share, float(self.amount) * share
+
+    def _off_square(self):
+        try:
+            return self.bearing()[1] != float(self.amount)
+        except ConditionError:
+            return False
+
+    def bearing_note(self):
+        """What a bearing load off square to its hole leaves out, as a line for the report (or None)."""
+        if self.kind != "load" or self.load != "bearing" or not self._off_square():
+            return None
+        typed = abs(float(self.amount))
+        applied = abs(self.bearing()[1])
+        along = math.sqrt(max(typed * typed - applied * applied, 0.0))
+        return (f"{self.label or 'bearing load'}: its direction is {math.degrees(math.acos(min(applied / typed, 1.0))):.0f}° "
+                f"off square to the hole, so {applied:.3g} N of the {typed:.3g} N press on the wall; the {along:.3g} N "
+                f"along the hole are left out (a pin cannot push along its hole: add a force for that part)")
 
     def _bearing_norm(self, d):
         """sum over the faces of area x w^2 (w = cos of the angle against the force): the pressure
@@ -315,13 +392,16 @@ class Condition:
         # (along a hole's axis w is rounding noise, so the total is 1e-32 of the area and not 0: 600 N became
         # 1.2e18 N sideways, and next to that the part's real loads counted for nothing)
         if np.abs(facing).max() < 1e-9 or                 np.linalg.norm(((0.5 * double * w)[:, None] * n).sum(axis=0)) > MAX_BEARING_GROWTH * total > 0:
-            raise ConditionError("bearing load: a pin presses sideways on the wall of a hole, so it cannot act along "
-                                 "the hole, and this direction runs along these faces. For a push or pull along the "
-                                 "hole use Kind: force, or give a direction across it")
+            raise ConditionError(BEARING_ALONG)
         if total <= 0:
             raise ConditionError("bearing load: no part of the faces faces against the force (check the "
                                  "direction: a pin pulled down presses on the bottom of the hole: -Z)")
         return total
+
+
+BEARING_ALONG = ("bearing load: a pin presses sideways on the wall of a hole, so it cannot act along the hole, and "
+                 "this direction runs along these faces. For a push or pull along the hole use Kind: force, or give a "
+                 "direction across it")
 
 
 def direction_vector(direction, vector=(0, 0, -1)):
@@ -550,6 +630,8 @@ def apply_conditions(grid, phi, conditions):
             notes.append(f"{cond.label or cond.kind}: {100 * (1 - share):.0f}% of it would act off the part, so the "
                          f"rest carries it")
         f = f[ok] / max(share, 1e-300)
+        if cond.bearing_note():
+            notes.append(cond.bearing_note())
         moment = cond.offset_moment()
         if moment is not None:
             notes.append(f"{cond.label or 'load'}: acts {np.linalg.norm(cond.offset):.3g} mm from the centre of its "

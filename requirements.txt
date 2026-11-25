@@ -13,6 +13,7 @@ fastapi
 uvicorn[standard]
 psutil
 pillow
+lxml
 pytest
 httpx
 # GPU (optional: the engine falls back to the CPU without them or without an NVIDIA card)

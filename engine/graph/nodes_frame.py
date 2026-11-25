@@ -22,7 +22,7 @@ from .core import (Cancelled, GraphError, Port, check_cancel, node, report_finis
 from .nodes import ARRAY_CACHE, S
 from .nodes_fea import SHOW, SIM, _check, _part, _validate, check_result, safety_text
 
-FRAME_VERSION = 5     # bump when the method changes: saved frames are then ignored
+FRAME_VERSION = 6     # bump when the method changes: saved frames are then ignored
 # The beam model sees neither the joints' fillets nor the bosses at holes, where the body is most
 # stressed: the bracket's body reached safety factor 1.42-1.57 of 2. So the body is analysed (at
 # CHECK_DETAIL) and the bars at its most stressed spot made thicker, for up to CHECK_ROUNDS rounds.
@@ -297,7 +297,8 @@ def frame(space, material, conditions, min_size, sizes, size_step, max_sizes, sa
         report_message(text, "warning")
     out.note = note
     ref = FO.FrameRef(np.asarray(state["nodes"]), np.asarray(state["bars"]), chains, sizes_, prof, body,
-                      tuple(conditions), float(skin), key, np.asarray(state["utilisation"]), np.asarray(state["axial"]))
+                      tuple(conditions), float(skin), key, np.asarray(state["utilisation"]), np.asarray(state["axial"]),
+                      material)
     out.frame_view = frame_view(ref)
     out.ground_view = ground
     shown = None
@@ -452,9 +453,13 @@ def _size_for_body(crop, state, conditions, material, prof, shape, key, safety, 
     rep = json.loads(str(state["report"]))
     mass = sum(prof.section(s).A * L for s, L in zip(sizes, lengths)) * material.density / 1000.0
     curved = f", {rep['curved']} curved" if rep.get("curved") else ""
+    # (bars by length count every joint once per bar: 14.7 g on a block of 7.1 g; the body's own mass is the
+    # analysis')
+    weighs = f" (the body weighs {r['mass']:.3g} g)" if r is not None and r.get("mass") else ""
     summary = (f"{rep['bars']} bars ({rep['pieces']} pieces, {rep['joints']} joints{curved}), "
                f"{len(np.unique(sizes))} sizes ({', '.join(f'{s:g}' for s in np.unique(sizes))} mm {prof.kind}), "
-               f"{mass:.3g} g of bars · beam model: max utilisation {rep['utilisation']:.2f}, max deflection "
+               f"{mass:.3g} g of bars by their length{weighs} · beam model: max utilisation {rep['utilisation']:.2f}, "
+               f"max deflection "
                f"{rep['deflection']:.3g} mm, buckling factor {rep['buckling']:.3g}")
     if rounds:
         report_message(f"body check: bars thickened in {rounds} {'round' if rounds == 1 else 'rounds'} for safety factor "
@@ -608,11 +613,16 @@ def _item_key(v):
             doc="Fillet size, mm; 0 = automatic (0.6 x the thinner bar)."),
        Port("continuity", "text", "G2", choices=list(CONTINUITY), label="Fillet continuity",
             when={"joints": ["fillet", "ball"]},
-            doc="How smoothly fillets run into the bars: G1, G2 or G3 (as in Frame Optimization).")],
+            doc="How smoothly fillets run into the bars: G1, G2 or G3 (as in Frame Optimization)."),
+       Port("check", "text", "yes", choices=["yes", "no"], advanced=True, label="Check the joined part",
+            doc="yes = the joined part is analysed (Static Analysis at medium) with every frame's supports and "
+                "loads at once: each frame was sized alone, without the load another one puts on it through "
+                "Connect to. Its safety factor and deflection are on the card. no = just join them.")],
       [Port("body", "implicit", doc="The frames and bodies as one part, filleted where they meet.")])
-def join_frames(a, b=None, c=None, d=None, joints=JOINTS[0], fillet=0.0, continuity="G2"):
+def join_frames(a, b=None, c=None, d=None, joints=JOINTS[0], fillet=0.0, continuity="G2", check="yes"):
     """Frames made separately (one connected to another with Connect to) and CAD bodies as one part:
-    where a bar of one meets a bar of another, the joint is filleted as inside one frame."""
+    where a bar of one meets a bar of another, the joint is filleted as inside one frame. The joined
+    part is then checked under all their loads together."""
     items = []
     for name, v in (("A", a), ("B", b), ("C", c), ("D", d)):
         items += _items(v, f"Frame {name}")
@@ -626,4 +636,35 @@ def join_frames(a, b=None, c=None, d=None, joints=JOINTS[0], fillet=0.0, continu
         raise GraphError("the fillet must be 0 or more")
     if continuity not in CONTINUITY:
         raise GraphError(f"fillet continuity must be one of: {', '.join(CONTINUITY)}")
-    return join_body(frames, bodies, joints, float(fillet), continuity)
+    if check not in ("yes", "no"):
+        raise GraphError("check must be yes or no")
+    out = join_body(frames, bodies, joints, float(fillet), continuity)
+    if check == "yes":
+        out.note = _joined_check(out, frames)
+    return out
+
+
+def _joined_check(body, frames):
+    """The card note of Join Frames: Static Analysis of the joined part under every frame's supports and
+    loads at once (each condition once). A frame connected to another was sized without the load it gets
+    from it, and that other without the load it is given (frame_join: 120 N more on a frame sized for
+    120 N); only the joined part shows what that does."""
+    conditions, seen = [], set()
+    for frame in frames:
+        for c in frame.conditions:
+            if c.key not in seen:
+                seen.add(c.key)
+                conditions.append(c)
+    materials = [f.material for f in frames if f.material is not None]
+    if not materials:
+        return "not checked: these frames carry no material (optimize them again)"
+    if not any(c.kind == "fixed" for c in conditions) or not any(c.kind == "load" for c in conditions):
+        return "not checked: the frames have no Fixed Faces or no Load between them"
+    material = min(materials, key=lambda m: m.strength)
+    report, text, warnings = check_result(body, Conditions(tuple(conditions)), material, CHECK_DETAIL)
+    for line in warnings:
+        report_message(line, "warning")
+    if report is None:
+        return "the joined part could not be checked (see the log)"
+    mixed = f", in {material.name}, the weaker of the frames' materials" if len({m.key for m in materials}) > 1 else ""
+    return f"joined part, all loads at once: {text}{mixed}"

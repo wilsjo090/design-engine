@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useStore } from '../store'
 import type { PortSpec } from '../types'
 import { CATEGORY_COLORS, TYPE_COLORS } from '../types'
@@ -75,19 +76,32 @@ function KeysHelp() {
 /** What the selected node does, and every input and output explained; with nothing selected, the mouse
  *  and keys. */
 export function HelpPanel() {
-  const selected = useStore((s) => s.nodes.filter((n) => n.selected))
+  // (shallow: the filter makes a new array every time, and with it the panel was drawn on every store update)
+  const selected = useStore(useShallow((s) => s.nodes.filter((n) => n.selected)))
   const spec = useStore((s) => (selected.length === 1 ? s.specs[selected[0].data.typeId] : undefined))
   const [open, setOpen] = useState(readOpen)
   const toggle = (next: boolean) => {
     setOpen(next)
     try { localStorage.setItem('helpPanel', next ? 'open' : 'closed') } catch { /* storage unavailable */ }
   }
+  // The panel sits at the right of the graph; when the selected card is under it there, it moves to the
+  // left (it opened over the card just clicked, e.g. the one whose Optimize was pressed).
+  const panel = useRef<HTMLDivElement>(null)
+  const [left, setLeft] = useState(false)
+  const only = selected.length === 1 ? selected[0].id : null
+  useLayoutEffect(() => {
+    const box = panel.current?.parentElement?.getBoundingClientRect()
+    const card = only ? document.querySelector(`.react-flow__node[data-id="${CSS.escape(only)}"]`)?.getBoundingClientRect() : null
+    if (!box || !card) return
+    setLeft(card.right > box.right - 320 && card.left > box.left + 330)
+  }, [only, open])
   if (!spec) return selected.length ? null : <KeysHelp />
   if (!open) {
     return <button className="help-reopen" title="Show help for the selected node" onClick={() => toggle(true)}>?</button>
   }
   return (
-    <div className="help-panel" style={{ ['--cat' as string]: CATEGORY_COLORS[spec.category] ?? '#888' }}>
+    <div ref={panel} className={`help-panel${left ? ' left' : ''}`}
+      style={{ ['--cat' as string]: CATEGORY_COLORS[spec.category] ?? '#888' }}>
       <div className="help-head">
         <span className="help-title">{spec.title}</span>
         <span className="help-muted">{spec.category}</span>

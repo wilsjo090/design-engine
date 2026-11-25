@@ -73,6 +73,24 @@ def fractal(x, y, z, scale, octaves=3, roughness=0.5, seed=0):
     return total / max(norm, 1e-9)
 
 
+_GAINS = {}
+
+
+def gain(octaves, roughness):
+    """What fractal noise of these settings is multiplied by to span -1..1: as it comes it only reaches
+    about +-0.68 (3 octaves; the layers rarely peak together, 1 octave +-0.87), so "roughly -1..1" was not
+    true: a Remap of -1..1 never reached its ends, and a texture two thirds of its Height. 1 / the largest
+    value on a fixed sample (64^3 points over 23 features), measured once per setting with numpy, so it is
+    the same number in every process and on the GPU; the caller clips the rare value beyond."""
+    key = (int(octaves), round(float(roughness), 6))
+    if key not in _GAINS:
+        n = 64
+        axis = np.linspace(0.0, 23.0, n, dtype=np.float32) + np.float32(0.37)
+        x, y, z = np.meshgrid(axis, axis, axis, indexing="ij")
+        _GAINS[key] = float(1.0 / max(np.abs(fractal(x, y, z, 1.0, key[0], key[1], seed=0)).max(), 1e-6))
+    return _GAINS[key]
+
+
 def _slabs(grid, xp=np):
     """Yield (index slice, X, Y, Z) blocks of full coordinate arrays covering the grid."""
     ax, ay, az = [xp.asarray(a.astype(np.float32)) for a in grid.axes()]

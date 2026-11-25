@@ -67,6 +67,7 @@ class FrameRef:
     key: str
     utilisation: np.ndarray = None
     axial: np.ndarray = None
+    material: object = None  # what it was sized in (Join Frames checks the joined part with it)
 
 
 @dataclass

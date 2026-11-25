@@ -44,25 +44,70 @@ def cad_body(mesh, default=0):
     return int(getattr(mesh, "metadata", {}).get("cad_body", default))
 
 
+class FaceListError(ValueError):
+    pass
+
+
+_ENTRY = re.compile(r"^(?:(\d+):)?(\d+)(?:-(\d+))?$")
+
+
+def face_entries(text):
+    """A face list as [(body or None, first, last)]: "15", a range "10-15", or either on one body only,
+    "2:15", with commas or spaces between. Anything else is an error: "10-15" used to be read as faces 10
+    and 15, "5.5" as 5 and "-1" as 1, without a word."""
+    out = []
+    for token in re.split(r"[,;\s]+", re.sub(r"\s*([:-])\s*", r"\1", str(text or "")).strip()):
+        if not token:
+            continue
+        found = _ENTRY.match(token)
+        if not found:
+            if re.match(r"[A-Za-z_]", token):
+                raise FaceListError(f"no face selection named '{token}' in this recipe")
+            raise FaceListError(f"'{token}' is not a face: write face numbers (15), ranges (10-15) or body:face "
+                                f"(2:15), with commas between")
+        body, first, last = found.groups()
+        first, last = int(first), int(last if last is not None else first)
+        out.append((None if body is None else int(body), min(first, last), max(first, last)))
+    return out
+
+
 def faces_for_body(text, body):
     """Face numbers chosen on body number `body`: "15" means face 15 on every body (a list of
-    identical bodies, like the lamp's petals), "2:15" face 15 of body 2 only."""
+    identical bodies, like the lamp's petals), "2:15" face 15 of body 2 only, "10-15" faces 10 to 15."""
     if isinstance(text, (list, tuple)):
         return sorted({int(f) for f in text})
     out = set()
-    for b, f, plain in re.findall(r"(\d+)\s*:\s*(\d+)|(\d+)", str(text or "")):
-        if plain:
-            out.add(int(plain))
-        elif int(b) == body:
-            out.add(int(f))
+    for b, first, last in face_entries(text):
+        if b is None or b == body:
+            out.update(range(first, last + 1))
     return sorted(out)
+
+
+def faces_on(text, mesh, among=None):
+    """`faces_for_body` for a CAD body, with a "body:face" for a body that is not there an error (it chose
+    nothing, silently). Which bodies there are: `among`, the list the node was given (their numbers: bodies
+    of several files can be one list), else the number of bodies in this body's own STEP file."""
+    if not isinstance(text, (list, tuple)):
+        named = {b for b, _, _ in face_entries(text) if b is not None}
+        if among is not None:
+            known = {cad_body(b) for b in among}
+            missing, there = sorted(named - known), ", ".join(str(b) for b in sorted(known))
+        else:
+            count = int(getattr(mesh, "metadata", {}).get("cad_bodies") or 0)
+            # (a body numbered beyond its file's count was put together by hand: nothing to check against)
+            missing = sorted(b for b in named if b >= count) if count > cad_body(mesh) else []
+            there = "0" if count == 1 else f"0-{count - 1}"
+        if missing:
+            raise FaceListError(f"body {missing[0]} does not exist (there {'is body' if there == '0' else 'are bodies'} "
+                                f"{there})")
+    return faces_for_body(text, cad_body(mesh))
 
 
 def parse_faces(text):
     """'3, 7 12' -> [3, 7, 12] (body-qualified entries "2:15" count as face 15)."""
     if isinstance(text, (list, tuple)):
         return sorted({int(f) for f in text})
-    return sorted({int(f or p) for _, f, p in re.findall(r"(\d+)\s*:\s*(\d+)|(\d+)", str(text or ""))})
+    return sorted({f for _, first, last in face_entries(text) for f in range(first, last + 1)})
 
 
 # OpenCascade's GeomAbs_SurfaceType numbers, as kept in mesh.metadata["cad_surfaces"][:, 0]

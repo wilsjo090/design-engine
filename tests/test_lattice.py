@@ -75,6 +75,26 @@ def test_tpms_sheet_thickness_is_in_mm():
     assert sheet_volume == pytest.approx(area * t, rel=0.06)
 
 
+@pytest.mark.parametrize("kind, t", [("gyroid", 0.6), ("gyroid", 1.0), ("schwarz_p", 1.0), ("diamond", 0.8)])
+def test_thick_tpms_walls_are_as_thick_as_typed_on_average(kind, t):
+    # value / |gradient| is a distance only right at the surface: a 1 mm gyroid wall on 5 mm cells was
+    # 0.82 mm on average (half solid for the 62% that 1 mm of that surface is), a 1.5 mm one 1.17
+    voxel = 0.05
+    grid = Grid((0, 0, 0), (CELL - voxel, CELL - voxel, CELL - voxel), voxel)
+    raw = L.TPMS[kind](*[2 * np.pi / CELL * np.asarray(a) for a in np.meshgrid(*grid.axes(), indexing="ij")])
+    n = len(grid.axes()[0])                    # the cell and one more row round it: n + 1 intervals for n
+    v, f, _, _ = marching_cubes(np.pad(raw.astype(np.float32), 1, mode="wrap"), 0.0, spacing=(voxel,) * 3)
+    area = trimesh.Trimesh(v, f, process=False).area * (n / (n + 1)) ** 3
+    share = (values(L.tpms(kind, CELL, t), grid) < 0).mean()
+    assert share == pytest.approx(area * t / CELL ** 3, rel=0.03)
+    before = (values(L.tpms(kind, CELL, t, true_walls=False), grid) < 0).mean()
+    assert before < share
+    # a field as thickness goes the same way, and the lattice says how thin it gets
+    graded = L.tpms(kind, CELL, F.X * 0.0 + t)
+    assert (values(graded, grid) < 0).mean() == pytest.approx(share, rel=0.01)
+    assert L.tpms(kind, CELL, t).thinnest > 0
+
+
 def test_voronoi_nearest_struts_are_exact_and_repeatable():
     bounds = np.array([[0, 0, 0], [20, 15, 10]], float)
     field = L.voronoi(bounds, 4.0, 0.0, randomness=1.0, seed=3)

@@ -2,6 +2,7 @@
 // over views), and hiding list items whose pieces are drawn instead.
 import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
+import { useThree } from '@react-three/fiber'
 
 /** inside of a part cut by the section plane */
 export const CAP_COLOR = '#c8643f'
@@ -18,11 +19,24 @@ export interface BoxCutUniforms { uBoxLo: { value: THREE.Vector3 }; uBoxHi: { va
 /** The box's uniforms, shared by every shader patched with them, so a new box needs no new shader. */
 export function useBoxCutUniforms(box: CutBox | null | undefined): BoxCutUniforms {
   const uniforms = useMemo(() => ({ uBoxLo: { value: NO_BOX.lo.clone() }, uBoxHi: { value: NO_BOX.hi.clone() } }), [])
+  const invalidate = useThree((s) => s.invalidate)
   useEffect(() => {
     uniforms.uBoxLo.value.copy(box ? new THREE.Vector3(...box.lo) : NO_BOX.lo)
     uniforms.uBoxHi.value.copy(box ? new THREE.Vector3(...box.hi) : NO_BOX.hi)
-  }, [box, uniforms])
+    invalidate()   // (the canvas only draws when asked: no prop changed here)
+  }, [box, uniforms, invalidate])
   return uniforms
+}
+
+/** `hideRanges` as an effect of a drawn geometry, with the redraw it needs (the canvas draws on demand). */
+export function useHideRanges(geometry: THREE.BufferGeometry, source: Uint32Array | undefined,
+  counts: ArrayLike<number> | null | undefined, per: number, hide: number[] | undefined) {
+  const invalidate = useThree((s) => s.invalidate)
+  useEffect(() => {
+    if (!source) return
+    hideRanges(geometry, source, counts, per, hide)
+    invalidate()
+  }, [geometry, source, counts, per, hide, invalidate])
 }
 
 /** Patches a built-in material's shader (any with `begin_vertex` and `clipping_planes_fragment`: the

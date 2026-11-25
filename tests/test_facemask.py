@@ -99,6 +99,27 @@ def test_face_mask_node_maps_over_bodies_and_checks_faces(tmp_path):
         Evaluator(g, log=None).run()
 
 
+def test_a_texture_taller_than_a_masks_band_says_so():
+    # beyond its Band a surface mask is 0: a 3 mm texture behind the default Band of 2 mm was cut off flat
+    g = Graph()
+    g.add("import", "input.import_step", path=str(TEST_STEP))
+    g.add("part", "implicit.from_cad", cad=link("import.bodies"), band=4.0)
+    g.add("mask", "field.face_mask", cad=link("import.bodies"), faces="0", fade=1.0)
+    g.add("noise", "field.noise", scale=8.0)
+    g.add("tex", "implicit.texture", body=link("part.out"), pattern=link("noise.out"), height=3.0, fade=link("mask.out"))
+    events = []
+    Evaluator(g, log=None, on_event=events.append).run(["tex"])
+    said = [e["text"] for e in events if e["type"] == "message" and e.get("level") == "warning"]
+    assert any("Band" in t and "3 mm" in t and "2 mm" in t for t in said), said
+    events.clear()
+    g.set("mask", "band", 3.0)
+    Evaluator(g, log=None, on_event=events.append).run(["tex"])
+    assert not [e for e in events if e["type"] == "message" and e.get("level") == "warning"]
+    g.set("mask", "band", 0.0)
+    with pytest.raises(GraphError, match="Band must be greater than 0"):
+        Evaluator(g, log=None).run(["tex"])
+
+
 def volume_mask(box, faces=(TOP,), fade=10.0, position="inside"):
     return facemask.face_mask(box, facemask.cad_faces(box), faces, fade, position, reach="volume")
 

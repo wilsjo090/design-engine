@@ -148,8 +148,9 @@ def test_crowded_copies_shrink_or_are_left_out(stud):
 def test_copies_at_an_edge_shrink_to_fit_inside():
     plate = mesh_of(_box(0, 0, 0, 47, 33, 3))            # not a whole number of Spacings either way
     block = mesh_of(_box(-3, -2, 0, 6, 4, 2))
-    out = C.place(plate, [top_face(plate)], [block], spacing=8.0, layout="grid", edges="leave out")
-    fit = C.place(plate, [top_face(plate)], [block], spacing=8.0, layout="grid", edges="shrink")
+    # (moved off the middle of the face, where the pattern now starts, so that copies reach the edge)
+    out = C.place(plate, [top_face(plate)], [block], spacing=8.0, layout="grid", edges="leave out", offset=(2.0, 1.5))
+    fit = C.place(plate, [top_face(plate)], [block], spacing=8.0, layout="grid", edges="shrink", offset=(2.0, 1.5))
     assert len(fit[0]) > len(out[0]) and np.allclose(out[1], 1) and fit[1].min() < 0.95
     for M in (out[0], fit[0]):
         feet = footprints(M)[..., :2]

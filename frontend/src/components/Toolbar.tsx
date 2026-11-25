@@ -10,9 +10,9 @@ const STARTER: Recipe = {
   version: 1,
   nodes: {
     import: { type: 'input.import_step', inputs: { path: '' }, pos: [0, 0] },
-    part: { type: 'implicit.from_cad', inputs: { cad: { link: 'import.bodies' } }, pos: [320, 0] },
-    mesh: { type: 'mesh.from_implicit', inputs: { body: { link: 'part.out' } }, pos: [640, 0], visible: true },
-    export: { type: 'output.export', inputs: { mesh: { link: 'mesh.mesh' }, path: 'samples/out.stl' }, pos: [960, 0] },
+    part: { type: 'implicit.from_cad', inputs: { cad: { link: 'import.bodies' } }, pos: [360, 0] },
+    mesh: { type: 'mesh.from_implicit', inputs: { body: { link: 'part.out' } }, pos: [720, 0], visible: true },
+    export: { type: 'output.export', inputs: { mesh: { link: 'mesh.mesh' }, path: 'samples/out.stl' }, pos: [1080, 0] },
   },
 }
 

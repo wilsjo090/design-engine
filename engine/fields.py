@@ -333,7 +333,7 @@ def angle(axis="z"):
     """Angle around the given coordinate axis, radians (-pi..pi)."""
     u, v = [AXES[c] for c in "xyz" if c != axis]
     return Field(lambda ctx: np.arctan2(ctx.eval(v), ctx.eval(u)), _digest("angle", axis), f"angle_{axis}",
-                 children=(v, u))
+                 children=(v, u), range=(-math.pi, math.pi))
 
 
 Radius = radial("z")
@@ -356,10 +356,16 @@ def remap(f, in_lo, in_hi, out_lo, out_hi):
 
 # --- noise and 3D patterns ---------------------------------------------------------------
 def noise(scale=10.0, octaves=3, roughness=0.5, seed=0):
-    """Smooth fractal noise, roughly -1..1, with features about `scale` mm across."""
+    """Smooth fractal noise spanning -1..1 (`noise.gain`), with features about `scale` mm across."""
+    from .noise import gain
     args = (float(scale), int(octaves), float(roughness), int(seed))
-    return Field(lambda ctx: fractal_on_grid(ctx.grid, *args, xp=ctx.xp), _digest("noise", *args), f"noise{args}",
-                 cache=True, range=(-1.0, 1.0))
+    by = np.float32(gain(args[1], args[2]))
+
+    def fn(ctx):
+        values = fractal_on_grid(ctx.grid, *args, xp=ctx.xp)
+        values *= by
+        return ctx.xp.clip(values, -1.0, 1.0, out=values)
+    return Field(fn, _digest("noise", "spans -1..1", *args), f"noise{args}", cache=True, range=(-1.0, 1.0))
 
 
 def wave3d(pattern="ridges", period=5.0, warp=0.0, warp_scale=8.0, seed=0, axis="y"):
@@ -432,12 +438,104 @@ def body_from_mesh(mesh, band):
     return f
 
 
+def _bspline_weights(u):
+    """The four weights of a uniform cubic B-spline at u (0..1) between its second and third control value."""
+    v = 1.0 - u
+    return (v * v * v / 6.0, (3.0 * u * u * u - 6.0 * u * u + 4.0) / 6.0,
+            (3.0 * v * v * v - 6.0 * v * v + 4.0) / 6.0, u * u * u / 6.0)
+
+
+def sampled_body(values, start, voxel, bounds=None):
+    """An implicit body from values at samples `voxel` mm apart, the first at `start` (mm, negative inside):
+    a cubic B-spline with the samples as its control values. Twice continuously differentiable, so a surface
+    without the facets and stripes of a mesh of those samples (Topology Optimization's body was the distance to
+    one), and a point's value never leaves the range of the 64 samples round it: no ripples between them, and no
+    loose bits that the samples do not have (a spline through the samples rings: islands of 0.01-0.1 mm3 by
+    every hard edge in them). At a sample it is the samples' [1, 4, 1] / 6 average along each axis, a blur of
+    0.58 samples. Beyond the samples: the value at their edge plus the distance out. A pure function of
+    position (blocks get the same values bit for bit: positions and weights come from the grid's own float64
+    axes), worked out one axis at a time on the part of the samples a grid covers, on the CPU or the GPU. The
+    samples are a Shared array: workers map them."""
+    array = np.ascontiguousarray(values, dtype=np.float32)
+    shape = array.shape
+    if len(shape) != 3 or min(shape) < 4:
+        raise ValueError("a sampled body needs at least 4 samples along each axis")
+    samples = Shared(array)
+    start, voxel = tuple(float(v) for v in start), float(voxel)
+    if bounds is None:
+        bounds = (np.asarray(start), np.asarray(start) + voxel * (np.asarray(shape) - 1))
+
+    def fn(ctx):
+        return spline_values(samples.get(), start, voxel, ctx.grid.axes(), ctx.xp)
+    return Field(fn, _digest("sampled", samples.key, start, voxel), "body", np.asarray(bounds, dtype=np.float64))
+
+
+def spline_values(samples, start, voxel, axes, xp):
+    """`sampled_body`'s values: the cubic B-spline with `samples` (3D, `voxel` mm apart, the first at `start`) as
+    its control values, at the positions `axes` (three float64 arrays: a grid's axes, or a part of them)."""
+    shape = samples.shape
+    first, weights, beyond = [], [], []
+    for k, positions in enumerate(axes):
+        t = (positions - start[k]) / voxel
+        inside = np.clip(t, 1.0, shape[k] - 2.0)
+        lower = np.minimum(np.floor(inside), shape[k] - 3.0)
+        first.append(lower.astype(np.int64) - 1)
+        weights.append([w.astype(np.float32) for w in _bspline_weights(inside - lower)])
+        beyond.append(np.abs(t - inside) * voxel)
+    lo = [int(f.min()) for f in first]
+    out = xp.asarray(np.ascontiguousarray(samples[tuple(slice(lo[k], int(first[k].max()) + 4) for k in range(3))]))
+    for k in range(3):
+        across = [-1 if a == k else 1 for a in range(3)]
+        at = xp.asarray(first[k] - lo[k])
+        total = None
+        for tap in range(4):
+            term = xp.take(out, at + tap, axis=k) * xp.asarray(weights[k][tap].reshape(across))
+            total = term if total is None else total + term
+        out = total
+    if any(float(b.max()) > 0 for b in beyond):
+        x, y, z = (xp.asarray(b.reshape([-1 if a == k else 1 for a in range(3)])) for k, b in enumerate(beyond))
+        out = out + xp.sqrt(x * x + y * y + z * z).astype(np.float32)
+    return out
+
+
 def display_extent(field):
     """The box a field belongs to when shown with other bodies' fields: its bounds, else its extent."""
     if field.bounds is not None:
         return field.bounds
     extent = getattr(field, "extent", None)
     return None if extent is None else np.asarray(extent, dtype=np.float64)
+
+
+def thinnest(field):
+    """The thinnest wall or strut the bodies `field` is made of say they have, mm (None: none says): a
+    lattice's or a Shell's `thinnest`. A mesher warns when its voxel cannot show it."""
+    found, seen, stack = None, set(), [field]
+    while stack:
+        f = stack.pop()
+        if f.key in seen:
+            continue
+        seen.add(f.key)
+        thin = getattr(f, "thinnest", None)
+        if thin is not None and thin > 0:
+            found = thin if found is None else min(found, thin)
+        stack.extend(f.children)
+    return found
+
+
+def surface_band(field):
+    """The smallest `surface_band` among the fields `field` is made of, mm (None: none has one): a Face
+    Mask, a Surface Pattern, a Picture or Text is only computed that far from the surface, 0 beyond."""
+    found, seen, stack = None, set(), [field]
+    while stack:
+        f = stack.pop()
+        if f.key in seen:
+            continue
+        seen.add(f.key)
+        band = getattr(f, "surface_band", None)
+        if band is not None:
+            found = band if found is None else min(found, band)
+        stack.extend(f.children)
+    return found
 
 
 def mesh_triangles(field):
@@ -519,16 +617,170 @@ def subtract_edged(a, b, edge, radius):
                   lambda xp, x, y, r: xp.maximum(xp.maximum(x, -y), (x - y + r) * math.sqrt(0.5)), a.bounds, a.grown)
 
 
+FAN = (0.7, 0.95)   # a body's values count as fanning round an edge between these (`_meeting`'s curl)
+CURL_GAIN = 1.25    # second differences read a fan's curl ~0.83 one sample from its edge (1 farther out)
+
+
+def _meeting(xp, fa, fb, shape, rows):
+    """For the samples `rows` (flat indices) of two bodies' values: (along, curl_a, curl_b).
+    along, 0..1: the product of their unit gradients, cut to 0..1: 0 where the surfaces cross at 90
+    degrees or more, 1 where they run along each other (faces the bodies share).
+    curl, 0..1: value x Laplacian of each body (for a distance field: 0 beside a flat face, 1 where the
+    values fan round an edge, R-to-distance in between beside a cylinder).
+    Central differences; all 0 for samples on the array's outside (and where a gradient vanishes)."""
+    n0, n1, n2 = shape
+    i, j, k = xp.unravel_index(rows, shape)
+    inner = (i > 0) & (i < n0 - 1) & (j > 0) & (j < n1 - 1) & (k > 0) & (k < n2 - 1)
+    sub = rows[inner]
+    a0, b0 = fa[sub], fb[sub]
+    dot = xp.zeros(len(sub), dtype=np.float32)
+    na, nb, la, lb = dot.copy(), dot.copy(), dot.copy(), dot.copy()
+    for stride in (n1 * n2, n2, 1):
+        ap, am, bp, bm = fa[sub + stride], fa[sub - stride], fb[sub + stride], fb[sub - stride]
+        da, db = ap - am, bp - bm
+        dot += da * db
+        na += da * da
+        nb += db * db
+        la += ap + am - 2.0 * a0
+        lb += bp + bm - 2.0 * b0
+    norm = xp.sqrt(na * nb)
+    known = norm > 1e-12
+    out = [xp.zeros(len(rows), dtype=np.float32) for _ in range(3)]
+    out[0][inner] = xp.where(known, xp.clip(dot / xp.where(known, norm, 1.0), 0.0, 1.0), 0.0)
+    # (the squared gradient is over two samples: a x Laplacian = 4 a x second differences / it)
+    gain = 4.0 * CURL_GAIN
+    out[1][inner] = xp.where(na > 1e-12, xp.clip(gain * a0 * la / xp.where(na > 1e-12, na, 1.0), 0.0, 1.0), 0.0)
+    out[2][inner] = xp.where(nb > 1e-12, xp.clip(gain * b0 * lb / xp.where(nb > 1e-12, nb, 1.0), 0.0, 1.0), 0.0)
+    return out
+
+
+def _round_union(xp, a, b, r, g, ca, cb):
+    """A rounded union's value where a and b are both under r: r minus the distance to where both are
+    at least r (what a ball of radius r rolling over both bodies cannot reach is filled). With the
+    surfaces' angle (g) and each body's curl: the nearest such point lies straight out from one body
+    where the other is at least r there too (worked out as a flat face's values, or an edge's fan, by the
+    curl), else on the line where the two r-surfaces meet (as planes at that angle). g = 0 and no curl:
+    Mercury's formula."""
+    u, v = r - a, r - b
+    flat = b + u * g
+    b_there = flat + cb * (xp.sqrt(xp.maximum(b * b + u * u + 2.0 * b * u * g, 0.0)) - flat)
+    flat = a + v * g
+    a_there = flat + ca * (xp.sqrt(xp.maximum(a * a + v * v + 2.0 * a * v * g, 0.0)) - flat)
+    line = xp.sqrt(xp.maximum(u * u + v * v - 2.0 * g * u * v, 0.0) / xp.maximum(1.0 - g * g, 1e-6))
+    far = xp.where(b_there >= r, u, xp.where(a_there >= r, v, line))
+    return xp.minimum(r - far, xp.minimum(a, b))
+
+
+def _chamfer_union(xp, a, b, r, g, ca, cb):
+    """A chamfered union's value: min(a, b) cut by the plane through the two points where a fillet of
+    radius r would touch the faces (at 90 degrees, g = 0: r from the corner along both, (a + b - r) /
+    sqrt 2; at a flatter angle less, down to nothing where the surfaces run along each other). No cut
+    where a body's values fan round an edge (`FAN`)."""
+    cut = (a + b - r * (1.0 - g)) / xp.sqrt(2.0 + 2.0 * g)
+    fan = xp.clip((xp.maximum(ca, cb) - FAN[0]) / (FAN[1] - FAN[0]), 0.0, 1.0)
+    return xp.minimum(xp.minimum(a, b), cut + 4.0 * r * fan)
+
+
+def _union_edged(a, b, radius, label, bounds, grown):
+    """A rounded or chamfered union that works out, at every sample near both bodies, the angle at which
+    their surfaces meet and whether a body's values fan round an edge there (`_meeting`). Mercury's
+    formulas assume two flat faces at 90 degrees: where the bodies share a face (two boxes side by side,
+    a = b) they moved it out by 0.29 x radius (round) or half of it (chamfer), 2026-11-10: two 20 mm
+    boxes, round 2 mm, +0.59 mm on the faces they share; and a body's edge lying hidden on the other's
+    face read as a corner to fill."""
+    r = np.float32(radius)
+    kind = _round_union if "round" in label else _chamfer_union
+    reach = r if kind is _round_union else np.float32(2.0) * r   # beyond it the result is min(a, b)
+
+    def values(xp, va, vb):
+        out = xp.minimum(va, vb)
+        rows = xp.flatnonzero((va < reach) & (vb < reach))
+        if len(rows):
+            fa, fb = va.reshape(-1), vb.reshape(-1)
+            out.reshape(-1)[rows] = kind(xp, fa[rows], fb[rows], r, *_meeting(xp, fa, fb, va.shape, rows))
+        return out
+
+    return _with_neighbours((a, b), values, _digest(label, a.key, b.key, float(r)), label, bounds, grown)
+
+
+def _with_neighbours(bodies, values, key, label, bounds, grown):
+    """The field values(xp, *the bodies' values), for `values` that read each sample's neighbours
+    (`_meeting`)."""
+    def fn(ctx):
+        xp, grid = ctx.xp, ctx.grid
+        if min(grid.shape) >= 3:
+            return values(xp, *(ctx.eval_full(f) for f in bodies))
+        # a few samples (a value read at a point): with their neighbours, from a grid one sample bigger
+        from .grid import Grid
+        more = Grid.block(grid.base, grid.voxel, [s - 1 for s in grid.start], [n + 2 for n in grid.shape])
+        try:
+            inner = Context(more, ctx.cache, xp)
+            return values(xp, *(inner.eval_full(f) for f in bodies))[1:-1, 1:-1, 1:-1]
+        except ValueError:   # a body that samples coarser lattices cannot start one sample earlier
+            return values(xp, *(ctx.eval_full(f) for f in bodies))
+    f = Field(fn, key, f"{label}({', '.join(f.name for f in bodies[:2])})", bounds, children=tuple(bodies))
+    f.grown = grown
+    f.neighbours = 1   # reads one sample on every side: blocks need it as a margin (`halo`)
+    return f
+
+
 def union_edged(a, b, edge, radius):
-    """Both bodies, the inner edges where they meet filled round (radius) or with a chamfer."""
+    """Both bodies, the inner edges where they meet filled round (radius) or with a chamfer, at the
+    angle they meet at; nothing is added where the bodies' surfaces run along each other."""
     if edge == "sharp" or radius <= 0:
         return union(a, b)
     a, b = _lift(a), _lift(b)
     bounds, grown = _merge_bounds(a.bounds, b.bounds), _merged_core((a, b))
-    if edge == "round":
-        return _edged(a, b, radius, "union_round", _round_min, bounds, grown)
-    return _edged(a, b, radius, "union_chamfer",
-                  lambda xp, x, y, r: xp.minimum(xp.minimum(x, y), (x + y - r) * math.sqrt(0.5)), bounds, grown)
+    return _union_edged(a, b, radius, "union_round_at" if edge == "round" else "union_chamfer_at", bounds, grown)
+
+
+KEPT_EDGE = 0.25    # x the radius: `intersect_edged` rounds b in full where it is this much deeper than `keep`
+
+
+def intersect_edged(a, b, radius, bounds="intersect", keep=None, edge="round"):
+    """What the two bodies share, the edges where their surfaces cross rounded to `radius` at the angle they
+    cross at (`_meeting`); where the surfaces run along each other (faces the bodies share: a part and the
+    box that crops it) nothing changes, where Mercury's formula sinks them by 0.29 x the radius. Exact
+    inside and up to half the radius outside; farther out the rounding fades to the plain max(a, b) at one
+    radius (a lower bound of the distance there). `bounds`: "intersect", or "first" (b has none: a body
+    minus another, given as its negative). `edge` "chamfer": a flat cut instead of the arc, through the two
+    lines where the arc would touch the surfaces (legs of `radius` at 90 degrees, as the Booleans'
+    `_chamfer_union`).
+    `keep`: a part of b whose own surface is left as it is (a CAD body joined into b: Topology
+    Optimization's Keep). An edge of b's that lies on a face of a's (a plate's lower edge on the face of the
+    box that crops it) reads as two surfaces crossing only on its one side, and came out half rounded, with
+    a step along the edge: no rounding where b is `keep` (fading in to full where b is `KEPT_EDGE` x the
+    radius deeper: the other bodies in b, and the fillets between them and `keep`), and nothing is taken
+    off `keep` itself."""
+    a, b = _lift(a), _lift(b)
+    box = a.bounds if bounds == "first" else _merge_bounds(a.bounds, b.bounds, mode="intersect")
+    if radius <= 0 or edge == "sharp":
+        return a._binary(b, np.maximum, "max", bounds=bounds)
+    r = np.float32(radius)
+    bodies = (a, b) if keep is None else (a, b, _lift(keep))
+    kind = _chamfer_union if edge == "chamfer" else _round_union
+
+    def values(xp, va, vb, vk=None):
+        out = xp.maximum(va, vb)
+        rows = xp.flatnonzero((va > -r) & (vb > -r) & (out < r))
+        if len(rows):
+            fa, fb = va.reshape(-1), vb.reshape(-1)
+            along = _meeting(xp, fa, fb, va.shape, rows)[0]
+            plain = out.reshape(-1)[rows]
+            # (the rounded union of what is outside the two, seen from inside; no curl: only crossing surfaces)
+            none = np.float32(0.0)
+            more = xp.maximum(-kind(xp, -fa[rows], -fb[rows], r, along, none, none) - plain, 0.0)
+            more *= xp.clip(np.float32(2.0) - plain * (np.float32(2.0) / r), 0.0, 1.0)
+            if vk is not None:
+                kept = vk.reshape(-1)[rows]
+                more *= xp.clip((kept - fb[rows]) / (np.float32(KEPT_EDGE) * r), 0.0, 1.0)
+                out.reshape(-1)[rows] = xp.minimum(plain + more, xp.maximum(fa[rows], kept))
+            else:
+                out.reshape(-1)[rows] = plain + more
+        return out
+    grown = a.grown if bounds == "first" else _merged_core((a, b), "intersect")
+    label = "intersect_chamfer_at" if edge == "chamfer" else "intersect_round_at"
+    return _with_neighbours(bodies, values, _digest(label, *(f.key for f in bodies), float(r)), label, box, grown)
 
 
 def bulge(h, k, order):
@@ -600,6 +852,7 @@ def halo(field, voxel):
         if f.key not in memo:
             blur = getattr(f, "blur", 0.0) / voxel
             own = int(SMOOTH_TRUNCATE * blur + 0.5) + 1 if blur >= 0.05 else 0  # scipy's radius + 1
+            own = max(own, int(getattr(f, "neighbours", 0)))                    # e.g. a gradient's one sample
             memo[f.key] = own + max((reach(c) for c in f.children), default=0)
         return memo[f.key]
     return reach(field)

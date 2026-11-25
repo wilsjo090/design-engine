@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { api, claimEngine, connectEvents, startRun } from './api'
-import { useStore } from './store'
+import { useStore, waitsForFile } from './store'
 import { FileBrowser } from './components/FileBrowser'
 import { LogPanel } from './components/LogPanel'
 import { NodeEditor } from './components/NodeEditor'
@@ -16,6 +16,8 @@ function useAutoRun() {
   const ready = useStore((s) => s.catalog !== null && s.connected)
   useEffect(() => {
     if (!autoRun || !ready || graphVersion === 0) return
+    // (a new graph's Import STEP has no file yet: running it only showed "STEP file not found" in red)
+    if (waitsForFile(useStore.getState())) return
     const t = setTimeout(() => startRun('preview'), 450)
     return () => clearTimeout(t)
   }, [graphVersion, autoRun, ready])

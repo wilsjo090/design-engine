@@ -30,7 +30,7 @@ from scipy.special import erfinv
 
 from .. import backend, trace
 from ..backend import gaussian_filter, to_host, xp_of
-from ..fields import Context, _digest
+from ..fields import Context, Field, _digest
 from .analysis import _drop_loose, plan_grid
 from .element import stiffness
 from .model import ConditionError, apply_cases, element_fill, make_grid, sample_triangles
@@ -134,6 +134,19 @@ OUTLINE_FLOOR = 1e-3
 # Symmetry: mirror planes through the design space's middle (the grid is then laid symmetrically
 # about it, so every element has its mirror image), the sensitivities averaged with their images
 SYMMETRY = ("none", "x", "y", "z", "x and y", "x and z", "y and z", "x, y and z")
+# Extrude along: every member runs straight through the design space along one axis, with flat sides (a web
+# between plates, a part cut from sheet): the free densities of each grid line along the axis are one design
+# variable. Their sensitivities are averaged along the line (the chain rule's sums, as Symmetry's with the
+# mirror image), and everything that looks at neighbours looks in the plane only: the filter (a member's
+# thickness is its width in the plane; through the depth it is as thick as the design space, and the eroded
+# design must not lose the layers at the two faces), and Max thickness's neighbourhoods.
+EXTRUDE = ("none", "x", "y", "z")
+
+
+def extrude_axis(extrude):
+    if extrude not in EXTRUDE:
+        raise ConditionError(f"extrude along must be one of: {', '.join(EXTRUDE)}")
+    return None if extrude == "none" else "xyz".index(extrude)
 
 
 def _thinnest_max(h, min_thickness):
@@ -162,16 +175,23 @@ def section_limit(area, thinnest, widest=math.inf):
     return sigma, share(sigma)
 
 
-def _room(phi, h):
+def _room(phi, h, extrude=None):
     """How much room the design space has, mm: its thickest spot (the largest ball that fits, doubled), the
     second longest side of its box (what a member can be across, in a sheet too), the longest, and its largest
     section square to an axis (mm2). Limits past these cannot bind, and read as sizes they asked for filters of
-    gigabytes (a Max section of 1e6 mm2 on a 30 mm box: 6 GB in 5 s)."""
+    gigabytes (a Max section of 1e6 mm2 on a 30 mm box: 6 GB in 5 s). `extrude` (an axis): members run through
+    the depth along it, so the room is that of the design space seen along it (the largest circle, the
+    shorter and the longer side of its outline)."""
     inside = phi > 0
-    thickest = 2.0 * h * float(ndimage.distance_transform_edt(np.pad(inside, 1)).max())
     planes = ((1, 2), (0, 2), (0, 1))
-    sides = sorted(int(inside.any(axis=a).sum()) * h for a in planes)
     largest = max(float(phi.sum(axis=a).max()) for a in planes) * h * h
+    if extrude is not None:
+        seen = inside.any(axis=extrude)
+        thickest = 2.0 * h * float(ndimage.distance_transform_edt(np.pad(seen, 1)).max())
+        sides = sorted(int(seen.any(axis=a).sum()) * h for a in (1, 0))
+        return SimpleNamespace(thickest=thickest, across=sides[0], longest=sides[1], largest=largest)
+    thickest = 2.0 * h * float(ndimage.distance_transform_edt(np.pad(inside, 1)).max())
+    sides = sorted(int(inside.any(axis=a).sum()) * h for a in planes)
     return SimpleNamespace(thickest=thickest, across=sides[1], longest=sides[2], largest=largest)
 
 
@@ -237,6 +257,15 @@ class Problem:
     conditions: object = None  # (for that: supports and loads, and the skin around them, stay)
     skin: float = 0.0
     min_member: float = 0.0    # Min thickness, mm (at least MIN_MEMBER elements; `radius` without struts only)
+    extrude: object = None     # Extrude along: the axis (0, 1, 2) members run straight through along, or None
+
+    def along(self, a):
+        """Extrude along: `a` with the mean of the free elements of each grid line along the axis in each of
+        them (the same value all along a line then; fixed regions stay as they are)."""
+        xp, free = self.xp, self.free
+        count = xp.sum(free, axis=self.extrude, keepdims=True)
+        mean = xp.sum(xp.where(free, a, 0.0), axis=self.extrude, keepdims=True) / xp.maximum(count, 1)
+        return xp.where(free, mean, a).astype(a.dtype)
 
     def filter(self, x):
         return _convolve(self.xp, self.kernel.size)(x * self.domain, self.kernel) * self.norm
@@ -255,6 +284,8 @@ class Problem:
         return self.domain * _convolve(self.xp, self.kernel.size)(g * self.empty_norm, self.kernel)
 
     def _gauss(self, a, sigma):
+        if self.extrude is not None:   # neighbourhoods in the plane only (a member is as deep as the design space)
+            sigma = tuple(0.0 if k == self.extrude else sigma for k in range(3))
         return gaussian_filter(self.xp)(a, sigma=sigma, mode="constant", cval=0.0, truncate=3.0)
 
     def local(self, xb):
@@ -304,6 +335,56 @@ def _convolve(xp, taps):
         return lambda a, kernel: ndimage.convolve(a, kernel, mode="constant")
     from cupyx.scipy.ndimage import convolve
     return lambda a, kernel: convolve(a, kernel, mode="constant")
+
+
+# Elements the members' field is carried into the fixed regions (the skin at supports and loads, Keep), from the
+# nearest free element: members then run on into the exact bodies of those regions and overlap them.
+CARRY = 3
+MEMBERS_FIELD = 1   # bump when `members_field` gives other values: saved ones are then worked out again (`saved_members`)
+
+
+def saved_members(state):
+    """The members' field a state was saved with, or None when it has none or one of another version."""
+    if "members" in state and "members_version" in state and int(state["members_version"]) == MEMBERS_FIELD:
+        return state["members"]
+    return None
+
+
+def _carried(problem):
+    """(fixed elements that copy a free one, the flat index of that one), on the host: `members_field`'s
+    carrying into fixed regions, the same for every design of a problem."""
+    free = to_host(problem.free).astype(bool)
+    fixed = (to_host(problem.domain) > 0) & ~free
+    if not fixed.any() or not free.any():
+        return np.zeros(free.shape, dtype=bool), np.zeros(0, dtype=np.int64)
+    distance, nearest = ndimage.distance_transform_edt(~free, return_indices=True)
+    carried = fixed & (distance <= CARRY)
+    return carried, np.ravel_multi_index(tuple(n[carried] for n in nearest), free.shape)
+
+
+def members_field(problem, x, carry=None):
+    """What the optimizer designed, apart from what was fixed: per element (0..1, host float32) the filtered
+    design variables `x` on the free elements, 0.5 where a member's surface is (the densities are these,
+    projected: solid in the same free elements). The node's body is this (smoothed, `density_field`) joined
+    with the exact bodies of the fixed regions, the skin at supports and loads (`skin_body`) and Keep. The
+    densities have those regions in them as whole elements: stepped bosses, a Keep plate up to half an
+    element thicker than the CAD one, and no telling a member's surface from theirs, which a fillet between
+    the two needs (the rolling ball's corner is between a member and the plate, not inside one body). The
+    densities are also nearly 0 or 1, so their 0.5 surface follows the elements' faces, while this runs
+    smoothly across a member's surface (a cone as wide as the thinnest member) and places it between the
+    elements. Into the fixed regions the field is carried CARRY elements from the nearest free element, so
+    members overlap the exact bodies and nothing else of a fixed region is in it; empty outside the design
+    space. (Filtered over the free elements only, without the fixed regions' full elements, it lost what the
+    optimizer puts next to them, where those count: members necked at their roots, the bolted bracket 30%
+    less stiff and the wall bracket 8% lighter.)"""
+    p = problem
+    xp = p.xp
+    out = np.asarray(to_host(xp.where(p.free, p.filter(xp.asarray(x, dtype=p.dtype)), 0.0)), dtype=np.float32)
+    np.clip(out, 0.0, 1.0, out=out)
+    carried, source = _carried(p) if carry is None else carry
+    if len(source):
+        out[carried] = out.ravel()[source]
+    return out
 
 
 def project(xt, beta, eta=ETA):
@@ -359,6 +440,87 @@ def _skin_points(condition, spacing):
     return pts[condition.presses(normals)] if len(pts) else pts
 
 
+def skin_reach(skin, min_thickness, h):
+    """How far from the faces of supports and loads the solid skin reaches, mm: Skin, at least an element, and
+    with a Skin never less than a set Min thickness."""
+    reach = max(float(skin), h)
+    if skin > 0 and min_thickness > reach:
+        reach = float(min_thickness)
+    return reach
+
+
+SKIN_BEYOND = 1.0   # mm past the skin its body's values are worked out at least (a fillet's reach more)
+
+
+def skin_body(conditions, reach, beyond=0.0):
+    """The solid skin as a body of its own: everything within `reach` mm of the faces the skin is kept around
+    (`_skin_points`' rule on the triangles: all of a support's or load's, the contact side of a bearing load),
+    as an exact distance, so that a boss round a hole is a true cylinder and not the elements the optimizer
+    kept solid, smoothed (those stayed stepped at every Smoothing). Per connected piece of faces, in its box
+    only: a piece of a cylinder (`frame.geometry._cylinder`) is measured as that cylinder: a hole's wall as a
+    ring all round, as the frames' bosses are, also when the optimizer keeps only the side a pin presses on
+    (with that side alone the eye came out open: the hanger's shaft holes as slots with a notch at each end
+    of the arc, 17% more stress); a pin's wall as the arc it is; other pieces by their triangles. Values are
+    exact up to `beyond` mm past the skin (at least
+    SKIN_BEYOND); farther out they are at least that and grow with the distance from the pieces' boxes, so
+    an offset of the part does not fill the room. None when no face is left. The design space crops it."""
+    from ..frame.geometry import _cylinder, _cylinder_distance, _tree
+    from ..frame.ground import _pieces
+    reach, cap = float(reach), float(reach) + max(float(beyond), SKIN_BEYOND)
+    shapes, every = [], []
+    for c in conditions:
+        tri = np.asarray(c.triangles, dtype=np.float64).reshape(-1, 3, 3)
+        if not len(tri):
+            continue
+        normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        size = np.linalg.norm(normal, axis=1)
+        ok = size > 1e-12
+        tri, normal = tri[ok], normal[ok] / size[ok, None]
+        tri = tri[c.presses(normal)]
+        if not len(tri):
+            continue
+        for piece in _pieces(tri):
+            cyl = _cylinder(piece)
+            lo, hi = piece.reshape(-1, 3).min(axis=0), piece.reshape(-1, 3).max(axis=0)
+            if cyl is not None and cyl["ring"]:   # (a ring's box: the whole circle, whatever was chosen of it)
+                ends = [cyl["c"] + z * cyl["axis"] for z in (cyl["z0"], cyl["z1"])]
+                spread = cyl["r"] * np.sqrt(np.maximum(1.0 - cyl["axis"] ** 2, 0.0))
+                lo = np.minimum(lo, np.minimum(*ends) - spread)
+                hi = np.maximum(hi, np.maximum(*ends) + spread)
+            shapes.append((piece, cyl, lo - cap, hi + cap, _digest("skin piece", np.ascontiguousarray(piece).tobytes())))
+            every.append(piece)
+    if not shapes:
+        return None
+
+    def fn(ctx):
+        axes = ctx.grid.axes()
+        out = None
+        for _, _, lo, hi, _ in shapes:   # outside every box: at least the cap, and the way to the nearest box
+            off = [np.maximum(np.maximum(lo[i] - ax, ax - hi[i]), 0.0).astype(np.float32).reshape(
+                [-1 if a == i else 1 for a in range(3)]) for i, ax in enumerate(axes)]
+            far = np.sqrt(off[0] * off[0] + off[1] * off[1] + off[2] * off[2])
+            out = far if out is None else np.minimum(out, far)
+        out = np.ascontiguousarray(out + np.float32(cap), dtype=np.float32)
+        for piece, cyl, lo, hi, key in shapes:
+            sl = tuple(slice(int(np.searchsorted(ax, lo[i])), int(np.searchsorted(ax, hi[i], side="right")))
+                       for i, ax in enumerate(axes))
+            if any(part.start >= part.stop for part in sl):
+                continue
+            pts = np.stack(np.meshgrid(*[ax[part] for ax, part in zip(axes, sl)], indexing="ij"), axis=-1).reshape(-1, 3)
+            if cyl is not None:
+                dist = _cylinder_distance(cyl, pts)
+            else:
+                V, Fc, tree = _tree(key, piece)
+                dist = np.sqrt(tree.squared_distance(V, Fc, np.ascontiguousarray(pts, dtype=np.float64))[0])
+            block = np.minimum(dist, cap).astype(np.float32).reshape([part.stop - part.start for part in sl])
+            out[sl] = np.minimum(out[sl], block)
+        return ctx.xp.asarray(out - np.float32(reach))
+
+    box = np.concatenate([np.array([lo, hi]) for _, _, lo, hi, _ in shapes])
+    key = _digest("topology skin", np.ascontiguousarray(np.concatenate(every)).tobytes(), reach, cap)
+    return Field(fn, key, "skin", np.array([box.min(axis=0) + cap - reach, box.max(axis=0) - cap + reach]), cache=True)
+
+
 def _face_tree(pts):
     """A KD-tree of points sampled on faces, with its boxes not shrunk to the points (`compact_nodes`):
     on flat faces those boxes are flat, and queries with a distance bound then search far too much (the
@@ -386,11 +548,14 @@ def _gap_cells(space, grid, phi, conditions, keep_fill, gap, reach, xp, cache):
 
 def topology_key(space, conditions, material, keep, min_thickness, skin, keep_body, avoid_body, detail, h=None,
                  max_thickness=0.0, members=MEMBERS[0], gap=0.0, smoothness=0.0, symmetry="none", coarse=False,
-                 prefer_body=None, prefer_strength=0.0, prune=False, max_section=0.0):
+                 prefer_body=None, prefer_strength=0.0, prune=False, max_section=0.0, extrude="none"):
     """Fingerprint of everything an optimization's result depends on (without a max thickness, a max section, a
-    gap, smoothness, symmetry, a coarse start, a guide or pruning the same as before they existed, so
-    earlier results stay valid)."""
+    gap, smoothness, symmetry, a coarse start, a guide, pruning or an extrude direction the same as before they
+    existed, so earlier results stay valid)."""
     extra = (float(max_thickness),) if max_thickness else ()
+    if extrude != "none":   # (members and max section do nothing then: not in the key)
+        extra += (("extrude", extrude),)
+        members, max_section = MEMBERS[0], 0.0
     if max_thickness and members != MEMBERS[0]:
         extra += (members,)
     if max_section:
@@ -419,9 +584,9 @@ def topology_key(space, conditions, material, keep, min_thickness, skin, keep_bo
 def prepare(space, conditions, material, keep=30.0, min_thickness=0.0, skin=2.0, keep_body=None, avoid_body=None,
             detail="draft", xp=np, cache=None, volume=None, h=None, max_thickness=0.0, members=MEMBERS[0],
             gap=0.0, smoothness=0.0, symmetry="none", prefer_body=None, prefer_strength=0.0, prune=False,
-            max_section=0.0):
+            max_section=0.0, extrude="none"):
     """The optimization problem. `xp` may be a function giving numpy or cupy for a number of elements.
-    `prune`: dead ends are kept empty as they show (`Optimizer._prune`)."""
+    `prune`: dead ends are kept empty as they show (`Optimizer._prune`). `extrude`: see EXTRUDE."""
     if not 0 < keep < 100:
         raise ConditionError("Keep % must be between 0 and 100")
     if gap < 0:
@@ -429,6 +594,17 @@ def prepare(space, conditions, material, keep=30.0, min_thickness=0.0, skin=2.0,
     if smoothness < 0:
         raise ConditionError("smoothness must be 0 or more")
     axes = mirror_axes(symmetry)
+    along = extrude_axis(extrude)
+    extruded = []   # notes about what Extrude along turns off
+    if along is not None:
+        if max_thickness and members != MEMBERS[0]:
+            extruded.append(f"Members: {members} has no effect with Extrude along: every member is a wall through "
+                            f"the depth, and Max thickness is its width")
+            members = MEMBERS[0]
+        if max_section:
+            extruded.append("Max section has no effect with Extrude along (every member runs through the whole "
+                            "depth): use Max thickness for the members' width")
+            max_section = 0.0
     grid = plan_grid(space, detail, volume, h)
     across = {}
     if axes:  # the same number of elements on both sides of each plane (the part's faces in them alike)
@@ -456,9 +632,7 @@ def prepare(space, conditions, material, keep=30.0, min_thickness=0.0, skin=2.0,
     # solid skin at the faces with supports and loads: at least the elements those faces run through,
     # and never thinner than a Min thickness (a 2 mm skin on a key box's rim, under a bearing load, was
     # most of what came out thinner than its 3 mm)
-    reach = max(float(skin), h)
-    if skin > 0 and min_thickness > reach:
-        reach = float(min_thickness)
+    reach = skin_reach(skin, min_thickness, h)
     full, emptied = None, None
     if gap > 0:
         emptied = _gap_cells(space, grid, phi, conditions, keep_fill, float(gap), reach, xp, cache)
@@ -490,10 +664,11 @@ def prepare(space, conditions, material, keep=30.0, min_thickness=0.0, skin=2.0,
         notes.append(f"gap {gap:g} mm: {100 * (1 - left):.0f}% of the design space along its faces is kept empty")
     if reach > max(float(skin), h):
         notes.append(f"skin {skin:g} mm made as thick as the min thickness, {reach:g} mm")
-    room = _room(phi, h) if min_thickness or max_thickness or max_section else None
+    notes = notes + extruded
+    room = _room(phi, h, along) if min_thickness or max_thickness or max_section else None
     if room is not None and min_thickness > room.across:
         raise ConditionError(f"Min thickness {min_thickness:g} mm: no member that thick fits, the design space is "
-                             f"{room.across:.3g} mm across")
+                             f"{room.across:.3g} mm across" + (f" seen along {extrude}" if along is not None else ""))
 
     # solid skin: elements within `reach` mm of the faces with supports and loads, so bolt holes and
     # contact faces stay
@@ -566,6 +741,11 @@ def prepare(space, conditions, material, keep=30.0, min_thickness=0.0, skin=2.0,
     o = np.arange(-R, R + 1)
     d = h * np.sqrt(o[:, None, None] ** 2 + o[None, :, None] ** 2 + o[None, None, :] ** 2)
     kernel = np.maximum(radius - d, 0.0)
+    if along is not None:
+        # in the plane only: the cone's middle layer, in an array of the same (cubic) shape, which is what
+        # the convolutions and the GPU's volume kernel (its taps are the non-zero entries) expect
+        middle = (o == 0).reshape([-1 if k == along else 1 for k in range(3)])
+        kernel = kernel * middle
     dtype = np.float64 if xp is np else np.float32
     D = xp.asarray(domain, dtype=dtype)
     kern = xp.asarray(kernel, dtype=dtype)
@@ -587,6 +767,16 @@ def prepare(space, conditions, material, keep=30.0, min_thickness=0.0, skin=2.0,
     problem.prune, problem.conditions, problem.skin = bool(prune), conditions, float(skin)
     problem.min_member = max(float(min_thickness), MIN_MEMBER * h)
     problem.mirror = tuple(across.items())
+    problem.extrude = along
+    if along is not None:
+        free = domain & ~solid
+        lines = free.any(axis=along)
+        whole = (free.sum(axis=along) == domain.sum(axis=along))[lines]
+        note = f"extruded along {extrude}: every member runs straight through the design space that way, with flat sides"
+        if lines.any() and not whole.all():
+            note += (f" (the skin and Keep stay as they are: {100 * (1 - float(whole.mean())):.0f}% of the lines "
+                     f"pass through them)")
+        problem.notes.append(note)
     if prefer_body is not None and prefer_strength:
         d = to_host(Context(grid.centres(), cache, xp).eval_full(prefer_body)).astype(np.float64)  # mm, < 0 inside
         guide = np.clip(1.0 - d / (GUIDE_FADE * radius), 0.0, 1.0) * domain
@@ -627,6 +817,7 @@ class Optimizer:
         self._design = None      # (iteration, compliance of the design itself)
         self.level = None        # with a coarse start: the detail of this problem (saved with the state)
         self.pruned = None       # bool: dead ends kept empty (problem.prune), None while there are none
+        self._carry = None       # (`members_field`: which free element each fixed one copies)
         self.dead_ends = 0       # how many were pruned
         self.max_iterations = int(max_iterations)
         self.settled = False     # done because the design stopped changing (not at max_iterations)
@@ -796,8 +987,14 @@ class Optimizer:
         if p.mirror:   # (only with its mirror image: the halves stay images, and the other one may be working)
             cut = to_host(p.symmetric(xp.asarray(cut, dtype=p.dtype))) >= 1.0 - 1e-6
             count = count if cut.any() else 0
+        whole = lambda cells: to_host(p.along(xp.asarray(cells, dtype=p.dtype))) >= 1.0 - 1e-6
+        if p.extrude is not None:   # (only whole lines: a line is one design variable)
+            cut = whole(cut)
+            count = count if cut.any() else 0
         if count:
             far = ndimage.distance_transform_edt(~((density >= 0.5) & ~cut), sampling=p.grid.h) > p.min_member
+            if p.extrude is not None:
+                far = whole(cut & far)
             lock = xp.asarray(cut & far)
             self.pruned = lock if self.pruned is None else self.pruned | lock
             near = xp.asarray(cut & ~far)
@@ -972,15 +1169,21 @@ class Optimizer:
                 dc = dc - (p.prefer_strength * scale) * reward
         if p.mirror:
             dc, dv = p.symmetric(dc), p.symmetric(dv)
+        if p.extrude is not None:
+            dc, dv = p.along(dc), p.along(dv)
         with trace.span("oc update", xp=xp):
             if p.local_sigma or p.section_sigma:
                 g, dg_xb = self._local_constraint(xb)
                 dg = p.filter_transpose(xp.where(free, dg_xb, 0.0) * slope)
                 if p.mirror:
                     dg = p.symmetric(dg)
+                if p.extrude is not None:
+                    dg = p.along(dg)
                 x_new = self._update_two(self.x, dc, dv, dg, p.volume(xb), g)
             else:
                 x_new = self._update(self.x, dc, dv)
+        if p.extrude is not None:   # (the same along every line already, but for rounding: kept exactly so)
+            x_new = p.along(x_new)
         if p.section_sigma:
             self._track_moves(x_new - self.x)
         change = float(xp.max(xp.abs(x_new - self.x)[free])) if bool(xp.any(free)) else 0.0
@@ -1033,7 +1236,8 @@ class Optimizer:
         xp = p.xp
         x = xp.asarray(_transfer(handover["x"], handover["grid"], p.grid), dtype=p.dtype)
         x = xp.where(p.free, xp.clip(x, 0.0, 1.0), self.x).astype(p.dtype)
-        self.x = p.symmetric(x) if p.mirror else x    # (interpolation may round one side differently)
+        x = p.symmetric(x) if p.mirror else x    # (interpolation may round one side differently)
+        self.x = p.along(x) if p.extrude is not None else x   # (and gives a line's ends other values)
         self.beta, self.since_beta = handover["beta"], 0
         self.iteration, self.history = handover["iteration"], list(handover["history"])
         self.done = self.iteration >= self.max_iterations     # (Max iterations is for all levels together)
@@ -1042,6 +1246,12 @@ class Optimizer:
     def density(self):
         """Final densities per element (0..1, host), solid regions included."""
         return np.asarray(to_host(self.physical(self.x)[1]), dtype=np.float32)
+
+    def members_field(self):
+        """`members_field` of this design (what it carries into fixed regions worked out once)."""
+        if self._carry is None:
+            self._carry = _carried(self.p)
+        return members_field(self.p, self.x, self._carry)
 
     def design_compliance(self):
         """The compliance of the design itself, one solve per iteration asked for. The history has
@@ -1053,6 +1263,7 @@ class Optimizer:
 
     def state(self, stopped=False):
         p = self.p
+        xt, xb = self.physical(self.x)
         # the lmax vectors too, while the run can continue (also at Max iterations): it then continues exactly
         extra = {} if self.settled else {f"power_{i}": np.asarray(to_host(v)) for i, v in enumerate(self.power)}
         if self._design is not None and self._design[0] == self.iteration:  # when it was worked out
@@ -1075,7 +1286,9 @@ class Optimizer:
                 "history": np.asarray(self.history, dtype=np.float64).reshape(-1, 4),
                 "full_compliance": np.array(self.full_compliance), "done": np.array(self.done),
                 "settled": np.array(self.settled), "local_scale": np.array(self.local_scale),
-                "stopped": np.array(stopped), "density": self.density(),
+                "stopped": np.array(stopped), "density": np.asarray(to_host(xb), dtype=np.float32),
+                # (states saved before 2026-11-12 have none; MEMBERS_FIELD: which `members_field` made it)
+                "members": self.members_field(), "members_version": np.array(MEMBERS_FIELD),
                 "grid": np.array([*p.grid.origin, p.grid.h, *p.grid.shape], dtype=np.float64),
                 "phi": np.asarray(to_host(p.phi), dtype=np.float32),
                 "space": np.asarray(p.space if p.space is not None else to_host(p.phi) > 0, dtype=bool)}
@@ -1172,6 +1385,54 @@ SPECK = 0.01          # pieces smaller than this share of the largest are droppe
 # More than this share of a load's force on no piece joined to a support: the card says the shape does not reach it.
 # (By force: a bearing load's unloaded sides are often left empty. A load on two holes has half of it on each.)
 REACH_MISS = 0.2
+# `density_field`'s samples are the control values of a cubic B-spline (`fields.sampled_body`), which at a sample
+# is their [1, 4, 1] / 6 average along each axis: a blur of this variance (samples^2), taken off the Smoothing's own.
+SPLINE_VARIANCE = 1.0 / 3.0
+# Its values are made distances again, smoothly. The blurred distance runs slower than 1 per mm across members
+# thinner than the blur (0.64 at a strut 3 elements across at Smoothing 2), so a Texture 0.5 mm high would stand
+# 0.8 mm off them: the values are divided by their own slope (to first order the distance to their zero surface,
+# which stays where it is), the slope taken as at least SLOPE_MIN (it is 0 along the middle of a member) and at
+# most SLOPE_MAX (steps left by pushed-out specks). Far from the surface the values are the distance to the nearest
+# sample of the other side, blurred by FAR_BLUR samples: specks pushed out, tips cut and the clamp outside the crop
+# leave "just outside" far from any surface, and an Offset Body of 1 mm brought them back as blobs. That distance is
+# stepped by the samples: within FAR_SAMPLES of the surface the smooth values stay as they are (the steps showed as
+# stripes there), blended over to the blurred distance by twice that. (Held to within a sample of the unblurred
+# distance, the first version, a fillet into a Keep plate came out lumpy: a blend reads both bodies well away from
+# their surfaces. Left alone but for what was 30% off, values 2 mm out read 2.65.)
+SLOPE_MIN = 0.35
+SLOPE_MAX = 2.0
+FAR_SAMPLES = 2.5
+FAR_BLUR = 1.5
+# Even out (`even_out`, step 4 of docs/ORGANIC_PARTS_PLAN.md): the smoothed surface moves inwards by its smaller
+# principal curvature (outwards where that is negative) for EVEN_TIME x Even out elements^2 of time. Along a
+# straight strut and across a plate that curvature is 0, so they keep their thickness (the mean curvature thins a
+# strut at 1 / r), while bulges and necks level out, the corners of openings and the joints between members get
+# round and loose ends pull back. With Extrude along it is the curvature of the outline seen along the axis: a
+# flat-sided member's smaller curvature is 0 wherever its side bulges, and only the necks would fill.
+EVEN = 1.0                       # Even out's default
+# (The prototype's 4 elements^2 closes every hole under 2.8 elements' radius, R^2 falls by 2 x the time, and
+# halves one of 3.3: the hanger's two 5 mm openings, at 2.5% more deflection. With 2 the ripples at the elements'
+# scale are as gone, a wave 4 elements long falls to 1%, and holes over 3 elements' radius shrink by under 12%.)
+EVEN_TIME = 2.0
+EVEN_STEP = 0.1                  # samples^2 of time an explicit step (the curvature is at most 1 / sample)
+# Where two principal curvatures are closer than this (per element) they count as equal, and their mean moves the
+# surface: the hard minimum diffuses along one direction only, a random one where they are equal, and wrinkled
+# plates within 40 steps.
+EVEN_SOFT = 0.15
+# Only what is near the surface moves, fading out between these distances (samples), and not where the values
+# turn back within a sample: half way between two members, and along the middle of one, they have a ridge the
+# samples cannot resolve, and a flow over it pulled flakes out of the gaps (443 on the bolted bracket). Told by
+# how straight the values run through a sample, the central difference over the one-sided ones' (1 on a slope,
+# 0 on a ridge's top, 0.71 beside a ridge that falls between two samples), fading in between EVEN_GATE. (The
+# prototype stopped the flow where the slope was under 0.5 per mm, fading in to 0.8: the smoothed distance runs
+# at 0.66-0.74 at a member's surface, 0.2-0.5 on thin ones, so most of the surface moved at part speed and 5-27%
+# of it not at all, thin members least. On the bolted bracket that moved 2.5% of the material, this 8.6%.)
+EVEN_NEAR, EVEN_FAR = 3.0, 6.0
+EVEN_GATE = (0.75, 0.95)
+EVEN_PINHOLE = (0.3, 0.7)
+EVEN_BAND = 8                    # steps between looking for the samples near the surface again
+EVEN_CHUNK = 1 << 21             # samples worked on at a time (the temporaries are 30 times this)
+EVEN_HOLD = 3.0                  # samples: within this of a fixed body (a boss, Keep) the motion fades to none
 
 
 def dead_ends(density, stress, origin, h, conditions, skin, share=DEAD_SHARE, idle=DEAD_IDLE, reach=0.0):
@@ -1257,7 +1518,7 @@ def _label_max(values, labels, count):
     return to_host(top[1:])
 
 
-def thicken(values, level, inside, voxel, thickness, passes=THICKEN_PASSES, cancel=None):
+def thicken(values, level, inside, voxel, thickness, passes=THICKEN_PASSES, cancel=None, backing=None):
     """`values` (samples `voxel` mm apart, solid where >= level) with every member at least
     `thickness` thick, by moving the surface out where a member is thinner, as smoothly as the values
     run: a member's half thickness near a point is the deepest point of the solid within reach (the
@@ -1267,7 +1528,8 @@ def thicken(values, level, inside, voxel, thickness, passes=THICKEN_PASSES, canc
     samples, left steps of a sample and knobs all over the surface.) Plates lying on a face grow on
     both sides, so only half inwards: the optimizer's eroded design counts the faces as empty, so it
     does not make them thinner than elsewhere. Returns the new values and how many samples became
-    solid inside. `cancel()` is called before each pass (it may raise to stop)."""
+    solid inside. `cancel()` is called before each pass (it may raise to stop). `backing` (bool): samples that are
+    material whatever the values (the exact bodies joined to them afterwards)."""
     xp, nd = _modules(values)
     r = thickness / 2
     # within a whole thickness, so a point by a thick member sees its depth (with r, a block beside a
@@ -1279,6 +1541,8 @@ def thicken(values, level, inside, voxel, thickness, passes=THICKEN_PASSES, canc
         if cancel is not None:
             cancel()
         solid = (out >= level) & inside
+        if backing is not None:
+            solid |= backing & inside
         # a sample's distance runs to the middle of the nearest sample outside, half a sample past the surface
         # (in place, the arrays let go as soon as they are used: on the GPU memory is short)
         depth = nd.distance_transform_edt(solid, sampling=voxel)
@@ -1356,7 +1620,8 @@ def _unreached(pieces, count, dropped, conditions, start, voxel):
     return missed
 
 
-def cut_tips(values, level, inside, voxel, thickness, per_mm=1.0, start=np.zeros(3), conditions=(), cancel=None):
+def cut_tips(values, level, inside, voxel, thickness, per_mm=1.0, start=np.zeros(3), conditions=(), cancel=None,
+             backing=None):
     """`values` (samples `voxel` mm apart, solid where >= level) without the thin tips the design space's
     faces leave (`inside`: the samples in it): a skin or a plate whose edge runs into a hole at a shallow
     angle ends in a point, a skin wrapped round a fold in a rib. `thicken` cannot help those, since the crop
@@ -1367,11 +1632,13 @@ def cut_tips(values, level, inside, voxel, thickness, per_mm=1.0, start=np.zeros
     in a plate, and with little of a support's or load's faces on it (TIP_FACE_SHARE; `conditions`, `start`: the
     first sample, mm). It is cut along that distance, so its stump is round. `per_mm`:
     how fast the values run per mm. Returns the new values and how many tips went; `cancel()` is called
-    between the steps."""
+    between the steps. `backing` (bool): samples that are material whatever the values."""
     xp, nd = _modules(values)
     step = cancel if cancel is not None else (lambda: None)
     r = TIP_SHARE * thickness / 2
     solid = (values >= level) & inside
+    if backing is not None:
+        solid |= backing & inside
     # (a sample's distance runs half a sample past the surface, as in `thicken`)
     core = nd.distance_transform_edt(solid, sampling=voxel) - 0.5 * voxel >= r
     if not bool(core.any()):
@@ -1465,16 +1732,45 @@ def density_mesh(density, phi, origin, h, upsample=UPSAMPLE, smooth=SMOOTH_ITERA
     the GPU when there is room for it (`_smoothing_module`; a fine grid's 35M samples took ~95 s on the CPU,
     one distance transform 7.2 s there and 0.02 s on the GPU, the same to 1e-16), else on the CPU."""
     args = (density, phi, origin, h, upsample, smooth, blur, space, min_thickness, crop, cancel, conditions, tips_under)
-    xp = _smoothing_module(smoothing_samples(np.shape(density), blur, upsample))
+    return _on_gpu_or_cpu(args, smoothing_samples(np.shape(density), blur, upsample))
+
+
+def density_field(density, phi, origin, h, upsample=UPSAMPLE, blur=SMOOTHING, space=None, min_thickness=0.0,
+                  crop=None, cancel=None, conditions=(), tips_under=None, fixed=None, even=0.0, axis=None,
+                  avoid=None):
+    """density_mesh's smoothed samples themselves instead of a mesh of them, for `fields.sampled_body`: a
+    namespace with `values` (host float32, mm, negative inside, 0 at the surface), `start` (the first sample,
+    mm), `voxel`, `bounds` (the box of what is solid) and `metadata` (density_mesh's). The body is then a smooth
+    function of them (a cubic B-spline), not the distance to a mesh at their spacing, whose every facet showed in
+    the shading as stripes along the members. `density`: the densities, or better the members' own field
+    (`members_field`, the state's `members`) with `fixed`, the exact body of what the optimizer kept solid (the
+    skin, Keep): it is joined to the result afterwards, so here it only counts as material when pieces are told
+    apart (members that meet through a boss are one piece; a load on a boss is reached), and a design with no
+    member at all is no error. The same steps as density_mesh, but: the Smoothing's blur is
+    narrower by the spline's own (SPLINE_VARIANCE; at Smoothing 0 the spline's 0.3 elements remain), no mesh
+    smoothing, and the values are made distances in mm again (`_as_distances`, `_far_distances`). `even`: Even
+    out (`even_out` for EVEN_TIME x even elements^2, after the thickening; nothing moves in or by `fixed`, and the
+    material in the design space stays what it was), `axis`: Extrude along's, for the outline's curvature.
+    `avoid`: the Avoid body, which `crop` leaves out and the caller cuts away exactly afterwards: the members run
+    straight on into it, as they do through the design space's faces, so that cut leaves them a flat face.
+    (Without it the surface pulled back from Avoid by the smoothing: in a hollow design space, Walls, every
+    member was flat outside and round inside.)"""
+    args = (density, phi, origin, h, upsample, 0, blur, space, min_thickness, crop, cancel, conditions, tips_under)
+    return _on_gpu_or_cpu(args, smoothing_samples(np.shape(density), blur, upsample), as_field=True, fixed=fixed,
+                          even=float(even), axis=axis, avoid=avoid)
+
+
+def _on_gpu_or_cpu(args, samples, **more):
+    xp = _smoothing_module(samples)
     if xp is not np:
         try:
-            return _density_mesh(*args, xp=xp)
+            return _density_mesh(*args, xp=xp, **more)
         except Exception as err:   # (out of memory after all: other programs took some meanwhile)
             if not backend.is_out_of_memory(err):
                 raise
         finally:
             backend.release_gpu_memory()
-    return _density_mesh(*args, xp=np)
+    return _density_mesh(*args, xp=np, **more)
 
 
 def smoothing_samples(shape, blur=SMOOTHING, upsample=UPSAMPLE):
@@ -1494,9 +1790,188 @@ def _smoothing_module(samples):
     return backend.cupy() if samples * SMOOTH_GPU_BYTES + backend.GPU_HEADROOM < free else np
 
 
+def _as_distances(values, voxel):
+    """`values` (negative inside, samples `voxel` mm apart) divided by their slope, so that near their zero
+    surface they are the distance to it in mm (SLOPE_MIN, SLOPE_MAX)."""
+    xp = xp_of(values)
+    slope = _gradient_norm(values, voxel)
+    xp.clip(slope, SLOPE_MIN, SLOPE_MAX, out=slope)
+    return (values / slope).astype(np.float32)
+
+
+def _far_distances(values, voxel):
+    """`values` (mm, negative inside, samples `voxel` apart) as they are within FAR_SAMPLES of the surface, and
+    from twice that the distance to the nearest sample of the other side (less half a sample: the surface is
+    between the two), blurred by FAR_BLUR samples; blended between. Nowhere farther from 0 than that sample is
+    away: where the slope is near 0 (the middle of a thin member) or the values are stepped (Smoothing 0), the
+    division by it (`_as_distances`) leaves them too large: -1.24 where the surface was 1 mm away, which a
+    Shell reads, and at Smoothing 0 the surface itself moved in, 12% of a thin test shape's material."""
+    xp, nd = _modules(values)
+    solid = values < 0
+    signed = nd.distance_transform_edt(~solid, sampling=voxel).astype(np.float32)
+    signed -= nd.distance_transform_edt(solid, sampling=voxel).astype(np.float32)
+    values = xp.where(solid, xp.maximum(values, signed), xp.minimum(values, signed))
+    signed -= xp.where(solid, -0.5 * voxel, 0.5 * voxel).astype(np.float32)
+    del solid
+    weight = xp.clip(xp.abs(signed) / (FAR_SAMPLES * voxel) - 1.0, 0.0, 1.0)
+    weight *= weight * (3.0 - 2.0 * weight)
+    signed = nd.gaussian_filter(signed, FAR_BLUR)
+    return (values + weight * (signed - values)).astype(np.float32)
+
+
+def _fade(t):
+    """0 where t <= 0, 1 where t >= 1, a smooth step between (in place)."""
+    xp = xp_of(t)
+    xp.clip(t, 0.0, 1.0, out=t)
+    t *= t * (3.0 - 2.0 * t)
+    return t
+
+
+def _second_largest(h):
+    """Of the symmetric 2 x 2 or 3 x 3 matrices `h` (a nested list of arrays) the second largest eigenvalue where
+    it is positive and within reach of the largest (fading in from EVEN_PINHOLE[0] to [1] of it), else 0."""
+    xp = xp_of(h[0][0])
+    if len(h) == 2:
+        mean = 0.5 * (h[0][0] + h[1][1])
+        half = xp.sqrt(0.25 * (h[0][0] - h[1][1]) ** 2 + h[0][1] * h[0][1])
+        second, largest = mean - half, mean + half
+    else:
+        (a, d, e), (_, b, f), (_, _, c) = h
+        mean = (a + b + c) / 3.0
+        a, b, c = a - mean, b - mean, c - mean
+        p = xp.sqrt(xp.maximum((a * a + b * b + c * c + 2.0 * (d * d + e * e + f * f)) / 6.0, 1e-20))
+        det = a * (b * c - f * f) - d * (d * c - f * e) + e * (d * f - b * e)
+        angle = xp.arccos(xp.clip(det / (2.0 * p * p * p), -1.0, 1.0)) / 3.0
+        largest = mean + 2.0 * p * xp.cos(angle)
+        smallest = mean + 2.0 * p * xp.cos(angle + np.float32(2.0 * math.pi / 3.0))
+        second = 3.0 * mean - largest - smallest
+    low, high = EVEN_PINHOLE
+    share = second / xp.maximum(largest, 1e-12)
+    return xp.maximum(second, 0.0) * _fade((share - np.float32(low)) / np.float32(high - low))
+
+
+def even_out(values, voxel, time, axis=None, hold=None, soft=0.0, cancel=None):
+    """`values` (positive inside, 0 at the surface, samples `voxel` mm apart) with their zero surface moved
+    inwards by its smaller principal curvature (1 / mm; out where it is negative) for `time` mm2: a level set
+    flow, values -= dt x speed x |gradient|, in explicit steps of EVEN_STEP samples^2. `axis`: the outline's
+    curvature in the planes across that axis instead (Extrude along). `soft` (1 / mm): the two curvatures'
+    soft minimum (EVEN_SOFT), exact where they are far apart. `hold` (0..1 per sample): how much of the motion
+    each sample gets. Only samples near the surface are worked on (found again every EVEN_BAND steps), all of
+    them from the values before the step, and none where the values turn back within a sample (EVEN_GATE), but
+    for holes a sample or two wide, which are filled (EVEN_PINHOLE). The values should be smooth (blurred): on
+    a raw distance every sharp edge is such a ridge. The same code on numpy and CuPy arrays; `cancel()` is
+    called every EVEN_BAND steps."""
+    xp = xp_of(values)
+    steps = int(math.ceil(time / (EVEN_STEP * voxel * voxel)))
+    if steps < 1:
+        return values
+    dt = np.float32(time / steps)
+    out = xp.array(values, dtype=np.float32, order="C")
+    flat = out.reshape(-1)
+    held = None if hold is None else xp.ascontiguousarray(hold, dtype=np.float32).reshape(-1)
+    stride = (out.shape[1] * out.shape[2], out.shape[2], 1)
+    across = [k for k in range(3) if k != axis]
+    inner = xp.zeros(out.shape, dtype=bool)
+    inner[1:-1, 1:-1, 1:-1] = True
+    first, second = np.float32(0.5 / voxel), np.float32(1.0 / (voxel * voxel))
+    cap, soft2 = np.float32(1.0 / voxel), np.float32(soft * soft)
+    low, high = EVEN_GATE
+    at = fresh = None
+    for k in range(steps):
+        if k % EVEN_BAND == 0:
+            if cancel is not None:
+                cancel()
+            # (a sample's value changes by at most 0.1 of a sample a step)
+            at = xp.flatnonzero((xp.abs(out) < (EVEN_FAR + 0.1 * EVEN_BAND + 0.5) * voxel) & inner)
+            fresh = xp.empty(at.size, dtype=np.float32)
+        for start in range(0, int(at.size), EVEN_CHUNK):
+            i = at[start:start + EVEN_CHUNK]
+            c = flat[i]
+            g, d2 = {}, {}
+            sides = 0.0
+            for a in across:
+                lo, hi = flat[i - stride[a]], flat[i + stride[a]]
+                g[a] = (hi - lo) * first
+                d2[a, a] = (hi - 2.0 * c + lo) * second
+                sides = sides + (hi - c) * (hi - c) + (c - lo) * (c - lo)
+            for n, a in enumerate(across):
+                for b in across[n + 1:]:
+                    d2[a, b] = (flat[i + stride[a] + stride[b]] - flat[i + stride[a] - stride[b]]
+                                - flat[i - stride[a] + stride[b]] + flat[i - stride[a] - stride[b]]) * (0.25 * second)
+            norm2 = sum(g[a] * g[a] for a in across)
+            xp.maximum(norm2, 1e-12, out=norm2)
+            norm = xp.sqrt(norm2)
+            if axis is None:
+                x, y, z = across
+                total = -((d2[y, y] + d2[z, z]) * g[x] * g[x] + (d2[x, x] + d2[z, z]) * g[y] * g[y]
+                          + (d2[x, x] + d2[y, y]) * g[z] * g[z]
+                          - 2.0 * (g[x] * g[y] * d2[x, y] + g[x] * g[z] * d2[x, z] + g[y] * g[z] * d2[y, z])) / (norm2 * norm)
+                gauss = (g[x] * g[x] * (d2[y, y] * d2[z, z] - d2[y, z] * d2[y, z])
+                         + g[y] * g[y] * (d2[x, x] * d2[z, z] - d2[x, z] * d2[x, z])
+                         + g[z] * g[z] * (d2[x, x] * d2[y, y] - d2[x, y] * d2[x, y])
+                         + 2.0 * (g[x] * g[y] * (d2[x, z] * d2[y, z] - d2[x, y] * d2[z, z])
+                                  + g[y] * g[z] * (d2[x, y] * d2[x, z] - d2[y, z] * d2[x, x])
+                                  + g[x] * g[z] * (d2[x, y] * d2[y, z] - d2[x, z] * d2[y, y]))) / (norm2 * norm2)
+                # (k1 - k2)^2 = total^2 - 4 gauss. The soft minimum: their mean where they are closer than `soft`,
+                # the smaller one beyond. ((k1 + k2 + soft - sqrt((k1 - k2)^2 + soft^2)) / 2, the prototype's, is
+                # soft / 2 too large on every strut, and a form that is soft^2 / 4 (k1 - k2) too large still
+                # thinned a 4 mm strut by 0.27 mm in 4 mm2 of time.)
+                apart = total * total - 4.0 * gauss
+                xp.maximum(apart, 0.0, out=apart)
+                if soft2 > 0:
+                    speed = 0.5 * (total - xp.sqrt(apart) * (1.0 - xp.exp(apart / -soft2)))
+                else:
+                    speed = 0.5 * (total - xp.sqrt(apart))
+                del total, gauss, apart
+            else:
+                x, y = across
+                speed = -(d2[x, x] * g[y] * g[y] - 2.0 * g[x] * g[y] * d2[x, y] + d2[y, y] * g[x] * g[x]) / (norm2 * norm)
+            del g, norm2
+            xp.clip(speed, -cap, cap, out=speed)
+            weight = _fade((EVEN_FAR - xp.abs(c) / np.float32(voxel)) / np.float32(EVEN_FAR - EVEN_NEAR))
+            if held is not None:
+                weight *= held[i]
+            # 1 where the values run straight through the sample, 0 where they turn back in it (a ridge)
+            straight = _fade((norm / xp.sqrt(xp.maximum(sides * (0.5 * second), 1e-12)) - np.float32(low))
+                             / np.float32(high - low))
+            del sides
+            speed *= norm
+            speed *= weight
+            speed *= straight
+            speed *= dt
+            new = c - speed
+            del speed, norm
+            # A hole that has shrunk to a sample or two is all ridge, and stayed as a pit or a thread of empty
+            # space inside. What the flow adds to the values there is the second largest eigenvalue of their
+            # second derivatives: large along the middle of a hole (two directions across it), about 0 along
+            # the middle of a gap between two members (one direction across it), which has to stay open
+            # (EVEN_PINHOLE: how near the largest it must be). Filled to half a sample above 0: the
+            # level that keeps the material moves by a few hundredths of a mm afterwards, and a hole filled to
+            # just over 0 came back as a pit.
+            pit = xp.flatnonzero((c < np.float32(0.5 * voxel)) & (straight < 1.0) & (weight > 0))
+            if pit.size:
+                fill = _second_largest([[d2[min(a, b), max(a, b)][pit] for b in across] for a in across])
+                fill *= (1.0 - straight[pit]) * weight[pit] * dt
+                new[pit] += fill
+                del fill
+            fresh[start:start + EVEN_CHUNK] = new
+            del c, new, weight, straight, d2, pit
+        flat[at] = fresh
+    return out.astype(values.dtype, copy=False)
+
+
+def _level_keeping(values, space, count, limit):
+    """The level at which `count` of the `space` samples of `values` are at or above it, within +-`limit` of 0."""
+    xp = xp_of(values)
+    flat = values[space]
+    if not 0 < count < flat.size:
+        return 0.0
+    return float(xp.clip(xp.partition(flat, flat.size - count)[flat.size - count], -limit, limit))
+
+
 def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_thickness, crop, cancel, conditions,
-                  tips_under, xp=np):
-    """density_mesh on numpy or CuPy arrays (the mesh and its metadata on the host either way)."""
+                  tips_under, xp=np, as_field=False, fixed=None, even=0.0, axis=None, avoid=None):
+    """density_mesh (or, with `as_field`, density_field) on numpy or CuPy arrays (the result on the host either way)."""
     import trimesh
     from ..grid import Grid, upsample_linear
     from ..meshing import field_to_mesh
@@ -1510,6 +1985,12 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
     g = GROW_OUTSIDE + int(math.ceil(blur))  # the blur must not round off faces cut by the design space
     # room to grow into: the FE grid starts right at the part's lowest corner
     region = np.asarray(space, dtype=bool) if space is not None else np.asarray(phi) > 0
+    if avoid is not None:
+        # Avoid's elements (empty, their centre in the body) count as outside too: what lies by them runs on into
+        # them, and the exact cut by the Avoid body, which the caller makes, leaves a flat face (not the gap's
+        # elements: nothing cuts those)
+        centres = Grid.block(np.asarray(origin, dtype=np.float64) + h / 2, h, (0, 0, 0), region.shape)
+        region = region & ~((np.asarray(phi) <= 0) & to_host(Context(centres, xp=xp).eval_full(avoid) < 0))
     inside = xp.pad(xp.asarray(region), g, mode="constant", constant_values=False)
     ext = xp.pad(xp.asarray(density, dtype=np.float32), g, mode="constant")
     # outside the design space each element takes the density of the nearest one inside: material
@@ -1517,6 +1998,9 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
     # spread it sideways too: 3 elements of that closed a beam's open sides into a cavity)
     distance, nearest = nd.distance_transform_edt(~inside, return_indices=True)
     ext = xp.where(distance <= g, ext[tuple(nearest)], 0.0).astype(np.float32)
+    # (Even out: where the extension ends, an element in from its end, nothing moves: its cut-off ends would pull
+    # back into the design space like any loose end)
+    free = xp.clip(g - 0.5 - distance, 0.0, 1.0).astype(np.float32) if even > 0 else None
     del nearest, distance
     values = xp.pad(ext, 1, mode="constant", constant_values=0.0)  # a ring of "outside"
     start = np.asarray(origin, dtype=np.float64) + h / 2 - (g + 1) * h  # element centres, less the pads
@@ -1525,6 +2009,12 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
     values = up(values)
     voxel = h / upsample
     level = 0.5
+    # the spline's own blur is taken off the Smoothing's (samples)
+    spread = (lambda sigma: math.sqrt(max(sigma * sigma - SPLINE_VARIANCE, 0.0))) if as_field else (lambda sigma: sigma)
+    if as_field and not blur > 0:
+        step()
+        values = -_surface_distance(values, voxel)   # mm, positive inside: the same surface
+        level = 0.0
     if blur > 0:
         # Smoothing blurs the distance to the surface, not the densities: across a member it runs
         # straight, so the blur hardly moves the surface. (Blurring the densities thinned members and took
@@ -1538,9 +2028,9 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
         dist = _surface_distance(values, voxel)
         step()
         sigma = blur * h
-        values = -nd.gaussian_filter(dist, blur * upsample)        # mm, positive inside
+        values = -nd.gaussian_filter(dist, spread(blur * upsample))        # mm, positive inside
         if blur > LIGHT_BLUR:
-            light = -nd.gaussian_filter(dist, LIGHT_BLUR * upsample)
+            light = -nd.gaussian_filter(dist, spread(LIGHT_BLUR * upsample))
             half = nd.maximum_filter(xp.maximum(light, 0.0), size=2 * int(math.ceil(sigma / voxel)) + 1)
             weight = nd.gaussian_filter(xp.clip(2.0 * half / sigma - 1.0, 0.0, 1.0), 0.5 * sigma / voxel)
             values = weight * values + (1.0 - weight) * light
@@ -1550,22 +2040,48 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
         # the surface where the material in the design space stays as much as the densities give (a
         # strong blur rounds members off: the bolted bracket lost 10% at Smoothing 3), within half an element
         space = up(xp.pad(inside, 1, mode="constant").astype(np.float32)) >= 0.5
-        flat = values[space]
-        count = int(xp.count_nonzero(dist[space] <= 0.0))
-        del dist
-        level = 0.0
-        if 0 < count < flat.size:
-            level = float(xp.clip(xp.partition(flat, flat.size - count)[flat.size - count], -0.5 * h, 0.5 * h))
-        del flat, space
+        level = _level_keeping(values, space, int(xp.count_nonzero(dist[space] <= 0.0)), 0.5 * h)
+        del dist, space
     thickened = 0.0
     # inside: where the design space fills half an element or more (no Avoid, no gap)
     inside_fine = up(xp.pad(xp.asarray(phi, dtype=np.float32), g + 1, mode="constant")) >= 0.5
+    grid = Grid.block(start, voxel, (0, 0, 0), values.shape)
+    # the exact bodies of the fixed regions (joined to the members afterwards) count as material where thin
+    # members, tips and pieces are told: a member lying half in a boss is not thin, and what the members' field
+    # carries into a Keep plate is no tip (ten "thin tips cut off" on the hanger, all of them inside its plate)
+    backing = anchored = None
+    if fixed is not None:
+        away = Context(grid, xp=xp).eval_full(fixed)
+        backing = away < 0
+        if even > 0:
+            # Even out moves nothing in a fixed body, and by it less and less: EVEN_HOLD. (Not farther than the
+            # skin's body is exact whatever the fillet, SKIN_BEYOND: with the values' cap as "far", the flow
+            # ran at 2 / 3 round every boss at Fillet 0, and the shape depended on the fillet.)
+            anchored = xp.clip(away / min(EVEN_HOLD * voxel, SKIN_BEYOND), 0.0, 1.0).astype(np.float32)
+        del away
     if min_thickness > 0:
         had = int(((values >= level) & inside_fine).sum())
-        values, added = thicken(values, level, inside_fine, voxel, float(min_thickness), cancel=cancel)
+        values, added = thicken(values, level, inside_fine, voxel, float(min_thickness), cancel=cancel, backing=backing)
         thickened = added / max(had, 1)
+    if even > 0:
+        # after the thickening, whose own ripples and necks it evens (it thins no straight member), and before
+        # the tips, which are told by the design space's faces; the material in the design space stays as it was
+        step()
+        space = up(xp.pad(inside, 1, mode="constant").astype(np.float32)) >= 0.5
+        if backing is not None:   # (what a member has inside a boss or Keep is no material of the part's: counted,
+            space &= ~backing     # holes that closed were paid for there, and the part grew by 0.5-1%)
+        count = int(xp.count_nonzero(values[space] >= level))
+        hold = up(xp.pad(free, 1, mode="constant"))
+        if anchored is not None:
+            hold *= anchored
+        with trace.span("even out", xp=xp):
+            values = even_out(values - np.float32(level), voxel, EVEN_TIME * even * h * h, axis, hold, EVEN_SOFT / h,
+                              cancel)
+        del hold
+        level = _level_keeping(values, space, count, 0.5 * h)
+        del space
+    del free, anchored
     step()
-    grid = Grid.block(start, voxel, (0, 0, 0), values.shape)
     # bits on their own inside the design space, under SPECK of the largest, are emptied there: flakes by
     # its faces that only joined the part outside it, where the crop to the design space cuts them off
     # (the wall bracket's pin eye at Smoothness 0.5: three of 0.3-1.8 mm3, 0.5 mm thin)
@@ -1575,8 +2091,13 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
     under = min_thickness if tips_under is None else tips_under
     if under > 0:
         values, tips = cut_tips(values, level, kept_in, voxel, float(under),
-                                per_mm=1.0 if blur > 0 else 1.0 / h, start=start, conditions=conditions, cancel=cancel)
-    pieces, count = nd.label((values >= level) & kept_in)
+                                per_mm=1.0 if blur > 0 or as_field else 1.0 / h, start=start, conditions=conditions,
+                                cancel=cancel, backing=backing)
+    material = (values >= level) & kept_in
+    if backing is not None:
+        material |= backing & kept_in
+    pieces, count = nd.label(material)
+    del material, backing
     count = int(count)
     small = np.zeros(0, dtype=np.int64)
     if count > 1:
@@ -1598,8 +2119,21 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
     del kept_in
     step()
     values = (level - values).astype(np.float32)
-    if float(values.min()) >= 0:
+    if float(values.min()) >= 0 and fixed is None:
         raise ConditionError("no material left (every density is below 0.5)")
+    metadata = {"thickened": thickened,   # share of material added for the min thickness
+                "tips": tips,             # thin tips cut off
+                "unreached": unreached}   # loads the shape leaves in the air (`_unreached`)
+    if as_field:
+        step()
+        values = _far_distances(_as_distances(values, voxel), voxel)
+        solid = [to_host(xp.flatnonzero((values < 0).any(axis=tuple(a for a in range(3) if a != k))))
+                 for k in range(3)]
+        if not len(solid[0]):   # (no member at all: only what was fixed)
+            solid = [np.array([n // 2]) for n in values.shape]
+        bounds = np.array([[start[k] + voxel * (int(solid[k][0]) - 1) for k in range(3)],
+                           [start[k] + voxel * (int(solid[k][-1]) + 1) for k in range(3)]])
+        return SimpleNamespace(values=to_host(values), start=start, voxel=voxel, bounds=bounds, metadata=metadata)
     # (on the host: Warp's marching cubes puts the same vertices but splits cells along other diagonals than
     # scikit-image's, 9715 of 12340 triangles, and the Taubin smoothing then moved vertices up to half a sample
     # apart: the shape, and its analysis, would depend on whether the GPU had room)
@@ -1614,9 +2148,7 @@ def _density_mesh(density, phi, origin, h, upsample, smooth, blur, space, min_th
         volumes = np.array([p.volume for p in pieces])
         kept = [p for p, v in zip(pieces, volumes) if v < 0 or v >= SPECK * volumes.max()]
         mesh = trimesh.util.concatenate(kept) if len(kept) > 1 else kept[0]
-    mesh.metadata["thickened"] = thickened  # share of material added for the min thickness
-    mesh.metadata["tips"] = tips            # thin tips cut off
-    mesh.metadata["unreached"] = unreached  # loads the shape leaves in the air (`_unreached`)
+    mesh.metadata.update(metadata)
     return mesh
 
 

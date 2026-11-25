@@ -75,6 +75,58 @@ def test_gpu_field_evaluation_matches_cpu(gpu, cad_part):
     assert (np.sign(out) != np.sign(cpu))[np.abs(cpu) > 3e-3].sum() == 0
 
 
+def test_gpu_edged_booleans_match_cpu(gpu):
+    # the rounded union and intersection read each sample's neighbours by flat indices: the same on the card
+    box, slab = F.box((0, 0, 0), (16, 16, 16)), F.box((0, 0, 5), (16, 16, 6))
+    rod = F.bar((0, -20, -2), (0, 20, -2), 2.5)
+    grid = Grid((-10, -10, -10), (10, 10, 10), 0.25)
+    for body in (F.intersect_edged(box, F.union(slab, rod), 1.5, keep=slab), F.union_edged(slab, rod, "round", 1.5),
+                 F.intersect_edged(box, F.union(slab, rod), 1.5, keep=slab, edge="chamfer")):
+        cpu = F.Context(grid).eval_full(body)
+        out = backend.to_host(F.Context(grid, xp=gpu).eval_full(body))
+        assert out.dtype == np.float32 and np.abs(out - cpu).max() < 1e-4
+
+
+def test_gpu_bars_match_cpu(gpu):
+    # Members as bars: the bars' body, bar by bar on the samples round each, the same on the card
+    from engine.fea import bars as B
+    a = np.array([[-20.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    b = np.array([[20.0, 0.0, 0.0], [0.0, 20.0, 0.0], [12.0, 3.0, 14.0]])
+    normal = B.normals(a, b, np.tile([0.0, 0.0, 1.0], (3, 1)))
+    grid = Grid((-26, -6, -6), (26, 26, 18), 0.25)
+    for body in (B.body(a, b, normal, 6.0, 4.0, 5.0, 1.0, "chamfer"), B.body(a, b, normal, [6.0, 5.0, 4.0], 4.0, 0.0, 1.0),
+                 B.body(a, b, normal, [6.0, 5.0, 5.0], 4.0, [6.0, 3.0, 3.0], 1.0, "chamfer", width_b=[5.0, 3.0, 8.0],
+                        member=[0, 1, 1], layer=[0, 0, 1])):
+        cpu = F.Context(grid).eval_full(body)
+        out = backend.to_host(F.Context(grid, xp=gpu).eval_full(body))
+        assert out.dtype == np.float32 and np.abs(out - cpu).max() < 1e-4 and float(cpu.min()) < -1.5
+    # lofted joints: the bars cut short and a loft between every two, worked out on the samples' nearest points
+    # of its curve
+    made = B.lofts(np.zeros((3, 3)), b * [[2.0], [2.0], [3.0]], normal, np.full(3, 6.0), np.full(3, 6.0), np.full(3, 4.0),
+                   np.arange(3), [[(0, 0), (1, 0), (2, 0)]], edge=1.0)
+    body = B.body(made.a, made.b, made.normal, made.width, made.thick, 0.0, 1.0, "chamfer", width_b=made.width_b,
+                  flat_a=made.flat_a, flat_b=made.flat_b, curves=made.curves)
+    cpu = F.Context(grid).eval_full(body)
+    out = backend.to_host(F.Context(grid, xp=gpu).eval_full(body))
+    assert len(made.curves) >= 2 and np.abs(out - cpu).max() < 1e-4 and float(cpu.min()) < -1.5
+    # ... and with the joint's dimples filled: a patch of samples, read as a sampled body's
+    patches = B.fills(lambda local: F.Context(local).eval_full(body), made.joints)
+    filled = B.body(made.a, made.b, made.normal, made.width, made.thick, 0.0, 1.0, "chamfer", width_b=made.width_b,
+                    flat_a=made.flat_a, flat_b=made.flat_b, curves=made.curves, fills=patches)
+    cpu = F.Context(grid).eval_full(filled)
+    out = backend.to_host(F.Context(grid, xp=gpu).eval_full(filled))
+    assert len(patches) == 1 and np.abs(out - cpu).max() < 1e-4
+    # ... and patched: samples that replace the bars' values by a weight
+    seams = B.body(made.a, made.b, made.normal, made.width, made.thick, 0.0, 1.0, "chamfer", width_b=made.width_b,
+                   flat_a=made.flat_a, flat_b=made.flat_b, curves=made.curves, seams=True)
+    patches = B.patches(lambda local: F.Context(local).eval_full(body), made.joints, lambda local: F.Context(local).eval_full(seams))
+    patched = B.body(made.a, made.b, made.normal, made.width, made.thick, 0.0, 1.0, "chamfer", width_b=made.width_b,
+                     flat_a=made.flat_a, flat_b=made.flat_b, curves=made.curves, fills=patches)
+    cpu = F.Context(grid).eval_full(patched)
+    out = backend.to_host(F.Context(grid, xp=gpu).eval_full(patched))
+    assert len(patches) == 1 and np.abs(out - cpu).max() < 1e-4
+
+
 def test_gpu_out_of_memory_falls_back_to_cpu(gpu, cad_part, monkeypatch):
     import engine.graph.nodes as nodes
     real = nodes._mesh_on
@@ -118,6 +170,7 @@ def test_gpu_marching_cubes_matches_cpu(gpu, cad_part):
     assert len(on_gpu.vertices) == len(cpu.vertices) and len(on_gpu.faces) == len(cpu.faces)
     assert on_gpu.is_watertight and on_gpu.is_winding_consistent
     assert abs(on_gpu.volume - cpu.volume) < 1e-5 * cpu.volume
+    assert cpu.volume > 0 and on_gpu.volume > 0     # both face out; no volume check in the mesher turns them
     assert np.abs(np.sort(on_gpu.vertices, axis=0) - np.sort(cpu.vertices, axis=0)).max() < 1e-4
 
 
@@ -254,6 +307,33 @@ def test_gpu_topology_surface_matches_cpu(gpu, monkeypatch):
     assert on_gpu.volume == pytest.approx(cpu.volume, rel=1e-4)
     apart = max(cKDTree(cpu.vertices).query(on_gpu.vertices)[0].max(), cKDTree(on_gpu.vertices).query(cpu.vertices)[0].max())
     assert apart < 1e-3, apart     # (mm; samples 0.5 mm apart)
+    # the body itself: density_field's samples and the cubic B-spline of them (`fields.sampled_body`)
+    made = {}
+    for name, xp in (("cpu", np), ("gpu", gpu)):
+        monkeypatch.setattr(T, "_smoothing_module", lambda samples, xp=xp: xp)
+        made[name] = T.density_field(d, phi, np.zeros(3), 1.0, blur=2.0, space=np.ones(d.shape, bool),
+                                     min_thickness=3.0, crop=crop)
+    assert made["gpu"].metadata["tips"] == made["cpu"].metadata["tips"]
+    assert np.array_equal(made["gpu"].bounds, made["cpu"].bounds)
+    assert np.abs(made["gpu"].values - made["cpu"].values).max() < 1e-3
+    assert np.mean((made["gpu"].values < 0) != (made["cpu"].values < 0)) < 1e-5
+    body = F.sampled_body(made["cpu"].values, made["cpu"].start, made["cpu"].voxel, made["cpu"].bounds)
+    grid = Grid((-3.1, -2, -2), (46, 32, 32), 0.23)
+    on_cpu, on_card = F.Context(grid).eval_full(body), F.Context(grid, xp=gpu).eval_full(body)
+    assert on_card.dtype == np.float32 and np.abs(backend.to_host(on_card) - on_cpu).max() < 1e-5
+    block = F.Context(Grid.block(grid.base, grid.voxel, (24, 36, 12), (80, 60, 70)), xp=gpu).eval_full(body)
+    assert bool((block == on_card[24:104, 36:96, 12:82]).all())      # blocks bit for bit, on the card too
+    # Even out, the flow by the surface's smaller curvature and by the outline's with Extrude along: the same
+    # array code on the card (float32 sums in another order: the flow damps what that leaves)
+    for axis in (None, 1):
+        even = {}
+        for name, xp in (("cpu", np), ("gpu", gpu)):
+            monkeypatch.setattr(T, "_smoothing_module", lambda samples, xp=xp: xp)
+            even[name] = T.density_field(d, phi, np.zeros(3), 1.0, blur=2.0, space=np.ones(d.shape, bool),
+                                         min_thickness=3.0, crop=crop, even=1.0, axis=axis)
+        assert np.abs(even["cpu"].values - made["cpu"].values).max() > 0.1       # (it did something)
+        assert np.abs(even["gpu"].values - even["cpu"].values).max() < 2e-3, axis
+        assert np.mean((even["gpu"].values < 0) != (even["cpu"].values < 0)) < 1e-5
     # thin tips (thickening grows the needle above, so here directly): a needle off a block goes, a strut
     # between two blocks and a plate stay (tests/test_topology.py), on the GPU as on the CPU
     from scipy import ndimage
@@ -445,6 +525,42 @@ def test_gpu_topology_runs_on_a_sheet_and_a_slender_bar(gpu, tmp_path):
         opt = T.Optimizer(p, max_iterations=iterations).run()
         assert opt.iteration == iterations and np.isfinite(backend.to_host(opt.x)).all()
         assert opt.history[-1][1] == pytest.approx(0.3, abs=0.01)
+
+
+def test_gpu_topology_extrudes_as_the_cpu(gpu, tmp_path):
+    # Extrude along: one design variable per grid line through the plate, with the filter in the plane only
+    # (the fused volume kernel reads its taps from a cubic array that is empty but for its middle layer)
+    from engine import fields as F
+    from engine.fea import topology as T
+    from engine.fea.materials import PRESETS
+    from engine.fea.model import Condition, Conditions
+    from engine.graph.nodes import import_step
+    from test_fea import _box_step, _face_id
+    mesh = import_step(_box_step(tmp_path / "web.step", (40, 4, 20)), 0.01, 1, 0.5)[0]
+    ids = mesh.face_attributes["cad_face"]
+    end = lambda at: mesh.triangles[ids == _face_id(mesh, 0, at)]
+    conds = Conditions((Condition("fixed", end(0.0)), Condition("load", end(40.0), amount=50.0, direction="-Z")))
+    found = {}
+    for name, xp in (("cpu", np), ("gpu", gpu)):
+        p = T.prepare(F.body_from_mesh(mesh, 2.0), conds, PRESETS["PLA"], keep=45.0, skin=1.0, h=1.0, xp=xp,
+                      extrude="y", max_thickness=8.0)
+        opt = T.Optimizer(p, max_iterations=30).run()
+        x, free = backend.to_host(opt.x), backend.to_host(p.free)
+        lines = np.where(free, x, np.nan)
+        assert np.nanmax(np.nanmax(lines, axis=1) - np.nanmin(lines, axis=1)) == 0.0, name
+        assert opt.history[-1][1] == pytest.approx(0.45, abs=0.01)
+        found[name] = opt.history[-1][0], opt.density()
+    (c_cpu, d_cpu), (c_gpu, d_gpu) = found["cpu"], found["gpu"]
+    assert c_gpu == pytest.approx(c_cpu, rel=0.05)                       # the same design, in float32
+    assert np.mean(np.abs(d_gpu - d_cpu) > 0.5) < 0.02
+    # the members' own field (what the body is made of) of one design, worked out on either
+    x = np.random.default_rng(3).uniform(0.0, 1.0, d_cpu.shape).astype(np.float32)
+    fields = []
+    for xp in (np, gpu):
+        p = T.prepare(F.body_from_mesh(mesh, 2.0), conds, PRESETS["PLA"], keep=45.0, skin=1.0, h=1.0, xp=xp,
+                      extrude="y", max_thickness=8.0)
+        fields.append(T.members_field(p, x))
+    assert fields[1].dtype == np.float32 and np.abs(fields[1] - fields[0]).max() < 1e-4
 
 
 def test_gpu_solver_kernels_let_their_hierarchy_go(gpu):

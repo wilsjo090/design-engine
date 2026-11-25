@@ -2901,3 +2901,923 @@ Plan and status: docs/ROADMAP.md, "GPU and CPU together" and "6. Progress". Meas
   would have counted 2.4 GB. The meter now sums private working sets (`PROCESS_MEMORY_COUNTERS_EX2`).
 - libigl's angle-weighted vertex normals and edge normals are deterministic (same bits on every call); a few
   are NaN on the test part's degenerate triangles, so compare them with `equal_nan`.
+
+## Audit fixes, measured (2026-11-10)
+
+The list is docs/AUDIT_2026-11-10.md (its last section says what was done); before | after pictures in
+docs/audit_2026-11-10/. "Before" is the engine at commit 045655b.
+
+**Static Analysis's report**
+- The maximum stress came from every element with any material (from 2% full). A twisted round bar (true
+  17.64 MPa) read +14..22% at every detail, the maximum sitting in elements 4-7% full. From elements at least
+  half full (`analysis.SOLID`) alone bending under-read, so the surface elements' stress is extrapolated to
+  the surface (`_surface_stress`). Now: the bar +5..9% at the loaded end and within 4% mid-length; plates in
+  bending -7.2 / -9.6 / -3.7% -> -5.4 / -1.4 / -0.9% at draft / medium / fine; the sample bracket 12.8 / 11.6 /
+  13.0 -> 10.1 / 11.7 / 13.0 MPa (it now rises steadily with the detail instead of jumping about).
+- Fill from 2 x 2 x 2 samples per part-filled element (`FILL_SUB`), stiffness of a 10 x 10 mm bar lying half
+  an element off the grid: -19.4 -> -10.7% (2 mm elements), -5.7 -> -2.9% (1 mm). A plate 3 elements thick
+  stays -24.9%: its error is the bending of 3 elements, not the fill, so it gets the thin-wall note instead
+  (`THIN_WALL`, under 8 elements).
+- Bearing load 45° off square to the hole's axis, 200 N typed: 283 N was applied (the direction was scaled up
+  to the amount), now the 141 N that is square to the hole, with a note.
+- Frame check, buckling: a column fixed at the foot and propped at the top as one piece read 164.7 N against
+  114.2 N exact (+44%); with two elements per compressed piece within 3%.
+
+**Geometry**
+- Offset Faces' slivers: past a border corner the sideways sign was taken from one edge's outward direction.
+  On the plane that continues that edge the dot product is ±1e-16, and its sign depends on the grid's
+  coordinates, so only some voxel sizes (0.3, 0.4) and part positions showed it (a centred box never did; the
+  STEP plate through the node did). 30 x 30 x 4 plate, a side wall +1 mm, voxel 0.4: 2 pieces and bounds
+  31 x 32.7 x 6.7 before, 1 piece and 31 x 30 x 4 after. The sign at a corner now comes from both edges
+  meeting there (`Patch.mates`), measured from the corner itself (measured from the closest point it was
+  1e-4 off).
+- Rounded / chamfered Union: two 20 mm boxes side by side, round 4 mm: 22.34 mm across and +1333 mm³ before,
+  20.34 mm and +52 mm³ after. What did not work: weighting the radius by 1 - (gradient product) alone left a
+  ridge along the hidden edges, where one operand's gradient turns through an edge fan; the two-plane formula
+  for planes at that angle plus a curl test for the fans (`fields._meeting`, `FAN`, `CURL_GAIN`) leaves a ridge
+  under one voxel (0.17 mm here). The rounded Subtract is unchanged.
+- Hole Pattern, pockets 2 mm deep on both faces of a 6 mm plate: 12 pockets before (the other face's were
+  dropped as too close), 30 after.
+- Patterns centred on their face: 5 mm holes 9 mm apart on 60 x 40 mm: 18 holes with uneven margins before,
+  24 after. Choosing between the lattice through the middle and the one half a cell off by the face's box
+  failed for turned patterns; counting the points that fit on a raster of the face (`holes._start`) works.
+- TPMS thickness: gyroid, 8 mm cells, 2 mm: mean wall 1.56 mm (60% solid) before, 1.98 mm (76%) after. The
+  area-per-volume estimate aliased by -7% when sampled on the cell's own lattice: a shifted 64³ sample.
+- Text on the top of a 3 mm plate with Band 6 mm printed 0.8 mm out of the underside too; now it stops at
+  half the wall.
+- Noise: as it came, 3 octaves reached about ±0.68, so a 3 mm Texture reached 2.27 mm on the sample. A gain
+  from the 99.9% point was 1.86 x (more than it looks); 1 / the largest value on a fixed 64³ sample is
+  1.49 x (2 octaves 1.35, 1 octave 1.05). Existing noise recipes change: the lamp's labyrinth lines come
+  ~1.5 x denser (density 140 -> ~94 gives the old look back).
+
+**Editor**
+- Draw on demand: an idle Final view made 5,968 draw calls in 3 s (361 frames); now 0. After a camera turn
+  the damping draws for about 2 s and then stops.
+- Progress events at most every 80 ms per node; the server collects garbage 0.3 s after a run instead of on
+  the run thread (60-70 ms after a 71 ms Draft), and freezes its imports at start-up.
+
+**Engine speed**
+- Pattern fields in float32 with the turn and the scale folded into the directions across
+  (`holes._Shapes.around`), 28M samples on the CPU: hex studs (relief) 0.55 -> 0.36 s, round holes 0.21 -> 0.13 s,
+  turned slots 0.14 -> 0.09 s; Voronoi cells 1.31 -> 1.24 s (the polygon distance is its time). Values within
+  2.4e-7 mm; samples lying exactly on an outline or on the band's end plane can fall on the other side (they
+  were rounding noise before too).
+- No volume integral to orient a mesh: skimage's and Warp's marching cubes both face out of a body that is
+  negative inside (a ball, a shell with a cavity, two bodies, a body cut by the box: raw volume positive on
+  both), so the check never turned anything. 60 ns per triangle: 8 ms for a 125k-triangle body, 0.7 s in the
+  main process for a 12M-triangle part meshed in blocks.
+- Closest points for face masks and Offset Faces on the GPU are picked out on the card; the whole grid's
+  answers (16 B per sample) no longer come to the host.
+- Task payloads, measured on the lamp (147 petals, 4 workers, tools/trace_run.py): a warm Draft's map takes
+  2.8 s (worker start-up included), sending 0.42 s, 2.9 ms per task, the same with arrays under 64 KB or under
+  1 MB inside the tasks: the time is the cloudpickle of each item's closures. With 64 KB the first run wrote
+  300 files in 5.3 s (36 ms a task). `INLINE_BYTES` stays 1 MB. Cold, at Medium, the petals' fields run on the
+  CPU (grids under `GPU_MIN_VOXELS`): 2.0 s each, 74 s for the map with 4 workers, the GPU 4% busy.
+- Start-up: importing the server takes 2.1 s, trimesh 1.15 s of it (scipy.spatial, networkx) and fastapi
+  0.44 s; the engine's own modules under 0.15 s together, so there is nothing to defer.
+
+**Why topology's struts look bulby** (fine detail, Min thickness 4, Max thickness 10, Max section 50, struts
+only, a run that stopped at Max iterations still changing): the optimizer's own struts are uneven, and
+`topology.thicken` measures a member's half-thickness as the deepest point within a cube of ± the thickness,
+so beside a thicker member or a joint it adds nothing: a neck at the joint, a bulge further along. A trial
+that measured the local thickness instead removed the necks but added 27% material instead of 6% and webbed
+an opening; left as it is. What helps today: more iterations, a lower Min thickness or a higher Keep %.
+
+## Extrude along: members straight through the design space (2026-11-11)
+
+Step 1 of the organic-parts plan (a reference part with an exact plate, a web whose members all run through its
+depth with flat sides, fillets and a polished surface; the other steps: a polished body, a fillet to Keep and
+true bosses, an even-out flow, planar frames). Topology Optimization's *Extrude along* (none / x / y / z): one
+design variable per grid line along the axis (`Problem.along`), the filter and Max thickness in the plane only.
+Pictures: docs/organic_parts/.
+
+- Deep thin cantilever (40 x 4 x 20 mm, 1 mm elements, Keep 45%), extruded through its 4 mm against free: 98% of
+  the free design's stiffness (Keep 30%: 92%), and it settled where the free one ran to Max iterations. The
+  eroded design carries 9.5% of the full plate's stiffness against 1.4%: free, every member is eroded from the
+  plate's two faces (the 3D cone sees the outside as empty), extruded only in the plane.
+- With the 3D cone the densities of a line still differed near the two faces, and the eroded design lost the
+  layers there, so the filter is the cone's middle layer (kept in a cubic array: the convolutions and the GPU's
+  fused volume kernel need no change).
+- Keep % must leave room for walls Min thickness wide through the whole depth: the tests' 30 x 10 x 10 box at
+  30% with 3-element members (two flanges alone are 60% of its outline) put one-element flanges on the faces,
+  lost its web and ended at 1% of the full box's stiffness (free: 24%).
+- The hanger sample as it was until 2026-11-12, when the part, its supports and its loads were replaced ("Round
+  edges, and a hanger like the reference"; the hanger numbers in the sections between are of this one)
+  (`recipes/topo_hanger_extruded.json`: 200 x 28 x 57 mm, a 5 mm plate as Keep, a 10 mm web
+  under it, three shaft holes loaded 60 N each, held by the two end screw holes, Keep 35%, PETG):
+
+  | Detail | Extrude along y | none |
+  |---|---|---|
+  | draft (1.5 mm elements) | stiffness 20% of the full design space, deflection 0.161 mm, 24 s | 27%, 0.121 mm, 22 s |
+  | medium (0.81 mm) | 23%, 0.161 mm, settled at 119 iterations, 36 s | 33%, 0.0995 mm, 35 s |
+
+  The extruded web is the reference's kind of shape (a fish-belly truss of flat-sided members under the exact
+  plate); free, it is bone-like, with a thick round bottom chord and thin diagonals. The price at the same
+  mass, 25-40% in deflection here: an extruded member is at least Min thickness wide through all 10 mm (24 mm2
+  at medium), where a free diagonal is a 3 mm round bar (7 mm2), so less is left for the chord. A finer detail
+  or a smaller Min thickness narrows it.
+- Held by all six screws the loads go straight up to the plate (three hangers, safety factor over 10): a web
+  like the reference's comes from supports that make it work as a beam.
+- Still as before, for the plan's next steps: the members' sides are wavy at the elements' scale, the web
+  meets the plate in a sharp corner, and the bosses are voxel skins on the loaded side only.
+
+## The polished body: smooth samples instead of a mesh (2026-11-12)
+
+Step 2 of docs/ORGANIC_PARTS_PLAN.md, the two prototypes of 2026-11-03 built into the node. Before, Topology
+Optimization's body was the exact distance to a mesh of its smoothed samples (h / 2 apart), and every facet of that
+mesh showed in the shading as stripes along the members. Now the samples are the body:
+`fields.sampled_body(T.density_field(...))`.
+
+- **A cubic B-spline with the samples as control values**, not a spline through them as the prototype had. The
+  prototype's interpolating spline rings between samples and left 5-8 loose islands of 0.01-0.1 mm3 by hard edges
+  in the samples. With the samples as control values a point's value stays within the range of the 64 samples
+  round it, so there is nothing to clean up. The price is a blur of 0.58 samples (0.29 elements) on top, which is
+  taken off the Smoothing's own blur (`SPLINE_VARIANCE`). A 4 mm ball sampled at 0.5 mm moves in by 0.021 mm, as
+  predicted.
+- **Evaluated one axis at a time** (4 taps per axis instead of 64 gathers), on the part of the samples the grid
+  covers. Positions and weights come from the grid's own float64 axes, so blocks get the same values bit for bit
+  and the GPU the same numbers as the CPU (difference 0.0).
+- **The filtered field** is saved with new states (`field`): solid in exactly the same elements as the densities
+  (checked in a test), but it runs smoothly across the surface. Older states use their densities. (Since
+  2026-11-12 the state has the members' own field instead, `members`, and older states get it too: see "Exact
+  bosses and a fillet".)
+- **Values in mm again.** The blurred distance is not a distance across thin members: at a strut 3 elements thick
+  with Smoothing 2 its slope at the surface was 0.64 per mm. A Texture 0.5 mm high would have stood 0.8 mm off such
+  a strut. The samples are divided by their own slope (clipped to 0.35-2), which leaves the surface where it is.
+  Afterwards the slope at the surface is 1.00 (median and 10th percentile, hanger), and values 0.5 / 1 / 2 mm
+  from the surface read 0.53 / 1.10 / 2.07 (the old exact distance, measured the same way: 0.52 / 1.04 / 2.00).
+  Far from the surface the values are clamped to the distance to the nearest sample of the other side, so
+  pushed-out specks do not come back under an offset. Through the nodes (`scratchpad/offset_check.py`, the free
+  hanger, 46,322 mm3 and 22,759 mm2): Offset Body +1 mm adds 23,807 mm3, which is 0.97 mm over the mean of the two
+  surfaces' areas, and -0.5 mm takes 10,800 mm3, 0.50 mm. One closed piece each, also meshed in blocks by the
+  workers at 0.12 mm (3.9M triangles, the same volume to 0.04%).
+
+Measured on one analysis grid for both bodies (`scratchpad/compare_bodies.py`; the node's own check moves its grid
+with the body's volume, which alone changed the hanger's reading by 3%):
+
+| part | mass | max deflection | pieces | normal's unevenness, 95% |
+|---|---|---|---|---|
+| hanger, free 3D, medium | +0.1% | -0.3% | 1 | 4.0 -> 1.4 degrees per 0.2 mm |
+| hanger, extruded, medium | -0.1% | +0.4% | 1 | (sharp CAD edges dominate) |
+| wall bracket, medium | +0.3% | -0.65% | 1 | |
+| bolted bracket, fine | +0.9% | -1.7% | 1 | 5.4 -> 4.3 |
+
+- The bolted bracket's larger shift is the filtered field (the 2026-11-03 table had +0.5% for it at Smoothing 2).
+- Smoothing 1 is now as smooth as 2 (unevenness 1.2 against 1.4; before 3.9 and 4.0), and at 0 the waves at the
+  elements' scale remain (3.8; before 6.4). The default stays 2, so results look as round as before.
+- Faster as well: the smoothing 1.6-2.1 -> 0.4-0.7 s on the GPU (no marching cubes and Taubin smoothing on the
+  host); a view's 7-17M samples 0.03-0.11 -> 0.014-0.035 s on the GPU, first use 0.7-1.1 -> 0.04 s (no search tree
+  to build), and on the CPU 1.4-2.5 -> 0.06-0.16 s for an eighth of them. In the editor the hanger's Final view
+  took 0.1 s of node time.
+- Not fixed by this: thin members still carry faint ripples at the elements' scale (visible on the extruded
+  hanger's thinnest diagonal, before and now) and members' sides are wavy over several millimetres. The first comes
+  from `thicken` on members at Min thickness, the second is the optimizer's own shape; both are what the even-out
+  flow (step 4) is for. Bosses are still stepped skins (step 3).
+- Pictures: docs/organic_parts/polished_body.png.
+
+## Exact bosses and a fillet where members meet them (2026-11-12)
+
+Step 3 of docs/ORGANIC_PARTS_PLAN.md. Topology Optimization's body is now three things joined: the members (the
+smooth sampled field of step 2, of the members alone), the skin at supports and loads as an exact distance
+(`topology.skin_body`), and the Keep body itself. New input Fillet (mm, 0 = sharp) blends the members into the other
+two. Picture: docs/organic_parts/fillet_and_bosses.png.
+
+What it took, in the order it went wrong:
+
+- **The members need a field of their own.** The densities have the skin and Keep in them as whole elements. Smoothed,
+  a boss was 0.29-0.30 mm off its cylinder (hanger, medium, element 0.81 mm) and the Keep plate carried a 0.4 mm ledge
+  along the web. Joining exact bodies on top does not help: the smoothed elements still poke out of them. So the
+  state saves `members`: the filtered design variables on the free elements, carried 3 elements into the fixed
+  regions so they overlap the exact bodies. Older states get it once from their saved `x` (`T.prepare` again).
+- **Filtered over the free elements only, it was wrong.** The optimizer's filter counts the fixed regions' full
+  elements, and it puts material next to them that relies on that. Without it members necked at their roots: the
+  bolted bracket 30% less stiff, the wall bracket 8% lighter. The members' field is the optimizer's own filtered
+  field on the free elements, solid in exactly the elements the densities are.
+- **Join first, crop last.** Cropped by the design space first, the members had its faces as their own, and where
+  Keep is part of the design space (a plate over a web) those are Keep's faces too. Between two bodies that share a
+  face there is no corner to fill: the fillet came out as a ragged half collar. Now members, bosses and Keep are
+  joined and then cropped by design space union Keep. The design space's own faces stay as modelled: a web's flat
+  side meets the plate in the CAD corner.
+- **The rolling-ball union pitted.** `union_edged` works out how each body's values curve (the Laplacian) to tell a
+  flat face from an edge. On the sampled field that is noise, and the fillet had pits. The frames' blend
+  (`smooth_union`, order 2, curvature continuous, 1.76 x the radius wide so it is as deep as a round fillet) only
+  reads the two values and is smooth.
+- **A blend reads both bodies far from their surfaces.** Step 2 held values beyond 2.5 samples to within a sample
+  of the distance to the nearest sample, which is stepped; the fillet came out lumpy. Far values are now that
+  distance blurred by 1.5 samples, blended in between 2.5 and 5 samples. The cap "no farther from 0 than the nearest
+  sample of the other side" stays everywhere: without it the division by the slope moved the surface itself at
+  Smoothing 0 (12% of a thin test shape).
+- **Thin tips that were not there.** What the members' field carries into a Keep plate looked like thin tips and
+  thin members: "10 thin tips cut off" on the hanger's card, all inside its plate. The exact fixed bodies now count
+  as material in those steps (`backing`).
+- **Closed eyes.** With a bearing load the optimizer keeps only the side the pin presses on. As an exact body that
+  is an arc, and the hanger's shaft holes came out as open slots with a notch at each end: 17% more stress than
+  before, where a 0.5 mm bridge of smoothed elements had closed them. A hole's wall is now a ring all round, as the
+  frames' bosses are. It costs material where the eye is large: the bolted bracket's three pin eyes add 1,052 mm3,
+  10% of its mass (measured inside the skin's body; the rest of the part is 2% leaner).
+
+Measured, both bodies on one analysis grid (before = the body before step 2):
+
+| part | Fillet | mass | max deflection | stress away from supports | pieces |
+|---|---|---|---|---|---|
+| hanger, extruded, medium | 0 | -1.3% | +2.5% | -2.6% | 1 |
+| hanger, extruded, medium | 2 mm | -0.8% | +0.7% | -4.3% (safety 10.8 -> 11.3) | 1 |
+| wall bracket, medium | 0 | -0.5% | +0.5% | 0% | 1 |
+| bolted bracket, fine | 0 | +9.7% | -1.2% | +13% (one element; safety 0.38 -> 0.34) | 1 |
+| bolted bracket, fine | 1 mm | +11.3% | -5.5% | +7.5% | 1 |
+
+- The hanger and wall bracket are a little lighter because the smoothed elements were bloated: the exact plate and
+  bosses are leaner by about 1%.
+- Bosses: free boss surface 0.02-0.04 mm off the cylinder (0.29-0.30 before); with Fillet 1.5 mm 0.07-0.09, the
+  blend's own reach.
+- Distances: slope 1.00 at the surface, 0.51 / 1.05 / 1.89 where the surface is 0.5 / 1 / 2 mm away (hanger).
+- Not fixed by this: the corner between two of the design space's own faces (model it in CAD), wavy member sides
+  and ripples on the thinnest members (step 4).
+
+## Even out: a flow that evens the members (2026-11-12)
+
+Step 4 of docs/ORGANIC_PARTS_PLAN.md: the prototype of 2026-11-03 ("Polishing", `flow.kmin_flow`) built into Topology
+Optimization as the input Even out (x, default 1, 0 = off; not in the key, so changing it never optimizes again).
+`topology.even_out` moves the members' smoothed surface inwards by its smaller principal curvature, after `thicken`
+and before the tips are cut. Picture: docs/organic_parts/even_out.png.
+
+Measured, Even out against 0, both bodies on one analysis grid (0.5 mm):
+
+| part | Even out | mass | max deflection | stress away from supports | material moved | pieces |
+|---|---|---|---|---|---|---|
+| hanger, extruded, medium, Fillet 1.5 | 1 | 0.0% | +1.5% | +0.6% | 1.3% | 1 |
+| | 2 | +0.2% | +2.4% | +0.9% | 2.4% | 1 |
+| hanger, free 3D, medium | 1 | -0.3% | +1.0% | +0.9% | 1.1% | 1 |
+| | 2 | -0.4% | +1.7% | +1.6% | 1.9% | 1 |
+| wall bracket, medium | 1 | +0.2% | +0.1% | 0% | 1.2% | 1 |
+| | 2 | +0.2% | +0.1% | 0% | 2.0% | 1 |
+| bolted bracket, fine | 1 | +0.6% | -7.3% | -20.8% | 5.4% | 1 |
+| | 2 | +0.6% | -9.1% | -20.3% | 9.3% | 1 |
+
+- On the hanger the ripples on the thin diagonal's side are gone and the members' edges run straight; its members
+  were even already, and the price is 1-2% of stiffness: the flow rounds what the optimizer put at the outline's
+  far corners and shrinks the two 5 mm openings, and that material is spread over every surface.
+- The bolted bracket, a web of thin struts with many small holes, gains: with the dead-end search off for both
+  bodies (they find other dead ends in the two shapes) the flow alone gave about -8% deflection and -10% stress at
+  Even out 2. The rest of the table's -21% is another dead end cut.
+- Time: 80 steps (Even out 1), 0.7-1.6 s on the GPU for 9.4-15.4M samples (2.0-3.0M of them near the surface),
+  46 s on the CPU (bolted bracket). In the editor the hanger at draft shows a changed Even out in about 4 s
+  (smoothing, analysis and the dead-end search of the new shape; nothing is optimized).
+- With Smoothing 0 it works too (hanger +0.4% deflection, bolted bracket -6.6%, the normal's unevenness 7.7 -> 6.6
+  and 10.9 -> 9.5 degrees per sample), and leaves no loose pieces.
+
+What it took beyond the prototype:
+
+- **In the plane with Extrude along.** A flat-sided member's smaller curvature is 0 wherever its side bulges (the
+  other one, along the axis, is 0), so the 3D flow only filled the necks: a wall 3-5 mm thick came out 3.8-4.9. With
+  the axis given the flow uses the curvature of the outline in the planes across it: 3.7-4.1.
+- **Another soft minimum.** The prototype's, (k1 + k2 + d - sqrt((k1 - k2)^2 + d^2)) / 2, is d / 2 too large on
+  every strut (0.12 mm thinner at its setting, put back by the level). A form that is d^2 / 4 (k1 - k2) too large
+  still thinned a 4 mm strut by 0.27 mm in 4 mm2 of time. Now the mean where the two are closer than d and the
+  smaller one beyond, by an exponential: the same strut loses 0.04 mm.
+- **Another gate.** The prototype stopped the flow where the values' slope was under 0.5 per mm (fading in to
+  0.8), to keep off the ridges half way between members. But the smoothed distance runs at 0.66-0.74 per mm at a
+  member's surface and 0.2-0.5 on thin ones: 62-93% of the surface moved at part speed and 5-27% not at all, thin
+  members least. The gate is now on how straight the values run through a sample (the central difference over
+  the one-sided ones: 1 on a slope, 0 on a ridge). On the bolted bracket that moves 8.6% of the material where
+  the slope gate moved 2.5%, with no flake on any part (pieces counted right after the flow).
+- **Holes close all the way.** A hole shrinks as 1 / its radius, and once it is a sample or two wide it is all
+  ridge: it stayed as a pit in each face and a thread of empty space between them. There the surface's smaller
+  curvature times the slope is the second largest eigenvalue of the values' second derivatives: large along the
+  middle of a hole, about 0 along the middle of a gap between two members. Filled by that, to half a sample over
+  0 (the level that keeps the material moves afterwards, and holes filled to just over 0 came back as pits). In
+  the tests a 3 mm hole through a plate closes completely (straight, diagonal, and in the plane with an axis),
+  and gaps two samples wide, straight, tilted and curved, and the channel between three struts stay open.
+- **Half the prototype's time.** At 4 elements^2 every hole under 2.8 elements' radius closes and one of 3.3
+  halves: the hanger's two openings, at 2.5% more deflection. Even out 1 is 2 elements^2.
+- **Fixed bodies hold.** Nothing moves in a boss or a Keep body or within 3 samples of one, so members keep
+  their roots (the Fillet shapes those). The distance over which that fades must not be longer than the skin
+  field is exact: capped at 1 mm past the skin at Fillet 0, the flow ran at 2 / 3 round every boss and the shape
+  depended on the fillet (found by the test that a fillet only adds material).
+- **What the smoothing extends past the design space** ends cut off, a few elements out, and those ends pull
+  back like any loose end: held there.
+- **The material that is kept** is counted outside the fixed bodies. Counted with what members have inside a
+  boss or a plate, holes that closed were paid for there, and the parts grew by 0.5-1%.
+
+Left as it is:
+
+- A hole just about to close is a small hole (the bolted bracket at Even out 1, closed at 2).
+- Waves longer than about 8 elements on a member's side stay at 1; 2 and 3 take more, and more of the small
+  openings with them. A flow that evens without shrinking holes (the curvature less its local mean) was not
+  tried.
+- The dead-end search finds other dead ends in an evened shape. On the bolted bracket at 1 it emptied the
+  middle of an idle strut, which shows as a neck with a knob; at 2 the strut is whole.
+- On a raw distance (not smoothed) every sharp edge is a ridge, and stays: the flow is for smoothed values.
+- Enclosed voids are not filled (the bolted bracket has one with and without).
+
+## Round edges, and a hanger like the reference (2026-11-12)
+
+After step 4 the user's verdict on the hanger sample was that it still did not look like the reference picture.
+Side by side (docs/organic_parts/reference_look.png) the surface was not what differed. In order of how much it
+showed:
+
+1. **Every edge of the reference is round.** Ours had a sharp rim wherever a member's side met the web's flat
+   face (the crop by the design space), and a box for a design space.
+2. **The web.** The reference is a truss of thick members round triangular openings; ours was two thin diagonals
+   and a chord, because the sample was a beam on its two end screws with one load case and Keep 35%.
+3. **The part.** A wedge with sloped ends, round corners and countersunk holes against a 10 mm slab under a
+   rectangular plate.
+
+None of that is the polish steps 2-4 worked on. What was built:
+
+**Round edges** (Topology Optimization, mm, default 0 = sharp; not in the key). The crop is
+`fields.intersect_edged`: where the shape's surface crosses a face of the design space the edge is an arc of that
+radius, at the angle they cross at. On a rod through a box's face the arc is within 0.003 mm of the exact one at
+0.2 mm samples and the volume taken off is 8.14 mm3 where the exact is 8.09. Faces the shape shares with the design
+space do not move (Mercury's rounded intersection sinks them 0.29 x the radius), and the design space's own edges
+stay: those are CAD's to round.
+
+| part | Round edges | mass | max deflection | stress away from supports | pieces |
+|---|---|---|---|---|---|
+| hanger sample (new), medium | 1 mm | -0.3% | -0.3% | +0.2% | 1 |
+| | 2 mm | -1.1% | +0.3% | +0.7% | 1 |
+| | 3 mm | -2.6% | +2.1% | +1.6% | 1 |
+| wall bracket, medium | 1.5 mm | -1.1% | +1.3% | 0.0% | 1 |
+| bolted bracket, fine | 1.5 mm | -1.2% | +0.1% | +0.2% | 1 |
+
+(Each against 0, both bodies on one 0.6 mm analysis grid.) The material is at the corners of the members'
+sections, where it does least for bending in the web's plane.
+
+- **A Keep body's own edges.** An edge of Keep's lying on a face of the design space (the plate's lower front edge
+  over an opening, when plate and web are flush) reads as two crossing surfaces only on its one side: the plate's
+  field is the distance to its front face on the other, the same as the crop's. It came out half rounded, with a
+  step of up to 0.4 x the radius along the edge. Nothing in the two fields tells it from a member's side; the node
+  knows which body is Keep, so `intersect_edged(keep=)` rounds nothing where the shape is Keep and takes nothing
+  off it. Such an edge stays sharp.
+- **Tried and taken out:** fading the rounding out where the surfaces cross at a flat angle. It changed nothing on
+  the brackets (to 0.1 mm3) and cost the exact arc at 150 degrees.
+
+**The sample** (`tools/make_hanger_sample.py`, `recipes/topo_hanger_extruded.json`): the part is the
+reference's, 203 x 28 x 57 mm: a 6 mm plate with round corners and top edges and six countersunk holes, and under
+it a wedge as deep as the plate at the top and 9 mm at the bottom, flush with the plate's front, its ends sloped,
+its bottom corners and outer edges round. Keep 50%, Min thickness 5.5, Skin 4, Extrude along y, Fillet 4, Round
+edges 2, medium: 66 iterations, 53 s in the editor, safety factor over 10, 0.040 mm.
+
+What the web looks like is the loads' doing. Five trials at draft, same part:
+
+| held by | loads | the web |
+|---|---|---|
+| the two end screws | one case: the three shafts pulled down and outwards | a deep arch, two small openings |
+| the two end screws | three cases: all down, all right, all left | a lower chord in waves, five openings of all sizes |
+| all six screws | the same three cases | three separate V's hanging from the plate, no chord |
+| the two end screws | nine cases: each shaft alone, down, right and left | a truss: chord, diagonals, five triangles |
+| the four outer screws | the same nine cases | the same truss, more even: the sample |
+
+Each shaft loaded alone, and sideways too, is what makes diagonals: every load then needs its own path to the
+screws, and a chord to pass the sideways pull along. A part held everywhere needs no truss.
+
+Two variants of the part that were not kept: the web set 3 mm back under a plate with all its edges round (a T,
+less like the reference's one block), and a Keep plate of 3.5 mm in a 6 mm band (the optimizer's own material
+under it, so the openings' upper rims could be rounded: a lumpier web).
+
+Left as it is:
+
+- The web has five openings where the reference has eight, and its bosses run into the chord: the optimizer's
+  answer to these loads, not a drawing.
+- The plate's lower edge over each opening is sharp (Keep's own edge, above).
+- A member lying along an edge of the design space meets two of its faces at once, and the rim there is a rough
+  line a sample wide (the wall bracket has one; it was rough without the rounding too).
+- Tests: CPU 656 passed, GPU 44 passed (`tests/test_fields.py`, the node's test in `tests/test_topology.py`,
+  `tests/test_gpu.py`).
+
+### The reference is not an extrusion (2026-11-12, later the same day)
+
+The user, on the extruded sample: its members are all in one plane and extruded in one direction, and the
+reference's are not. The plan's first premise ("the reference is a 2.5D part") was wrong: its side view has an
+opening through the wedge, and members lie at different depths. `recipes/topo_hanger.json` is the same part and
+load cases without Extrude along (Symmetry x, Keep 40%, Min thickness 5, Max iterations 200; it settles at 127,
+85 s in the editor at medium). Trials, all free in 3D:
+
+| loads | Keep | the shape |
+|---|---|---|
+| in the web's plane (the extruded sample's) | 35% | round struts in 3D, the bosses as round eyes, a tube look |
+| the same | 45% | plates: too much material for members |
+| 40 mm in front of the web (Offset), four or six screws held | 35% | three separate pylons hanging from the plate |
+| 12 mm in front | 40% | a flat-faced truss in the front face, struts behind it running back to the plate: the sample |
+
+The arm is what gives depth: a load in the web's plane needs none, a long arm makes each shaft a bracket of its
+own, a short one keeps the truss and braces it backwards. Measured on one 0.6 mm grid against the same shape
+sharp: Round edges 2 mm takes 0.9% mass, +0.7% deflection, +1.0% stress; against the shape with Even out, Fillet
+and Round edges all off the sample is 4.7% heavier and deflects 8.6% less (the fillets). One piece, no cavities,
+safety factor over 10, 0.171 mm. Picture: docs/organic_parts/reference_look.png.
+
+## Walls and chamfers (2026-11-12, evening)
+
+The user on the free 3D hanger: "the picture has a more refined shape with square profiles with nice chamfers".
+Looked at again, the reference is a hollow wedge: a front wall and a sloped back wall under the plate, each cut into
+a truss, so every member is a strip of a wall (flat outside and inside, a square section) with bevelled rims. Free
+3D members are round because nothing but the design space's outer faces makes a flat on them.
+
+Built, both on Topology Optimization and neither a change to the optimizer:
+
+- **Walls** (mm, 0 = solid). The design space becomes walls of that thickness along its faces: the node makes the
+  body to keep empty itself (`_hollow`: deeper than the walls inside the part, less Keep and the bosses round
+  supports and loads) and joins it with a connected Avoid. In the topology key through that body's key.
+- **Edge shape** round / chamfer for what was Round edges (now **Edges**): the chamfer is a flat cut with legs of
+  the size at 90 degrees (`fields.intersect_edged(edge="chamfer")`). On a square bar through a box face the cut is
+  where it should be to 0.001 mm at 0.1 mm samples. The rims inside the hollow are broken too (the crop by Avoid).
+
+The hanger (`recipes/topo_hanger.json`: Walls 6, Min thickness 5.5, Keep 50%, Fillet 3, Edges 1.5 chamfer, the rest
+as before), medium: 117 iterations, 73 s headless, one piece, no cavities, safety factor about 10, 0.30 mm, 93 g.
+
+| Edges 1.5 mm | mass | max deflection | stress away from supports |
+|---|---|---|---|
+| chamfer | -2.4% | +5.1% | +2.5% |
+| round | -1.1% | +2.1% | +1.0% |
+
+(Against sharp, one 0.6 mm analysis grid.) A chamfer takes 2.3 x what the arc takes, and here from both faces of
+every strip.
+
+What the trials showed (medium, same loads):
+
+| trial | result |
+|---|---|
+| Walls 6, Keep 50%, Min 5.5 | a truss of strips in the front wall, Y's and a chord in the back wall: the sample |
+| Walls 5, Min 5 | the same, thinner |
+| Keep 43-45% (Walls 6 or 7, four or six screws held) | three separate brackets, no chord: narrower bars are not to be had from Keep % |
+| Max thickness 7-8 | round holes and blobs in the walls |
+| Max thickness 9-10 | no change: it is measured across the wall, which is 6 |
+| Min thickness 6 in walls of 5 | not settled at 200 iterations, 8 cavities, +10% material thickened |
+| Extrude along y with the hollow | both walls the same outline, members like box sections; rough rims along the lower chord |
+
+- **The distance has to be exact as deep as the walls.** A CAD body's field is exact in a 2 mm band and interpolated
+  from a coarse pass beyond; Offset Body by a negative number does not regrow it. The node measures the design
+  space again with a band of walls + 1 mm for the hollow. (A hollow built in the graph with Offset Body needs the
+  Implicit Body's Band raised by hand.)
+- **The hollow ends in a V where two walls meet** (the wedge's bottom): no slit, since the two faces of the hollow
+  just run together. Cutting the hollow off with a box instead left two loose specks of a sample each.
+- Left: five openings where the reference has eight, and the strips are 8-15 mm wide where its bars are about 7
+  (see Keep % above); the bosses round the shaft holes stand out at the back as long lobes; the plate's lower edge
+  over an opening is still sharp.
+- Tests: CPU 657 passed; `tests/test_fields.py` (the chamfer), the node's test in `tests/test_topology.py` (chamfer,
+  Walls), `tests/test_gpu.py` (the chamfer on the card).
+
+### Inside the hollow (2026-11-12, later)
+
+The user on the walls sample: the parts wholly inside the part do not look like the rest. Cut open, two things
+were round in there:
+
+- **The members' inner faces.** The members' field is extended straight out past the design space, so the crop
+  cuts a flat face, but not into Avoid: there the smoothing rounded each member off and pulled its surface back,
+  and the exact cut by the hollow touched nothing. Every strip was flat outside and a half-round bar inside.
+  `density_field(avoid=)` now counts Avoid's elements as outside too (those with nothing in them and their centre
+  in the body; not a gap's elements, which nothing cuts afterwards). On a strip of six elements ending at an Avoid
+  body the corner by the body's face read 0.22 mm outside before and 0.58 mm inside after. For any Avoid body, not
+  only Walls.
+- **Balls under the plate.** The four held screw holes each had a ball 13 mm across hanging in the hollow: the
+  Skin, 4 mm round the faces of holes that end 1 mm under the plate. A limit on how far a boss may stand into the
+  hollow was tried and taken out: the depth it has to be measured by is the distance to the part's faces, and the
+  hole's own faces are among them, so round a hole it never bound. The sample is now held by the screws'
+  countersinks (faces 29, 30, 33, 34), where a countersunk screw bears, and that skin stays inside the plate.
+
+With both: 116 iterations, one piece, safety factor over 10, 0.25 mm (it was 0.30 held by the hole walls).
+Left: a thin pad round each screw hole under the plate (the walls round the hole's end, filled an element deep
+beside Keep).
+
+## Bars along the optimized members (2026-11-13/14)
+
+The user's idea, after the walls sample: use the optimization to know where bars should go, and draw the bars
+ourselves, instead of working on the optimizer's own surface. Built as Topology Optimization's *Members as:
+bars* with a *Bar size* (`engine/fea/bars.py`); nothing in the optimizer changed, and switching it optimizes
+nothing again.
+
+How: the smoothed members and the fixed bodies are thinned to centre lines, the lines are read as joints and
+members, tidied, cut into straight pieces and drawn as prisms with a stadium outline, flat faces, filleted
+joints and broken rims (CLAUDE.md has the steps).
+
+The hanger (`recipes/topo_hanger.json`, Walls 6, bars 7 mm, Fillet 3, chamfer 1.5), against its own optimized
+shape on one 0.6 mm analysis grid:
+
+| | mass | max deflection | stress away from supports | safety factor |
+|---|---|---|---|---|
+| optimized shape | 96.3 g | 0.256 mm | 4.47 MPa | 10.1 |
+| bars 7 mm (11 bars) | -27% | +74% | +87% | 5.4 |
+| bars 8 mm | -24% | +63% | +52% | 6.6 |
+| bars, automatic (7.6 to 10 mm) | -22% | +60% | +77% | 5.7 |
+
+The bars are lighter and less stiff than what they are traced from: the optimized strips are 8-15 mm wide with
+gussets at every joint, the bars are one width with a 3 mm fillet. Automatic widths do not give the mass back
+either: a member's section is its own samples' volume over its length, and what sits in the joints belongs to no
+member. Tracing and drawing take about 2 s on top of the result's 10.
+
+What it took to get right, in the order it showed:
+
+- **A 3D skeleton keeps topology, nothing else.** A member that is no part of a loop shrinks to nothing (and
+  scikit-image's thins a lone bar with an even number of samples across to no sample at all). The members alone
+  are mostly such pieces, hanging between the plate and a boss; thinned together with the fixed bodies every one
+  is part of a loop through them, and the lines inside the fixed bodies are dropped afterwards.
+- **Where a line enters a fixed body is a joint**, also when the line runs on past it. Counting a line sample's
+  neighbours on the drawn lines alone missed it; and a link of a single sample between a joint and a body was
+  read as a ring on the joint. With both wrong the hanger's two outer shaft eyes hung on their back struts
+  alone: safety factor 2.8. Right: 5.8.
+- **Bars must end inside what holds them, not past it.** Run straight on by their width, the bars at the middle
+  eye crossed over it and stuck out the other side. A held joint is moved into its body along the body's own
+  gradient instead, by a bar's width: towards a boss's axis, up into a plate.
+- **A joint that moves has to take its members along.** Merging two joints 9 mm apart left the chord with a
+  dog-leg at its old end; every point of a member's line now moves by its share of what the ends moved.
+- **Fillets and flat faces.** A smooth union of the bars pillows their common face at every joint (0.6 mm at a
+  3 mm fillet). The outlines are blended on prisms taller than the bars, and the faces are the bars' own slabs.
+- **Faces a hair apart streak.** In walls the bars' inner faces lay in the hollow's face, then 0.1 mm short of
+  it: breaking the edge between the two (Edges at the hollow's cut) left streaks along every bar. Bars in walls
+  keep their own broken rims and the hollow cuts sharp.
+- **Depth in a wall is measured along the bar's normal.** The distance to the nearest face is another face's
+  near an edge of the design space, and a bar's ends lie in the plate or a boss: bars came out 1.5 mm askew.
+- **Symmetry.** The optimizer's shape is a mirror image, its skeleton not quite (4 pieces in one chord, 5 in the
+  other). With Symmetry the low side's bars are mirrored.
+- **Straight is a choice.** At 0.3 x the width the chords had three or four pieces each, following every dip of
+  the optimized member; at 1 x they are one or two, which is what reads as designed.
+
+Limits:
+
+- **Plates.** A plate has no centre line. The wall bracket (a box of plates) as bars lost half its volume and
+  fell into four pieces, with a load in the air. The node counts the pieces of the bars against those of the
+  members and shows the optimized shape with a warning when there are more.
+- Five openings where the reference has eight: the layout is still the optimization's.
+- One bar size for all, or automatic: no way yet to set single bars.
+- Tests: `tests/test_bars.py`, the node's test in `tests/test_topology.py`, `tests/test_gpu.py` (the bars' body
+  on the card).
+
+### Bars that follow their members (2026-11-14)
+
+The user on the straight 7 mm bars: the bar's shape should follow the size and form of the optimized shape
+better. Built as *Bar form: follow* (the default now; *straight* is the form above): a bar runs along its
+member's own centre line and is as wide as the member is there.
+
+The hanger again, each against the optimized shape on one 0.6 mm analysis grid:
+
+| | mass | max deflection | stress away from supports | safety factor |
+|---|---|---|---|---|
+| optimized shape | 96.3 g | 0.256 mm | 4.47 MPa | 10.1 |
+| bars that follow, Bar size auto (8.4 to 25 mm) | -4.0% | +10.5% | -2.3% | 10.3 |
+| bars that follow, 7 mm | -26% | +69% | +54% | 6.5 |
+| straight bars, auto (7.3 to 9 mm) | -23% | +55% | +66% | 6.1 |
+| straight bars, 7 mm | -25% | +60% | +79% | 5.6 |
+
+Following the members' width gives back nearly all of what one-width bars lost: the optimizer had put the
+material where the forces are, wide at the plate and narrow at the eyes.
+
+What it took:
+
+- **The width is the member's section over its own thickness.** Over the walls' thickness the lower chords, which
+  run where the wedge is solid and 9 to 13 mm deep, came out 31 mm wide. The thickness is measured through every
+  line sample along the bar's normal.
+- **A line of samples is longer than the member it runs along.** Where the skeleton steps to and fro a sample
+  at a time, its length is 1.4 x the member's, and the section (material over length) read 30% low. Lengths are
+  taken along the line smoothed over 2 samples. (Found by a test on a member of known width, not by eye.)
+- **Smoothing a line must not move it.** Smoothed and its ends put back by shares, a steep line's ends moved a
+  sample and the correction moved the middle as far: a bowed member's bar ran 1 mm inside its bow. The line is
+  continued past each end by its mirror image through that end instead, and nothing needs putting back. (The
+  same test.)
+- **A moved joint bends its bars only near it.** Joints are moved into the eyes they hang from, 13 mm here. By
+  shares, as the straight bars do it, the chord moved 13 mm down all along, onto the part's lower edge and out
+  of its member; near the rounded edge its pieces then looked the bottom face's way, and the chord was ragged.
+- **A member's pieces need one normal and one plane.** Each with its own (the design space's gradient at its
+  middle, its own depth in the wall), the 130 pieces lay a hair askew of each other: shards at every joint
+  between two pieces. One normal for a member whose length mostly looks one way, all its ends in one plane.
+- **Pieces of one member are not blended.** Blended like members, every joint between two pieces bulged by a
+  sixth of the blend's width. They share their end circles and are joined plainly.
+- 130 pieces for 11 members at 2% of the width; at 7% the chords showed their corners.
+
+Left: the widest ends (25 mm at the plate) are the member's line picking up the joint's material; the cap is 1.6 x
+the member's median width.
+
+### Fillets of the bars (2026-11-14, later)
+
+The user: make the fillets nicer, above all on the bars that follow the shape. Close up, with Fillet 3 mm:
+the same small radius between 20 mm bars as between 8 mm ones, a chip in the sharp notch where two bars leave an
+eye, the eye itself three outlines (the boss and two bars' round ends beside its axis), and the corners where
+bars leave the plate nearly sharp.
+
+- **A fillet by the bar's width**: max(Fillet, 0.4 x the bar's median width), at most 10 mm; between two bars
+  the narrower one's. Fillet stays the least radius, and 0 still means none. The bosses and Keep are joined with
+  the bars' middle radius. The notch is a round now and the chip is gone (it was the edge of a 3 mm blend in
+  a 20 degree notch).
+- **Joints rest in the middle of what holds them**: up the distance from the fixed body's surface to its ridge.
+  Every bar at a boss ends on its axis, concentric with the eye.
+- **Fillets only between bars of one plane.** With blends this wide, a bar of the front wall and the strut of
+  the back wall at the same eye were blended into a web from wall to wall, which the two slabs cut down to a
+  patch of skin beside the eye, with voids of a few samples under it. Members are grouped by plane and only
+  blended within one.
+- **A slab reaches a sixth of the blend past its bar**, not the whole blend: at 17 mm it met the taller prism
+  of a bar in another plane, a tab beside every eye.
+
+The hanger with them, against the optimized shape (one 0.6 mm grid): mass +1.9%, deflection -2.2%, stress -4.7%,
+safety factor 10.6 (with 3 mm fillets -4.0%, +10.5%, -2.3%): the bars are now as stiff as what they are traced
+from. No voids at 0.21 and 0.3 mm samples.
+
+Left: where the back wall's strut meets an eye from behind, its wide round end shows under the eye as a second
+lip, and the joint between the two walls there is faceted.
+
+### Which bars, and their bends (2026-11-14, evening)
+
+The fillets by bar width above were made for the bars that follow their members. The user had meant the straight
+one-width bars: shown the four variants side by side (straight bars; bars that follow, small fillets; bars that
+follow, fillets by width; the optimized shape), they chose the straight ones. Side by side the bars that follow,
+with their member's width and wide fillets, are hard to tell from the optimized shape: what reads as bars is one
+width and straight runs. `recipes/topo_hanger.json` is back to Bar form straight, 7 mm.
+
+For those:
+
+- **Bends are arcs.** A straight bar that follows a bent member was two pieces meeting at a corner: a crease
+  on the inside of the bend, and across the chamfered faces on the outside. Corners are turned in an arc of 3 x
+  the width (`bars._rounded`), in pieces of at most 4 degrees.
+- **Fillet 5 instead of 3** in the recipe (a bar's own rule, 0.4 x the width, gives 2.8 mm at 7 mm, so the
+  Fillet input decides): the blends flow into the eyes and the plate.
+- The joints rest on the eyes' axes and blends stay within a wall, as above.
+
+Against the optimized shape (one 0.6 mm grid; the optimized shape with Fillet 5 is 99.6 g, 0.238 mm):
+
+| straight bars 7 mm | mass | max deflection | stress away from supports | safety factor |
+|---|---|---|---|---|
+| Fillet 3 | -28% | +82% | +56% | 6.4 |
+| Fillet 5 | -25% | +68% | +19% | 8.3 |
+| Fillet 6 | -22% | +60% | +11% | 8.9 |
+
+The fillets carry: 2 mm more radius takes a third off the stress at the joints.
+
+A lesson for showing work: when a remark could be about either of two things on the picture, put both on one
+sheet with letters and ask, before building. A round of work went into the wrong bars.
+
+### Bars deep in a part: one plane per member (2026-11-21)
+
+The user's bolted bracket (struts only, no Walls, Members as bars, Bar form follow) came out with five of its
+27 bars crumpled, as if wrung. A bar's faces lie as the design space's nearest face does, and a member deep in
+a free 3D part is as far from several faces: the nearest was another one every few pieces, so neighbouring
+pieces were turned up to 83 degrees against each other (116-360 degrees summed along a member), and each
+piece's slab stood out of the next one's faces. Members most of whose length looks one way were always laid in
+one plane (`BAR_FLAT`, `BAR_MOSTLY`); the others kept each piece's own normal. Now those get one direction too:
+across the plane the member's line bends in (the least direction of its points, when it is bent more than
+`BAR_BENT` x its width), else the way most of it looked, made square to its line; a line that leaves that plane
+by less than `BAR_LIFT` x its width is laid in it, a farther one gets that direction made square to each piece.
+Even 4-10 degrees between pieces showed as ribs across a bar, so laying it in the plane matters. After: no
+piece askew of the next in any of the 27 bars; the hanger (Walls, all members flat before) is unchanged, 11
+bars. Picture: `docs/organic_parts/bars_one_plane.png`. Left: a member whose faces lie in its bending plane by
+the vote (`flat` from the design space's faces) is still flattened into it.
+
+Joints between planes (the same day, the user's "yes"): where bars of different layers met they were joined
+plainly (fillets are for bars of one layer: across the hanger's two walls a blend was a web), and a 3D joint
+showed every bar's round end and corners beside the others. `B.body` `knots`: a joint where the ends of members
+of two or more layers lie together (`BAR_KNOT_NEAR` x the larger side apart; 12 on the bracket, none on the
+hanger, whose walls are far apart) gets a ball the ends lie in (`BAR_KNOT` x half the widest bar's smaller side;
+none inside a boss or Keep), and round it the finished layers, rims and all, are joined by a G2 blend in space as
+wide as the narrowest bar's fillet there, full within `BAR_KNOT_REACH` x the larger side and faded to none at
+twice that, so away from the joints layers are joined plainly as before. The blend's width is a field (0 away
+from knots), a pure function of position: blocks bit for bit (test). Not done: a wide flat bar's round end still
+shows as a disc beside a small ball, and two bars of different layers running close and nearly parallel within a
+knot's reach swell a little towards each other.
+
+The discs, looked at again (2026-11-21, nothing kept): they are not ends that miss the ball. These joints lie
+3-4 mm under the design space's face, the bars there are 4.5-6.5 mm thick, and the crop cuts the bar of the face's
+layer flat: its flat face, flush with the part, ends in its round end, a disc, while the ball and the bars of the
+other planes lie lower beside it (bars alone, uncropped, show none). Tried on the bracket's 12 joints, each
+rendered close up, none better than before: bars run on to the joint's centre (ends concentric, little to see);
+rims rounded towards the joint by Mercury's rounded intersection with a radius field (smooth with one radius per
+joint, but the bars thin to pebbles and the ball stands out as a bulb; a radius per nearest bar is discontinuous,
+rough surfaces); wide bars tapered to the ball (these bars are thicker than wide: nothing); a ball that holds
+every end's corners (a knob, cut to a larger disc); the joint pushed inwards along the design space's gradient
+(1-2 mm at most, and the gradient points anywhere by a thin wall: joints moved outwards); ends within 1.5 x the
+larger side gathered into one joint (extension pieces across each other, crumpled). Edges 1.5 mm on the crop
+softens the disc's rim and is the only thing that helped a little. What is left to try: a joint by a face made
+flush with it (a flat pad over all the ends), or bars of the face's layer no thicker than the joint's depth.
+
+
+Flush joints at the face (2026-11-21, taken out again the same day: the user did not find it better, and it cost 7.8% material; `B.body`'s `knot_axis` / `knot_span` boss is still there, unused): the disc is a step. In a thin region of the part (7 mm between two faces) one member is 6.5 mm thick and cut flat by the face, the others at the joint 4.5 mm and a step lower; the flat cut ends in the thick bar's round end. `nodes_fea._bars` now takes a joint between planes whose bars come within `BAR_PAD_NEAR` of the design space's face (on the other side too, when that face is as near): every member ending there that lies along the face (`BAR_FLAT`) is made thick enough to stand `BAR_PAD_OVER` over the face, so the face cuts them all at one height, and where two or more such members meet the ball is a round boss along the face's normal instead (`B.body` `knot_axis`, `knot_span`), `BAR_PAD` 1.5 x half a width past the ends (1: a ring groove round it; 2: a knob). On the bolted bracket 4 of the 12 joints get flat tops with one outline (7, 8, 9, 10 in the close-ups); a slit 1-2 mm wide is left between two flush bars at three of them, the other 8 joints are as before, and the part is 7.8% heavier (47.0 -> 50.6 cm3: the members are thicker all along, a member has one thickness). The hanger has no such joint and is the same body. Tried on the way and dropped: a boss at every such joint without thicker bars (it is a disc itself); evaluating the bars at the point straight under each sample at the joint's level, so everything stands up to the face (flat tops, but bars leaving the pad sheared into sheets and pits in the fade zone, where thinner bars lie under the face). The swelling between planes near a joint is unchanged.
+
+Bars laid by their joints (2026-11-21, an experiment, off: `nodes_fea.BAR_BY_JOINTS`): on the bolted bracket the bars at 9 of the 12 joints lie in one plane (their directions' smallest singular value under 0.08 of the largest), yet the bars were drawn in 21 planes for 27 members, each by the design space's nearest face, turned 30-80 degrees against their joint's plane and 4-11 mm thick. Laid by their joints instead (a joint's plane across its members' directions, its members in it share that plane, a layer and a thickness; a member whose two joints lie otherwise turns and tapers along its middle, `B.body` `twist` / `thick_b`; its line laid in that plane, its ends moved to the joint's middle) the planes drop to 11 and the joints between planes to 3. But the body is worse as built: pointed shards stand out of several joints in the whole view, turning members wrinkle where their halves of two layers overlap, and holes are left in joints between three bars. Not found why; the first thing to look at is one turning member alone and one planar joint alone. For comparison the same bracket with Bar form straight, 5.5 mm (`docs/organic_parts/bracket_bars_ab.png`).
+
+Bars laid by their joints, second round (2026-11-21, still off): what the shards were, and what is left. (1) Laying a member's whole line in its joint's plane moved lines up to 9.5 mm: 22% of the bars' material lay outside the design space (9% before) and the crop cut it to shards. Now only the stretch within `BAR_JOINT_LOOK` sides of a joint is laid in the joint's plane, a bent member's middle in the plane it bends in: 9% outside again. (2) The ribs across every bar were the pieces' round ends: a round end lies in its piece's plane and stands out of the next piece's face where the line leaves the plane by a few degrees. `B.body(chain=)` mitres the pieces of a chain on the plane halving their bend, each piece giving values in its own cell only (cut with max, the values by a plane were the distance to the plane: a seam in every rim and blend). Ribs and seams gone; hairline steps of under 0.1 mm are left where two pieces' faces differ at the plane. (3) An end in a boss or Keep lies as the part's face does there. (4) A member too short to turn (`BAR_TWIST` 2.5 degrees per mm over half its length) keeps one joint's plane and meets the other joint as a bar of another plane. Close up the planar joints are then flat with one outline (joints 7, 9, 10), but the whole bracket is worse than before (`docs/organic_parts/bracket_by_joints.png`): bars that turn and taper along their length look wavy, crumples are left where short members meet a joint of another plane and by the bosses, and with (4) most joints are joints between planes again (21 layers, 12 knots, as before). The bars that follow their members drawn each in its own plane read as cleaner at arm's length. Not tried: no turning at all (every member one plane, chosen so that the most joints agree, as a graph problem), and one thickness per layer without touching the planes.
+
+### Lofted joints (2026-11-22)
+
+The user's remark on the bolted bracket's bars, one at a time over a day of test joints (pictures `docs/organic_parts/joint_sheet*.png`):
+the blended joints are the best of what there was but wonky, a ball or disc where bars of different planes meet is not wanted, faceted and
+"industrial" nodes are not good looking, and beams must not protrude through a joint. Their own idea: loft the section to each connecting
+beam. That is what a free part's joints are now (`nodes_fea.BAR_LOFT`, `bars.lofts`, `bars.body(curves=, flat_a=, flat_b=)`; walls keep their
+fillets in the plane, the hanger is as it was).
+
+What it is. A joint is where members' ends lie together outside the bosses and Keep. Every member is cut square short of it, 1.2 x its
+larger side (`LOFT`), farther where two bars lie at a sharp angle so that the inside of the bend keeps a radius, never beyond where the two
+bars' flat faces part (a hole between them and the bend), at most half a member's length. Between every two members there is a loft: a cubic
+Bezier that leaves the one member's line where it was cut, in its direction, and arrives on the other's the same way (handles of the chord /
+(3 cos^2(turn / 4)): a circle's arc for straight bars cut alike), along which width, thickness and the faces' normal go evenly (smoothstep)
+from the one member's to the other's. The first member's normal is carried along the curve, and what is left to turn at the end is at most
+45 degrees: a rectangle turned a quarter with its sides swapped is the same rectangle. `body` works a loft out as it is: per span (12 degrees
+of turn of the curve or of the normal at most), every sample's nearest point of the curve by 5 Newton steps from the span's middle, the
+section there in the frame between the span's two ends' normals, a layer of its own with its own rims, joined plainly.
+
+Measured on the bolted bracket (27 members, 281 pieces): 11 joints, 43 lofts (one joint of 5 bars, one of 4, nine of 3). Material: the bars
+alone 30.92 -> 29.48 cm3 (-4.7%), with the bosses 46.94 -> 45.50 cm3 (-3.1%), one piece both. `_bars` 5.0 -> 5.6 s; the whole part's values
+at 0.3 mm on the CPU 24.8 -> 55.2 s. GPU and CPU agree on a lofted joint to the last bit (2.6M samples, largest difference 0). Pictures:
+`docs/organic_parts/bracket_lofted_front.png`, `_back.png`, `_joints.png`.
+
+What did not work, in the order it was met:
+- On the test joints: a smooth union of bars that melt towards the joint is a ball (a joint 10.8 mm thick on 6 mm bars: it swells where two
+  bars' faces lie in one plane and over a bar end under a face). Blend weights that vary from sample to sample (the surfaces' angle, buried
+  surfaces) left marks and tears three times. A fill kept inside the bars' convex hull took the ball away, but the beams still ran through.
+- A loft as a chain of straight pieces 6 degrees apart: every piece a rib across a face that bends, and slivers where the mitres of a tight
+  bend cross. A true curve has neither.
+- Round ends, half the width into the bar: an arc on the bar's face wherever the bar tapers or bends there. Now a loft runs a tenth of its
+  smaller side on into its bar and ends square, and the bar ends square where its first loft begins.
+- A stub member 7 mm long and 11 mm thick with both its ends in one joint (two joints 7 mm apart that count as one): 7 ends, 21 lofts in a
+  thumbnail's space. Such a member is left out; the lofts between the others are what joins them.
+- The knots' blend in space (a joint in a boss 10 mm away) drew the lofts' and bars' cut ends, which are steps in the values, out into a
+  striped patch. Lofts are joined plainly everywhere.
+- Samples beyond the middle of a tight bend, where Newton's steps do not come to rest: counted as inside, they would be stripes of material
+  across the inside of the bend. A sample is a span's only where the steps ended square to the curve (within a tenth of the smaller side).
+- The faces' normal by the loft's turn and twist as a whole: 31 degrees in one of five spans of a loft that leaves its plane. The spans are
+  now as many as keep the normal's own turn within 12 degrees.
+
+What is left. Where bars of three planes meet, the lofts leave a dimple on the outside of the corner and creases where they cross (a light
+fill between lofts softened these on the test joints; it is not in the engine). A loft tighter than half the bar's side, a hairpin between
+two bars that leave the joint side by side, is left out where both bars have other lofts, so there is no web between such bars. Short
+members (12-20 mm with sections of 5-8 mm) leave their lofts little room, and those bend tightly. Outside a tight bend, farther from the
+curve than its radius, a loft's values are `far` instead of distances, which the fillet to the bosses reads within its width. The strength
+with lofted joints was not checked here: the node's own check does that when the part is opened.
+
+Dimples filled (2026-11-22, late; the user: "can it be walked over to fix the depressions in the surfaces"). Where lofts of different
+planes come together they leave a three-sided dimple between them and creases where they cross. What is in now (`nodes_fea.BAR_FILL` 0.7,
+`bars.fills`, `bars.closing`, `bars.body(fills=)`): round each lofted joint the bars as drawn are read on samples 0.4 mm apart and closed by
+a ball of 0.7 x the bars' side rolled over them from outside (two distance transforms, each distance carried on from the nearest sample to
+the surface by that sample's value along its slope); what the ball cannot reach is filled, a dimple narrower than the ball, a crease to an
+arc of its radius. What that adds within the joint's core is kept as a patch of samples per joint (a sampled body's cubic B-spline,
+`fields.spline_values`) and joined plainly in its box. `_bars` on the bolted bracket 5.8 -> 19 s on the CPU (11 joints; 75 s at 0.3 mm
+samples before the rules below); drawing the whole part's values costs the same as without (54 s at 0.3 mm). Pictures:
+`docs/organic_parts/bracket_filled_front.png`, `_back.png`, `_joints.png`.
+
+What it took, and what did not work:
+- A ball of 1.2 x the side fills the dimples nearly flat, but it is larger than the inside of a loft's bend (0.8 x), so it filled every
+  corner between bars too; 1.0 carved round marks. 0.7 rolls through the corners and leaves a shallow dish in a dimple, not a flat.
+- The patch as "the bars' distance less what the ball adds": the roughness of that distance (a few hundredths of a mm) was in every fill,
+  and where the ball adds next to nothing the patch won here and there on the bars' own faces: wrinkles. Now the closed solid itself,
+  smoothed over 1.25 samples, no fill where the ball adds under 0.25 mm and all of it from 0.5 mm on.
+- Three short members (13-15 mm, bars of 5-6 mm) round an opening 7 mm wide between three joints: the ball does not fit through, and the
+  fill was a dished web in the opening. It looked like a pocket in a joint, and I spent an hour plugging "pockets between a joint's lofts"
+  (flat prisms over the fan from the ring of three lofts' centre lines to its middle) before measuring that every joint's middle lies in
+  material and the hole is an opening of the part. An opening stays open: no fill round a place where the ball adds over 0.4 x the side.
+- The plugs themselves: fins wherever a ring of lofts does not lie in one plane. Taken out.
+
+What is left: a dimple is a dish now, not gone (the ball bridges it); the fill is as smooth as samples 0.4 mm apart are; nothing is done
+about the bands on the long bars' faces (the pieces of a bar that follows its member: there before the lofts).
+
+Filling them flat (2026-11-22, night; the user, asked whether the softer fill was enough: "fill them flat"). Tried two ways, both taken
+out again; the fill is the ball of 0.7 x the side as before (picture `docs/organic_parts/joint_flat_attempts.png`). What the measurements
+said first: on the bolted bracket the depressions are mostly not dimples on the outside of a corner. 8 of the 11 joints have their bars
+nearly in one plane; their depressions are the valleys where the three lofts overlap, each with its own face, turned from the one bar's
+normal to the other's. Nothing that fills only "beyond every loft's outer side" touches them (0 mm3 at 9 of 11 joints).
+- Flat caps: the convex hull of a ring's three lofts (their sections' corners along them), kept out of the bends. On a test corner in
+  space exactly flat (the dimple's surface the same to 0.01 mm over 1.2 mm, 0.36 mm higher than the ball's dish). On the bracket it adds
+  56-257 mm3 a joint, up to 3.7 mm over the bars: the hull lies a few tenths over every loft's own face wherever that twists, so the
+  caps come and go across the faces: ripples and films on what was clean, and material into the opening by joints 7, 9 and 10.
+- A larger ball (1.5 x the side: the test dimple flat to 0.02 mm over its middle), kept out of the bends by rule, since it is larger than
+  a bend's inside. Rules tried: not past a loft's inner side (judged from where the bars meet: swapped for lofts that pass that point
+  within a mm or two, the bars' ends being up to 4 mm apart; judged from the loft's own curvature: other bends let through), only within
+  0.3-0.6 sides of two of the joint's lofts, no fill where the ball adds over 0.35-0.5 sides. Every set left beads somewhere: in the bend
+  of a curved bar, of a neighbouring joint's loft 8-15 mm away, between two bars that leave a joint side by side (a lump of 91 mm3). The
+  "opening closed" guard, whose reach goes with the ball, switched a whole joint's fill off at 1.5.
+- A valley between two lofts' faces and the bend between two bars are the same thing to a ball, a concave crease: they differ only by
+  which surfaces meet. Rules that tell them apart by position kept failing on joints whose bars are 12-20 mm long and do not quite meet.
+- Working the ball out on samples 0.8 mm apart was 0.1-0.2 mm off (not even the same order between ball sizes): 0.4 mm it stays. A
+  distance carried to the surface along the line to the nearest sample (instead of that sample's slope) was 0.08 mm off at a plain
+  corner, where the values are kinked: the slope it stays.
+- Colouring what a fill adds (the bars' value at each vertex of the filled body, `colors=` of the scratch renderer) showed in one picture
+  what three rounds of numbers had not.
+What would make a joint's face flat is upstream of any fill (not done): the three lofts of a joint agreeing over its middle, one normal
+and one thickness there, each turning from its bar's frame to the joint's and on to the other bar's.
+
+Sharp is what tells them apart (same night; the user: "the defects have very sharp corners, can't you use that to fix it up?"). It is:
+a bend is round inside (LOFT_INNER), a crease between two faces is not, and the small ball is the test for it, since it rolls through
+every bend and fills only what is sharper than itself. What is in now (`bars.fills`, `FILL_FLAT` 1.5, `FILL_SEED`, `FILL_PIT`): two
+balls. The large one's fill is used only where the small one's is at least 0.08-0.2 mm (something sharp is there) and the large one adds
+under 1.3-1.8 x what the small one does. The second rule is what a pit is: a depression with a rim is filled to that rim by a ball of any
+size, while a valley that runs on, or a bend, takes ever more the larger the ball (in a bend the small ball adds nothing at all). On the
+test corner the dimple's surface is flat to 0.05 mm over 1.2 mm and 0.2 mm higher than the small ball's dish; a point in the bend, one
+over a flat face and one beside a bar keep their values to the last bit. On the bracket: no beads, the pits fuller, 44 against 25 mm3 at
+joint 4. `_bars` 22 -> 51 s on the CPU (the bars are read 2 x the large ball farther out, and closed twice).
+- Coloured renders of what a fill adds showed how little the small ball's fill covers: most of what still looks sharp at a joint is
+  creases the fill would cover by under FILL_LEAST (a crease of 30 degrees: 0.15 mm), and the three joints by the 7 mm opening get next to
+  nothing (2.8 mm3 at joint 7): their depressions open into the opening, and the fill is off within 0.5-1.5 balls of it.
+- FILL_LEAST 0.12 instead of 0.25 softened more creases and left faint marks on the hollow faces of curved bars: 0.25 it stays.
+- Without the first rule (something sharp) the large ball laid films of 0.1-0.25 mm on gently hollow faces: specks.
+- Taking only the opening's own lid out (what hangs together with its deep part, down to 0.5 mm) instead of everything within a ball or
+  two: a joint's fills hang together at that level, and whole joints lost theirs. The old reach stays.
+Still sharp: shallow creases, and the joints by the opening.
+
+A flow instead of balls (2026-11-23; the user: "from what I could see it didn't fill in much"). True, and the coloured renders say why:
+every rule that kept the balls out of trouble (nothing under FILL_LEAST, nothing within a ball or two of an opening, a pit only where
+the small ball finds something sharp) took fills away, and close up what the small ball did add was lumpy pads. What is in now
+(`bars.flow`, `bars.fills`; the balls, `closing` and their constants are gone): the joint's surface flows outwards, a level set flow as
+Even out's, with a speed that is itself the test for a defect:
+- the larger principal curvature where it is hollow: a place hollow in every direction, a pit. It fills until it is straight one way,
+  which for a pit with a rim is flat. A bend between two bars is hollow one way and straight the other: speed 0, with no rule.
+- what the smaller principal curvature is hollower than 1 / (FILL_SHARP x the side, 0.3: 1.8 mm for 6 mm bars): a groove sharper than
+  that, a crease between two faces or the foot of a step, is rounded to that radius. A bend's inside (0.8 x) and the wall of a round
+  opening wider than twice that do not move, nor the walls of a slot.
+Measured on samples 0.4 mm apart (tests/test_bars.py): a flat face unchanged to the last bit; a 90 degree groove filled 0.742 mm along its
+bisector (an arc of 1.8 mm: 0.746); cylinders of radius 5 and 2.75 mm unchanged, one of 2.0 shrinks to 1.83 and one of 1.2 closes; a
+dimple 1.5 mm deep and 6.2 mm wide is left 0.37 deep (0.11 at twice the time); a step 0.6 mm high gets 0.1 mm at 0.4 mm from it and
+nothing from 1.6 mm. The test corner in space: the dimple's surface flat to 0.004 mm over 1.2 mm and 0.8 mm above its bottom, the sharp
+inside of the corner filled by 1.0 mm, the bend and the faces unchanged to the last bit, blocks bit for bit, GPU = CPU. On the bracket the
+eleven joints get 1.6-52 mm3 each (137 in all); joint 7 by the opening 2.9 where the ball left 0.4, joint 11's creased pocket is a smooth
+web; no films on faces or in bends, the openings as they were, one piece, no enclosed voids added (three small ones closed). `_bars` 52 -> 33 s on
+the CPU: the flow is 1.3-4.5 s a joint, and the bars are read only a few samples beyond the joint instead of two large balls beyond.
+What did not work on the way:
+- Smoothing the solid and keeping what is sharp by comparing two widths (FILL_SOFT, FILL_SHARP as a ratio, FILL_FAINT): rings on the
+  hollow faces of curved bars wherever the two amounts were small, and with those cut off hardly anything left.
+- The same two widths combined so that a smooth hollow cancels ((4 x half - full) / 3, no thresholds): marks in every bend beside a
+  face's edge, where the surface is not the smooth one the cancelling assumes.
+- FILL_SHARP 0.6 (grooves rounded to a bend's radius, as the ball did): the tunnels and openings 4-5.5 mm wide between short bars filled
+  up, since their walls are sharper than that. 0.3 leaves them.
+- FILL_TIME 0.35 and 0.5: more in the large dimples (joint 1: 52 -> 69 -> 118 mm3), but a tunnel of 2 mm radius closed up in debris.
+- The gate against values that turn back (Even out's 0.75-0.95) left a dot at the bottom of a filled pit, where its creases had met; at
+  0.4-0.7 it is gone and nothing appears in the gaps between bars (pieces and voids counted on all eleven joints).
+- The scratch loop that made this quick: the unfilled bars sampled once round every joint (0.4 mm for the fill, 0.2 mm for pictures), then
+  every variant in seconds on those arrays with what it adds in colour, instead of 3 minutes of `_bars` and meshing per look.
+Still there: the steps where a joint's lofts cross at different depths (a fill rounds their foot only), and thin lines where one loft's
+chamfer stands 0.1-0.2 mm proud of another's face. Those are the lofts', not the fill's: see the note above on lofts agreeing over the
+joint's middle.
+
+One plane per joint (2026-11-23, tried and left off: bars.LOFT_PLANE). The steps where a joint's lofts cross at different
+depths, approached from the lofts: every loft of a joint with three or more turns its faces to one plane through the lofts'
+middles (fitted, sideways shift where four or more middles are not in one plane), with the joint's thickness across it there
+(a bump 16 s^2 (1 - s)^2 on the section's sizes and its offset, so each loft still leaves its bars as before). On the bracket
+35 of 43 lofts got it. Looked at close up: joint 4's band across the middle was partly gone, joint 8 the same as before, and
+on joints 9 and 11 the faces twisted to the plane and back, a wavy ribbon where they were flat. The lofts of a 3D joint run
+up to 40 degrees out of any one plane, so their faces cannot all lie in it; turning them there adds twist instead of taking
+steps away. What is left to try is not a loft per pair of members at all (one body for the whole joint).
+
+Sharp edges rounded too (2026-11-23; the user: "go over it again and look where the sharp angles are"). The flow filled only what
+is hollow; a step between two lofts has a sharp hollow foot (rounded) and a sharp top (left). `flow(ridge=)` also moves the surface
+inwards by what its larger principal curvature is rounder than 1 / (FILL_RIDGE 0.5 x the side, 3 mm for 6 mm bars); what that takes
+off is a second patch per joint that the values are raised to (`cut`), FILL_UNDER over the flow's surface. A 90 degree edge is
+rounded to 1.21 mm along its bisector (an arc of 3 mm: 1.24), a flat face unchanged to the last bit. On the bracket the joints lose
+6-22 mm3 each beside what is filled; the step across joint 4's middle and its sharp top are soft, the lines at joints 8 and 6 fainter,
+but the 0.1-0.2 mm lines where a chamfer stands proud stay (finer than the fill's 0.4 mm samples). The joints' own rims are rounded a
+little too: a gate meant to spare them (FILL_TURN: the mean of the surface normals near a sample, long where they differ little) does
+not tell a chamfered rim (0.90-0.93 at 0.8 mm) from the corner's dimple (0.91); measured over the volume instead of the surface it
+read a face 3 mm from a rim as a rim. Ungated at 0.3 x the side the rims got 3 mm rounds and the joints lost 38-58 mm3. `_bars` 33 ->
+40 s.
+Then (the user: "can't you tell the difference between an outside edge and an inside edge? you make the beams"): `body(seams=True)`
+gives the second nearest loft's values, and the rounding was gated to where a second loft's surface comes within 0.6 mm at over
+15-25 degrees. Three things it showed: (1) a union of lofts makes only hollow creases where they meet (the fill rounds those); every
+sharp outside edge is one loft's own edge, a step's top being a loft's rim 0.1-0.6 mm above another's face; (2) in these joints the
+three lofts overlap almost everywhere, so another loft's surface is within a millimetre and turned at the joint's rims as well (two
+lofts leaving one bar part slowly), and the gate picked rims; (3) at the fill's 0.4 mm samples the step tops hardly show as sharp at
+all, the rims do. A 0.2 mm pass with the gate (21 s a joint at r 1 mm) nibbled the rims ragged and left the lines in the middle as
+they were. FILL_RIDGE is 0 (off); the seams field and `flow(ridge=)` stay for a later try. The steps belong to how the lofts are
+laid, not to anything a pass over the surface can tell apart.
+
+One body per joint (2026-11-23, tried and left off: bars.LOFT_MIX). Instead of joining a joint's lofts plainly (the highest
+wins, so two at different depths leave a step), their values were mixed where they overlap: each loft counted by how far inside
+its outline (fully from 0.4 x its side) and how near its slab (fully within, none from 0.25 x its side) a sample is, the mix
+(sum of weight x value + 0.001 x the smallest) / (sum of weights + 0.001), so that by a loft's sides, where no other covers it, the
+surface is its own. Uncapped it carved a loft's side wherever another's face passed near it (the corner of three bars fell into five
+pieces); capped at 0.1 x the side below the smallest value it still left single-sample specks at the corner's outside. On the
+bracket (joints 1, 4, 8, 11, filled as before after it) the steps did not become slopes: the weights' own edges and the cap made
+new creases and notches, joints 1 and 4 most. A mix of distance fields is not a surface that lies between them where they cross at
+an angle. What is left for a joint as one body is to make it from the bars' end sections directly (their convex hull, cut back
+between the bars by each pair's bend), not from the lofts.
+
+A node per joint (2026-11-23, built, shown, off until the user says: bars.LOFT_NODE). A joint of three bars or more as one body made
+from the bars' ends: the convex hull of their cut square ends (4 corners each, scipy's ConvexHull, as planes) gives the joint's
+faces, and the lofts give only its outline (how far a sample lies beside the nearest loft, whatever its height), the rims between
+the two chamfered as a bar's. The lofts' own faces are not used, so there are no steps between them: on all eleven joints of the
+bracket the joint is one surface of flat faces. But it is faceted (the hull's edges are sharp, a low-poly look), and where the bars
+lie in different planes a loft's outline runs through the whole height, so the openings and round bends between bars of another
+plane fill with flat faces (joints 2, 4, 5 most). The corner of three bars: one piece, blocks bit for bit; volume -2% (the hull cuts
+the lofts' outer arcs to chords). `_bars` time unchanged (34 s).
+
+Patched joints (2026-11-23, the user: "have you looked at how the patch tool works in Rhino?"; built, shown, off until the user says:
+nodes_fea.BAR_PATCH, `bars.patches`, `bars._biharmonic`). As Rhino's Patch skins a gap between trimmed surfaces: each lofted joint's
+surface is kept where it is one loft's or bar's alone (the second nearest, `body(seams=True)`, more than PATCH_TRUST 0.5 x the side
+away, within PATCH_BAND 0.27 x the side of the surface, and only kept pieces that run on out of the joint's core: a stranded patch made
+a lump), and the rest of the core is a thin plate through it: the values' biharmonic 0 there (`_biharmonic`, scipy's spsolve on every
+second sample: 0.3-3 s a joint, 25 s for the bracket's `_bars` against 34 with the fill), free in the air, held deep inside (deeper than
+PATCH_INNER 0.42 x the side, and along each bar's middle, the values near the deepest within PATCH_MIDDLE 0.6 x the side). A patch for
+`body` (mode "replace": its samples replace the bars' by a weight, both cubic B-splines), one piece, blocks bit for bit, GPU = CPU.
+What the settings did, on the dumped joints: the whole core free (joint 4 a clean organic node, joint 1 fell into five pieces); a shell of
+2 mm round the surface free (all one piece, but the values just outside the shell keep the steps: ribs on joints 5 and 9); stranded kept
+patches dropped (fewer lumps); deep inside held at 1.5 mm (joints 1, 2, 4 clean, 5 and 9 ribbed) or 2.5 mm (5 and 9 smoother, a thin bar
+of joint 1 fell off); the bars' middles held too (all one piece). In the bracket: joints 4, 1, 2, 6 smooth one-piece nodes; joints 5 and 9
+still bumpy, and where a bar's edge enters the core it is draped into a wide skin (the square section is lost a bar's width before the
+joint). No steps anywhere.
+
+Face by face (2026-11-24, the user: "you have to patch all faces separately"; built, shown, off until the user says: bars.LOFT_FACES).
+A joint of three bars or more from its faces, each its own patch: its upper face one smooth surface through its bars' upper faces, its
+lower one through their lower faces (Shepard's mix of the faces' planes, weights 1 / the distance to the bar's section past its cut to
+the 4th power, so each bar's faces carry on exactly into and past its cut), its sides the lofts' outlines (the bends), the rims as a
+bar's; per joint the plane its bars spread least across, and per bar the face of four that looks most that way; a bar steeper than 45
+degrees to it (a post) keeps its lofts as they are. On a flat joint nothing changes; on a tilted test joint one piece, blocks bit for bit.
+On the bracket, joints 6 and 8 got one clean face without the crossing lines; joints 2, 4 and 5 got ledges and ragged notches by some
+cuts, joint 1 stayed messy. Why: the outline of each loft had to be kept near its own faces (LOFT_FACE_NEAR x the side), since reaching
+to any height (or TALL x the thickness) it crossed the faces' patch away from the bars in single-sample specks that made the part two
+pieces (the node refuses that as "loose"); kept near, where a thick bar (6.6 mm) meets a thin one (4 mm) the thick bar's face carries on
+over the thin bar's loft and is cut off flat there: a ledge. 0.25 ledges, 0.4 fewer, 0.5 specks. Weights to the bars' middle lines
+instead of their sections: a tilted bar's faces did not meet the joint's at the cut and two joints came apart.
+
+The user's verdict (2026-11-24), after one plane, one body (mix), a node, patched joints and face by face: the fill (`bars.fills`, the
+curvature flow, nodes_fea.BAR_FILL) still looks best. It stays the default; LOFT_PLANE, LOFT_NODE, BAR_PATCH and LOFT_FACES stay off.

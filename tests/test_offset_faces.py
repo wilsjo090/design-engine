@@ -300,6 +300,38 @@ def test_tiled_mesh_matches_the_whole_grid(monkeypatch):
                                                                      rel=1e-6)
 
 
+def test_past_a_corner_of_the_moved_face_nothing_is_added():
+    # a plate's side wall moved out: beyond the wall's corners, on the planes that continue its edges
+    # (where a mesher's samples lie when the part's size is a whole number of voxels), the sideways
+    # direction is square to the edge found there. Its sign was then rounding noise, and a sheet of
+    # "inside" values ran out to the band's end: slivers 2.5 mm past the part and a loose speck
+    plate = cad_box((30, 30, 4))
+    plate.apply_translation((15, 15, 2))                # 0..30, 0..30, 0..4
+    field = moved(plate, [0], 1.0)                      # the wall at x = 30, out to 31
+    hair = 4e-16                                        # what 7 x 0.4 - 2.8 leaves of 0
+    for point in [(29.2, hair, 4.4), (29.2, -hair, 4.4), (29.2, 30.8, hair), (29.2, 30.8, -hair), (30.5, 31.0, 4 + hair),
+                  (30.5, 31.0, 4 - 1e-15), (30.5, 30 + 1e-14, 5.0), (30.5, 30 - 1e-14, 5.0), (30.5, 31.0, 2.0)]:
+        assert F.sample(field, point) > 0, point
+    assert F.sample(field, (30.5, 14.0, 1.0)) < 0 < F.sample(field, (31.5, 14.0, 1.0))
+    for voxel in (0.3, 0.4):
+        box, padding = F.mesh_box(field, 2.0, voxel)    # the grid Mesh from Implicit Body lays
+        grid = Grid.from_bounds(box, voxel, padding)
+        mesh = field_to_mesh(F.Context(grid).eval_full(field), grid)
+        report = mesh_report(mesh.vertices, mesh.faces)
+        assert report["open_edges"] == 0 and report["bodies"] == 1
+        lo, hi = mesh.bounds
+        assert np.all(lo > -0.01) and np.all(hi < [31.01, 30.01, 4.01]), (voxel, lo, hi)
+        assert signed_volume(mesh.vertices, mesh.faces) == pytest.approx(30 * 30 * 4 + 30 * 4, rel=5e-3)
+
+
+def test_every_face_chosen_moves_the_whole_body():
+    # no border at all: the patch's border arrays are empty (hashing them for the workers once failed)
+    box = cad_box()
+    field = moved(box, [0, 1, 2, 3, 4, 5], 1.0, sides="round")
+    assert F.sample(field, (10.5, 0, 0)) < 0 < F.sample(field, (11.5, 0, 0))
+    assert F.sample(field, (0, 0, -10.5)) < 0 < F.sample(field, (0, 0, -11.5))
+
+
 # --- meshes: closed, one piece, the volume they should have ----------------------------------------
 @pytest.mark.parametrize("distance, kw, volume", [
     (2.0, {}, 8000 + 64 * 2),
@@ -369,7 +401,7 @@ def test_holes_start_from_the_moved_surface():
     for d in (2.0, -1.0):
         part = moved(plate, [top], d)
         holes = pattern(d)
-        assert len(holes) == 6
+        assert len(holes) == 12        # 4 x 3 in the middle of the face (3 x 2 from the plane's own origin)
         x, y, _ = holes.centre[0]
         through = F.subtract(part, H.cutter(holes))
         assert all(F.sample(through, (x, y, z)) > 0 for z in np.linspace(-0.4, 10 + d + 0.4, 25))

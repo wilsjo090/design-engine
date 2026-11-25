@@ -64,6 +64,12 @@ JOIN = 0.3              # mm: raised shapes reach this much deeper than the face
 FAR = np.float32(1e4)   # the cutter's value away from every hole (outside it)
 PAD = 3                 # voxels around each hole's box computed exactly
 OUTLINE = 64            # points on each outline for webs and margins
+# Pairs of shapes near each other are compared outline against shape, ~17 KB of temporaries per pair: in
+# chunks of WEB_CHUNK (all at once, 55k pairs took 0.95 GB), and above CROWD_PAIRS per shape the pattern is
+# refused: a Spacing far below the Size (0.5 mm with 4 mm holes: ~9,600 shapes, millions of pairs, 2.8 GB
+# within seconds) is a slip of the hand, not a pattern.
+WEB_CHUNK = 20_000
+CROWD_PAIRS = 40
 RAYS = 8                # extra wall-thickness rays around each hole's outline
 # what cells of a regular layout (Randomness 0) all are: Voronoi cells of the staggered (honeycomb)
 # layout look exactly like Shape hexagon, so picking voronoi alone seems to change nothing
@@ -273,7 +279,9 @@ def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD
             check()
         part = _face_holes(holes, face, V, Fc[tri], corner_uv, period, layout, sx, sy,
                            axis, angle, offset, randomness, seed, inset, check, alternate,
-                           cell_shape.kind if cells else None, name=name, flat=flat)
+                           cell_shape.kind if cells else None, name=name, flat=flat,
+                           clear=margin + max(k.size for k in shapes) / 2,
+                           anchor=_largest_face(V, Fc, ids, tri) if flat else None)
         if part is not None:
             parts.append(part)
     if not parts:
@@ -328,9 +336,6 @@ def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD
     near_border = _near_border(holes, border, margin)
     holes.take(~near_border)
     scattered = (isinstance(randomness, Field) or randomness > 0) and not cells
-    twice, too_close, crowded, overlaps = _crowded(holes, spacing, scattered=scattered)
-    holes.take(~(twice | too_close | crowded))
-
     # each shape's pocket depth or height: a number, or a field read at its centre
     amount, unset, label = None, 0, "Height" if raised else "Depth"
     source = height if raised else depth if pockets else None
@@ -339,6 +344,14 @@ def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD
             amount = np.nan_to_num(read_at(source, holes.centre, check))
         else:
             amount = np.full(len(holes), float(source))
+    # how far each shape reaches into the wall, to tell shapes on the two faces of a wall apart: a pocket
+    # its depth, raised shapes and a relief (at most half the wall) nothing; through holes all the way
+    reach = np.maximum(amount, 0.0) if pockets else np.zeros(len(holes)) if standing else None
+    twice, too_close, crowded, overlaps = _crowded(holes, spacing, scattered=scattered, reach=reach)
+    stay = ~(twice | too_close | crowded)
+    holes.take(stay)
+    if source is not None:
+        amount = amount[stay]
         zero = amount <= 1e-3
         unset = int(zero.sum())
         holes.take(~zero)
@@ -364,7 +377,8 @@ def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD
     described = shape.describe() if morph_to is None else f"{shape.describe()} morphing into {morph_to.describe()}"
     msg = f"{n} {what} ({described}) on {len(chosen)} face{'s' if len(chosen) != 1 else ''}"
     dropped = [(int(near_border.sum()), f"near the border (Edge margin {margin:g} mm)"),
-               (int(too_close.sum()), f"too close to {what} on a neighbouring face"),
+               (int(too_close.sum()), f"too close to {what} on a neighbouring face (or meeting those on the wall's "
+                                      f"other face)" if pockets else f"too close to {what} on a neighbouring face"),
                (int(crowded.sum()), "moved too close to a neighbour by Randomness"),
                (int(no_wall.sum()), "with no wall behind them"),
                (none_scaled, "with Size scale 0"),
@@ -381,17 +395,19 @@ def place(mesh, chosen, shape, layout="staggered", spacing=6.0, align="as in CAD
     if overlaps:
         holes.note(f"{overlaps} pairs of {what} overlap: increase Spacing or reduce Size", "error")
     if holes.smallest_web is not None and n > 1:
-        level = "error" if holes.smallest_web < MIN_WEB else "info"
+        # advice, not a failure (a knurl's ridges meet on purpose; shipped presets logged red errors on
+        # their own defaults, and 0.80 mm counted as under 0.8)
+        level = "warning" if holes.smallest_web < MIN_WEB - 1e-6 else "info"
         gap = "narrowest gap between shapes" if standing else "thinnest web between holes"
         holes.note(f"{gap} {holes.smallest_web:.2f} mm"
                    + (f" (under {MIN_WEB:g} mm: {'hard to print' if standing else 'fragile'})"
-                      if level == "error" else ""), level)
+                      if level == "warning" else ""), level)
     if n:
         sizes = holes.widths()
         small = int((sizes < MIN_HOLE).sum())
         if small:
             why = "fragile" if standing else "hard to print and to clear of powder"
-            holes.note(f"{small} {what} are under {MIN_HOLE:g} mm across ({why})", "error")
+            holes.note(f"{small} {what} are under {MIN_HOLE:g} mm across ({why})", "warning")
         # the shapes under MIN_HOLE are reported above: a fade (Size scale) shrinking shapes to nothing
         # would otherwise ask for a voxel of a few hundredths of a mm
         printable = sizes[sizes >= MIN_HOLE]
@@ -478,9 +494,56 @@ def _jacobians(P, UV):
     return ok, Ju, Jv, cross, area
 
 
+def _largest_face(V, F, ids, tri):
+    """Which of the triangles `tri` belong to the CAD face with the most area among them (a sheet of joined
+    faces is centred on it, so that face's pattern is the same joined or not)."""
+    corners = V[F[tri]]
+    area = np.linalg.norm(np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1)
+    faces, inverse = np.unique(ids[tri], return_inverse=True)
+    return inverse == int(np.argmax(np.bincount(inverse, weights=area)))
+
+
+START_PIXELS = 16        # per step: how finely `_start` draws the face to count the points that fit
+START_TRIANGLES = 150_000
+
+
+def _start(X, Y, box, layout, sx, sy, clear, wrap):
+    """Where a grid or staggered lattice starts so that it sits in the middle of the face: (x, y) of one
+    of its points, in the pattern's frame. Along each direction a point in the middle of the face's box
+    or the middle between two, whichever lets the most points lie at least `clear` inside the face
+    (counted on a drawing of the face's triangles, X and Y (k, 3): a turned pattern on a plate, or a face
+    with a hole in its middle, cannot be told from the box alone). Not along a direction the face closes
+    around in (`wrap`): its cells are fitted there, and the halves of a split cylinder must meet."""
+    from PIL import Image, ImageDraw
+    from scipy import ndimage
+    choices = [[0.0] if wrap[k] else [(box[k] + box[k + 2]) / 2, (box[k] + box[k + 2]) / 2 + step / 2]
+               for k, step in ((0, sx), (1, sy))]
+    starts = [(a, b) for a in choices[0] for b in choices[1]]
+    if len(starts) == 1 or len(X) > START_TRIANGLES:
+        return starts[0]
+    scale = min(START_PIXELS / min(sx, sy), 2000.0 / max(box[2] - box[0], box[3] - box[1], 1e-9))
+    pad = 2
+    size = (int((box[2] - box[0]) * scale) + 2 * pad + 1, int((box[3] - box[1]) * scale) + 2 * pad + 1)
+    image = Image.new("1", size, 0)
+    draw = ImageDraw.Draw(image)
+    px, py = (X - box[0]) * scale + pad, (Y - box[1]) * scale + pad
+    for k in range(len(X)):
+        draw.polygon([(px[k, 0], py[k, 0]), (px[k, 1], py[k, 1]), (px[k, 2], py[k, 2])], fill=1, outline=1)
+    inside = ndimage.distance_transform_edt(np.asarray(image, dtype=bool)) / scale >= max(clear, 1.0 / scale)
+    best, most = starts[0], -1
+    for start in starts:
+        x, y, *_ = P2.lattice(layout, sx, sy, box, origin=start, wrap=tuple(wrap))
+        col = np.clip(np.rint((x - box[0]) * scale + pad).astype(np.int64), 0, size[0] - 1)
+        row = np.clip(np.rint((y - box[1]) * scale + pad).astype(np.int64), 0, size[1] - 1)
+        count = int(inside[row, col].sum())
+        if count > most:
+            best, most = start, count
+    return best
+
+
 def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle, offset, randomness=0.0, seed=0,
                 inset=None, check=None, alternate="none", cell_kind=None, name=None, flat=False, girth=None,
-                footprint=None, margin=0.0, height=0.0):
+                footprint=None, margin=0.0, height=0.0, clear=0.0, anchor=None):
     """Centres, axes and frames of the holes on one CAD face (corners: (k, 3) vertex numbers of its
     triangles, UV: (k, 3, 2) their surface parameters), with `inset` (Voronoi) each one's cell
     (unit polygons in its frame) or None, and how much each one grows with the face's girth (1
@@ -572,8 +635,18 @@ def _face_holes(holes, face, V, corners, UV, period, layout, sx, sy, axis, angle
         box = (X.min(), Y.min(), X.max(), Y.max())
         centroid = (np.sum(tw * X.ravel()) / tw.sum(), np.sum(tw * Y.ravel()) / tw.sum())
         reach = 2 * max(fsx, fsy)   # a Voronoi cell at the face's edge needs its neighbours beyond it
+        # The lattice sits in the middle of the face (of the sheet of joined faces): until 2026-11-10 it
+        # started at the CAD surface's own origin, so a plate got margins of 4.5 and 2.5 mm, whichever way
+        # its sketch happened to lie. Not along a direction the face closes around in (its cells are fitted
+        # there, and a split cylinder's halves must meet). `clear`: what a shape needs from the border.
+        if layout in ("rings", "spiral"):
+            start = (0.0, 0.0)
+        else:  # (`anchor`: the triangles of a sheet's largest face)
+            pick = anchor[ok] if anchor is not None and anchor[ok].any() else np.ones(len(X), dtype=bool)
+            start = _start(X[pick], Y[pick], (X[pick].min(), Y[pick].min(), X[pick].max(), Y[pick].max()),
+                           layout, fsx, fsy, clear, wrap)
         try:
-            x, y, turn, li, lj = P2.lattice(layout, fsx, fsy, box, origin=offset,
+            x, y, turn, li, lj = P2.lattice(layout, fsx, fsy, box, origin=(offset[0] + start[0], offset[1] + start[1]),
                                             center=(centroid[0] + offset[0], centroid[1] + offset[1]),
                                             pad=(reach if inset is not None else 0.0) + (0.5 * reach if varies else 0.0),
                                             randomness=0.0 if varies else randomness, seed=seed, wrap=tuple(wrap))
@@ -1018,35 +1091,51 @@ def _near_border(holes, border, margin):
     return closest < margin - 1e-9
 
 
-def _crowded(holes, spacing, scattered=False):
+def _crowded(holes, spacing, scattered=False, reach=None):
     """(holes found twice, holes too close to a hole from another face, holes Randomness moved too
     close to a neighbour, pairs that overlap), the first three as masks of holes to drop. Found
     twice: on both ends of a cylinder's seam, or on two faces sharing one surface. Overlapping
     holes on one face are a setting to fix, so they stay (and are counted), unless `scattered`.
-    Also sets holes.smallest_web."""
+    `reach`: how far each shape goes into the wall, mm (None: all the way, through holes). Shapes on
+    the two faces of a wall, back to back, then only count as too close when they meet inside it: seen
+    along their axes they lie on top of each other, and 2 mm pockets on both faces of a 6 mm plate lost
+    every pocket of one face (2026-10-20, item 8). Also sets holes.smallest_web."""
     n = len(holes)
     twice, close, crowded = (np.zeros(n, dtype=bool) for _ in range(3))
     if n < 2:
         return twice, close, crowded, 0
     r = holes.radius() * holes.scale
-    pairs = cKDTree(holes.centre).query_pairs(2 * r.max() + max(spacing, MIN_WEB), output_type="ndarray")
+    tree, near = cKDTree(holes.centre), 2 * r.max() + max(spacing, MIN_WEB)
+    if n > 200 and (int(tree.count_neighbors(tree, near)) - n) // 2 > CROWD_PAIRS * n:
+        raise HoleError(f"the shapes lie far too close: {n:,} of them {2 * r.max():.3g} mm across, each with over "
+                        f"{2 * CROWD_PAIRS} others within reach. Spacing is the distance between their centres: "
+                        f"it should be more than their size")
+    pairs = tree.query_pairs(near, output_type="ndarray")
     if not len(pairs):
         return twice, close, crowded, 0
     i, j = pairs[:, 0], pairs[:, 1]
     gap = np.linalg.norm(holes.centre[i] - holes.centre[j], axis=1)
-    web = np.minimum(_web(holes, i, j), _web(holes, j, i))
+    web = np.concatenate([np.minimum(_web(holes, i[s:s + WEB_CHUNK], j[s:s + WEB_CHUNK]),
+                                     _web(holes, j[s:s + WEB_CHUNK], i[s:s + WEB_CHUNK]))
+                          for s in range(0, len(pairs), WEB_CHUNK)])
     same = holes.face[i] == holes.face[j]
     dup = gap < 1e-3 * holes.shape.size
     within = web[same & ~dup]
     limit = min(MIN_WEB, float(within.min())) if len(within) else MIN_WEB
     why = np.where(dup, 0, np.where(same, 2, 1))     # which mask a dropped hole goes to
-    bad = dup | (~same & (web < limit - 1e-9)) | (same & scattered & (web < MIN_WEB))
+    apart = np.zeros(len(pairs), dtype=bool)
+    if reach is not None:
+        back_to_back = np.einsum("ij,ij->i", holes.normal[i], holes.normal[j]) < -0.7
+        between = holes.centre[j] - holes.centre[i]
+        wall = np.minimum(-np.einsum("ij,ij->i", between, holes.normal[i]), np.einsum("ij,ij->i", between, holes.normal[j]))
+        apart = ~same & back_to_back & (wall - reach[i] - reach[j] >= MIN_WEB)
+    bad = dup | (~same & ~apart & (web < limit - 1e-9)) | (same & scattered & (web < MIN_WEB))
     masks = (twice, close, crowded)
     gone = np.zeros(n, dtype=bool)
     for a, b, k in sorted(zip(i[bad], j[bad], why[bad])):
         if not (gone[a] or gone[b]):
             masks[k][max(a, b)] = gone[max(a, b)] = True
-    kept = ~gone[i] & ~gone[j]
+    kept = ~gone[i] & ~gone[j] & ~apart
     holes.smallest_web = float(web[kept].min()) if kept.any() else None
     return twice, close, crowded, int((kept & same & (web < 0)).sum())
 
@@ -1153,7 +1242,7 @@ class _Shapes:
 
     def key(self, *extra):
         second = None if self.shape_b is None else self.shape_b.key()
-        h = hashlib.sha1(repr((self.shape.key(), second) + extra).encode())
+        h = hashlib.sha1(repr((self.shape.key(), second, "float32") + extra).encode())
         for a in self.arrays + [a for a in (self.cells, self.morph) if a is not None]:
             h.update(a.tobytes())
         return h.hexdigest()
@@ -1177,10 +1266,13 @@ class _Shapes:
         """For every shape whose box touches the grid: (shape number, slices of the grid, distance
         across (mm: the 2D shape's signed distance), distance along its axis), on the samples in its
         box plus PAD samples or `reach` mm, whichever is more. Positions come from the global sample
-        index: the same in every block, bit for bit."""
+        index: the same in every block, bit for bit. In float32 (the fields are float32; positions are taken
+        from the shape's centre in float64 first, so they are good to ~1e-6 mm), the turn and the scale folded
+        into the two directions across: three sums per sample instead of five and a turn."""
         centre, normal, t1, t2, scale, turn, _, _ = self.arrays
         if not len(centre):
             return
+        f32 = np.float32
         start = np.asarray(grid.start)
         pad = max(PAD * grid.voxel, float(reach))
         first = np.ceil((self.lo - pad - grid.base) / grid.voxel).astype(np.int64) - start   # sample indices
@@ -1189,15 +1281,19 @@ class _Shapes:
         axes = grid.axes()
         for k in np.flatnonzero(np.all(last > first, axis=1)):
             i0, i1 = first[k], last[k]
-            x = axes[0][i0[0]:i1[0], None, None] - centre[k, 0]
-            y = axes[1][None, i0[1]:i1[1], None] - centre[k, 1]
-            z = axes[2][None, None, i0[2]:i1[2]] - centre[k, 2]
-            a = x * t1[k, 0] + y * t1[k, 1] + z * t1[k, 2]
-            b = x * t2[k, 0] + y * t2[k, 1] + z * t2[k, 2]
-            along = x * normal[k, 0] + y * normal[k, 1] + z * normal[k, 2]
+            x = (axes[0][i0[0]:i1[0]] - centre[k, 0]).astype(f32)[:, None, None]
+            y = (axes[1][i0[1]:i1[1]] - centre[k, 1]).astype(f32)[None, :, None]
+            z = (axes[2][i0[2]:i1[2]] - centre[k, 2]).astype(f32)[None, None, :]
             c, s = math.cos(turn[k]), math.sin(turn[k])
-            u, v = (a * c + b * s) / scale[k], (b * c - a * s) / scale[k]
-            across = self._unit(k, u, v) * scale[k]
+            # (Python floats: a NumPy float64 scalar would make every float32 array float64 again)
+            size = float(scale[k])
+            du = [float(w) for w in (t1[k] * c + t2[k] * s) / size]
+            dv = [float(w) for w in (t2[k] * c - t1[k] * s) / size]
+            n = [float(w) for w in normal[k]]
+            u = x * du[0] + y * du[1] + z * du[2]
+            v = x * dv[0] + y * dv[1] + z * dv[2]
+            along = x * n[0] + y * n[1] + z * n[2]
+            across = self._unit(k, u, v) * size
             yield k, tuple(slice(i0[d], i1[d]) for d in range(3)), across, along
 
 
@@ -1213,7 +1309,7 @@ def cutter(holes, reach=0.0):
     def fn(ctx):
         out = np.full(ctx.grid.shape, FAR, dtype=np.float32)
         for k, box, across, along in data.around(ctx.grid, reach):
-            value = np.maximum(across, np.maximum(along - outer[k], -depth[k] - along)).astype(np.float32)
+            value = np.maximum(across, np.maximum(along - float(outer[k]), -float(depth[k]) - along)).astype(np.float32)
             block = out[box]
             np.minimum(block, value, out=block)
         return ctx.xp.asarray(out)
@@ -1246,8 +1342,8 @@ def relief(holes, softness, band):
                 t = np.clip(-across / soft, 0.0, 1.0)
                 value = t * t * (3 - 2 * t)
             else:
-                value = (across < 0).astype(np.float64)
-            value = np.where((along <= band) & (along >= -inner[k]), value, 0.0).astype(np.float32)
+                value = (across < 0).astype(np.float32)
+            value = np.where((along <= band) & (along >= -float(inner[k])), value, 0.0).astype(np.float32)
             block = out[box]
             np.maximum(block, value, out=block)
         return ctx.xp.asarray(out)

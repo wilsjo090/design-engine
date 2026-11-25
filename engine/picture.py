@@ -30,11 +30,21 @@ class PictureError(ValueError):
 
 def load_image(path):
     """Darkness 0..1 of a picture file (float32, rows from the top), scaled down to MAX_PIXELS."""
-    from PIL import Image
+    from PIL import Image, ImageOps
+    if not str(path or "").strip():
+        raise PictureError("choose a picture file (Path)")
     try:
         image = Image.open(path)
+        image = ImageOps.exif_transpose(image)       # a phone's photo: turned as its viewer shows it
     except (OSError, ValueError) as err:
         raise PictureError(f"cannot read the picture {path}: {err}") from err
+    if image.mode.startswith("I") or image.mode == "F":   # 16-bit greys: PIL's own conversion clips them to white
+        deep = np.asarray(image, dtype=np.float32)
+        if image.mode == "F":
+            top = max(float(deep.max()), 1.0)
+        else:
+            top = 65535.0 if deep.max() > 255 else 255.0
+        image = Image.fromarray(np.clip(deep / top * 255.0, 0, 255).astype(np.uint8), "L")
     if image.mode in ("RGBA", "LA", "P"):   # transparent parts count as white
         image = image.convert("RGBA")
         white = Image.new("RGBA", image.size, (255, 255, 255, 255))
@@ -119,6 +129,7 @@ class Placement:
         area = 0.5 * np.linalg.norm(cross, axis=1)
         normals = cross / np.maximum(2 * area, 1e-300)[:, None]
         self.centre = (area[:, None] * P.mean(axis=1)).sum(axis=0) / area.sum()
+        middles = P.mean(axis=1)
         if mapping == "auto":
             kinds = np.asarray(mesh.metadata.get("cad_surfaces", np.zeros((0, 3))))
             round_face = any(f < len(kinds) and int(kinds[f][0]) in ROUND_SURFACES for f in chosen)
@@ -137,9 +148,14 @@ class Placement:
             self.normal = n
             self.right = right * math.cos(a) + up * math.sin(a)
             self.up = up * math.cos(a) - right * math.sin(a)
+            front = int(np.argmin(np.linalg.norm(middles - self.centre, axis=1)))
         else:
             # the axis: the direction the normals of a cylinder or cone are (nearly) square to
             w, vecs = np.linalg.eigh((normals * area[:, None]).T @ normals)
+            if w[1] < 1e-6 * w[2]:   # every normal the same way: its circle was fitted to nothing, the picture
+                # landed far off the face, and the field was 0 everywhere without a word
+                raise PictureError("Mapping around needs a round face (a cylinder or cone); this one is flat: use "
+                                   "Mapping flat (or auto)")
             axis = vecs[:, 0]
             if axis[np.argmax(np.abs(axis))] < 0:
                 axis = -axis
@@ -166,6 +182,26 @@ class Placement:
             self.toward = toward / np.linalg.norm(toward)
             self.height = float((self.centre - self.origin) @ axis)
             self.turn = (math.cos(a), math.sin(a))   # the picture turned on the (unrolled) surface
+            at = self.origin + self.height * axis + self.radius * self.toward
+            front = int(np.argmin(np.linalg.norm(middles - at, axis=1)))
+        # where the picture's middle lies on the faces, and the face's outward direction there (`wall`)
+        self.anchor = (middles[front], normals[front])
+
+    def signature(self):
+        """Everything that places the picture, as plain numbers for the field's key (the angle was missing:
+        two pictures that differed only in Angle were one field)."""
+        parts = ((self.centre, self.normal, self.right, self.up) if self.mapping == "flat" else
+                 (self.centre, self.axis, self.origin, [self.radius, self.height], self.toward, self.turn))
+        return (self.mapping,) + tuple(round(float(v), 9) for part in parts for v in np.ravel(part))
+
+    def wall(self, mesh):
+        """Wall thickness under the picture's middle, mm (inf where a ray finds no far side)."""
+        from .checks import ray_thickness  # Warp: only needed here
+        V, F = np.asarray(mesh.vertices, dtype=np.float64), np.asarray(mesh.faces)
+        point, normal = self.anchor
+        reach = float(np.linalg.norm(np.ptp(V, axis=0))) * 1.1 + 1.0
+        found = float(ray_thickness(V, F, point[None], normal[None], reach)[0])
+        return found if np.isfinite(found) and found > 0 else math.inf
 
     def coordinates(self, x, y, z):
         """(across, up, off the face) in mm for points (broadcastable arrays)."""
@@ -183,13 +219,16 @@ class Placement:
         return s * c + t * k, t * c - s * k, np.sqrt(a * a + b * b) - self.radius
 
 
-def picture_field(placement, darkness, width, offset=(0.0, 0.0), invert=False, band=2.0, key=""):
+def picture_field(placement, darkness, width, offset=(0.0, 0.0), invert=False, band=2.0, key="", depth=None):
     """Field 0..1: the picture (darkness, rows from the top) `width` mm wide (its height follows its
-    proportions), centred on the placement plus `offset`, within `band` mm of the face; 0 elsewhere."""
+    proportions), centred on the placement plus `offset`, within `band` mm of the face, and no deeper
+    under it than `depth` (None: band; the nodes give half the wall, so a Band over a thin wall does not
+    print the picture on its far side as well); 0 elsewhere."""
     rows, cols = darkness.shape
     height = width * rows / cols
     image = Shared(np.ascontiguousarray(darkness, dtype=np.float32))
     ox, oy, band, width = float(offset[0]), float(offset[1]), float(band), float(width)
+    depth = band if depth is None else min(float(depth), band)
 
     def fn(ctx):
         grid = ctx.grid
@@ -198,7 +237,7 @@ def picture_field(placement, darkness, width, offset=(0.0, 0.0), invert=False, b
         s, t, off = np.broadcast_arrays(s, t, off)
         u = ((s - ox) / width + 0.5) * (cols - 1)            # pixel column, row (row 0 at the top)
         v = (0.5 - (t - oy) / height) * (rows - 1)
-        inside = (u >= 0) & (u <= cols - 1) & (v >= 0) & (v <= rows - 1) & (np.abs(off) <= band)
+        inside = (u >= 0) & (u <= cols - 1) & (v >= 0) & (v <= rows - 1) & (off <= band) & (off >= -depth)
         u0 = np.clip(np.floor(u), 0, cols - 2).astype(np.int64)
         v0 = np.clip(np.floor(v), 0, rows - 2).astype(np.int64)
         fu, fv = np.clip(u - u0, 0, 1), np.clip(v - v0, 0, 1)
@@ -209,8 +248,8 @@ def picture_field(placement, darkness, width, offset=(0.0, 0.0), invert=False, b
             value = 1.0 - value
         return ctx.xp.asarray(np.where(inside, value, 0.0).astype(np.float32))
     digest = hashlib.sha1(np.ascontiguousarray(darkness).tobytes()).hexdigest()
-    field = Field(fn, _digest("picture", key, digest, width, ox, oy, bool(invert), band,
-                              placement.mapping, tuple(np.round(placement.centre, 9))),
+    field = Field(fn, _digest("picture", key, digest, width, ox, oy, bool(invert), band, depth,
+                              placement.signature()),
                   "picture", range=(0.0, 1.0))
     reach = math.hypot(width, height) / 2 + abs(ox) + abs(oy) + band
     field.extent = (placement.centre - reach, placement.centre + reach)

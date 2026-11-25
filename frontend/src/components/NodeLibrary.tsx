@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useReactFlow } from '@xyflow/react'
 import { api } from '../api'
-import { useStore } from '../store'
+import { clearSpot, useStore } from '../store'
 import type { NodeSpec, PortSpec } from '../types'
 import { CATEGORY_COLORS, GROUP_PREFIX, TYPE_COLORS } from '../types'
 
@@ -81,15 +81,10 @@ function presetEntry(p: PresetInfo): Entry {
   }
 }
 
-/** A position for a new node: `at`, moved down and right while another node already sits there. */
+/** A position for a new node: `at`, moved down until it overlaps no card already there (it only stepped
+ *  aside from a card whose corner was within 30 px, and so landed on top of the others). */
 function freeSpot(at: { x: number; y: number }) {
-  const nodes = useStore.getState().nodes
-  const spot = { ...at }
-  for (let i = 0; i < 40 && nodes.some((n) => Math.hypot(n.position.x - spot.x, n.position.y - spot.y) < 30); i++) {
-    spot.x += 40
-    spot.y += 40
-  }
-  return spot
+  return clearSpot(at, useStore.getState().nodes)
 }
 
 /** Add what a library tile stands for (a node type id, or "preset:<name>") with its corner at `at`

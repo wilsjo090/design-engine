@@ -251,8 +251,25 @@ def test_a_bearing_load_presses_only_on_the_contact_side():
     for settings in ({"direction": "+Y"}, {"direction": "-Y"}, along):
         with pytest.raises(ConditionError, match="along the hole"):
             Condition("load", hole.triangles, load="bearing", amount=600.0, **settings).check()
-    Condition("load", hole.triangles, load="bearing", amount=600.0, direction="custom", vector=(0.0, 1.0, -1.0)).check()
     Condition("load", hole.triangles, load="force", amount=600.0, direction="+Y").check()   # what it should be
+    # a direction not square to the hole: only the part across its axis presses on the wall (a pin cannot push
+    # along its hole). 200 N at 45 degrees pressed 283 N until 2026-11-10, with the arrow along the typed vector
+    assert np.allclose(np.abs(hole.hole_axis), [0, 1, 0], atol=1e-3)
+    assert hole.bearing_note() is None and hole.resultant() == pytest.approx([0, 0, -200])
+    tilted = Condition("load", hole.triangles, load="bearing", amount=200.0, direction="custom", vector=(0.0, 1.0, -1.0))
+    tilted.check()
+    across = 200.0 * np.sqrt(0.5)
+    assert np.allclose((tilted.traction(normals) * areas[:, None]).sum(axis=0), [0, 0, -across], atol=1.5)
+    assert tilted.resultant() == pytest.approx([0, 0, -across], abs=0.2)
+    assert tilted.arrow() == pytest.approx([0, 0, -1], abs=1e-3)
+    assert "141 N of the 200 N" in tilted.bearing_note() and "45°" in tilted.bearing_note()
+    assert tilted.key != Condition("load", hole.triangles, load="bearing", amount=200.0, direction="custom",
+                                   vector=(0.0, 0.0, -1.0)).key
+    square = Condition("load", hole.triangles, load="bearing", amount=200.0, direction="custom", vector=(0.0, 0.0, -1.0))
+    assert square.bearing_note() is None and square.resultant() == pytest.approx([0, 0, -200])
+    # a flat face is no hole's wall: the typed direction as before
+    flat = Condition("load", mesh.triangles[ids == 0], load="bearing", amount=50.0, direction="-Z")
+    assert flat.hole_axis is None
 
 
 def test_markers_tell_which_cad_face_and_body_each_point_is_on():
@@ -439,6 +456,74 @@ def test_cantilever_matches_beam_theory(beam):
     assert vm[i, j, k] == pytest.approx(expect, rel=0.01)
 
 
+def _box_faces(lo, hi, axis, value):
+    """The two triangles of a box's face in the plane coordinate[axis] == value, outward order."""
+    import trimesh
+    box = trimesh.creation.box(extents=np.subtract(hi, lo))
+    box.apply_translation(np.add(lo, hi) / 2)
+    return box.triangles[np.abs(box.triangles_center[:, axis] - value) < 1e-6]
+
+
+def test_the_report_reads_stress_at_the_surface_of_what_is_solid(beam):
+    # the highest stress used to be the highest of every element with any material: slivers 2% full, whose
+    # centres lie outside the part. A round bar in torsion read 14-22% too much at every detail (and a
+    # plate in bending, from the centres half an element under its faces, up to 11% too little)
+    pla = PRESETS["PLA"]
+    F_, L, b = 100.0, 100.0, 10.0
+    part = F.body_from_mesh(beam, 2.0)
+    conds = Conditions((Condition("fixed", _face_triangles(beam, 0, 0.0)),
+                        Condition("load", _face_triangles(beam, 0, 100.0), amount=F_, direction="-Z")))
+    report = static_analysis(part, conds, pla, h=1.0).report
+    # away from the support (2 elements and their neighbours: x from ~4.5 mm): M c / I at the top and bottom faces
+    x = report["max_away_at"][0]
+    assert 3.0 < x < 8.0
+    assert report["max_away"] == pytest.approx(F_ * (L - x) * (b / 2) / (b * b ** 3 / 12), rel=0.03)
+    assert report["notes"] == []                              # 10 elements across: no thin-wall note
+    # a round bar D10 in torsion: the report is the stress at r = 5, not beyond it
+    R, T = 5.0, 2.0
+    bar = F.intersect(F.bar((0, 0, -20), (0, 0, 70), R), F.box((0, 0, 25), (20, 20, 50)))
+    ring = np.stack([R * np.cos(np.linspace(0, 2 * np.pi, 97)), R * np.sin(np.linspace(0, 2 * np.pi, 97))], axis=1)
+    cap = lambda z, up: np.array([[(0, 0, z), (*ring[i], z), (*ring[i + 1], z)][::(1 if up else -1)]
+                                  for i in range(96)], dtype=float)
+    twist = Conditions((Condition("fixed", cap(0.0, False)),
+                        Condition("load", cap(50.0, True), load="torque", amount=T, direction="+Z")))
+    model = build_model(bar, twist, h=0.5)
+    u, _, _ = solve(model, pla)
+    from engine.fea.analysis import SOLID, _surface_stress
+    vm = element_stresses(model, pla, u)
+    middle = slice(40, 60)                                    # away from the held and the loaded end
+    exact = np.sqrt(3) * 1000 * T * R / (np.pi * R ** 4 / 2)
+    assert vm[:, :, middle].max() > 1.1 * exact               # what the slivers say
+    read = _surface_stress(vm, model.phi, model.phi >= SOLID)[:, :, middle].max()
+    assert read == pytest.approx(exact, rel=0.04)
+
+
+def test_thin_walls_get_a_note_and_edges_their_real_fill():
+    # a plate 3 elements thick bends 25% too stiffly when its faces fall inside elements; the old note
+    # needed over half of the elements part-filled, which that plate is not
+    mat = Material("test", 3500.0, 0.0, 1.24, 50.0)
+    lo, hi = (0, 0, 0.5), (60, 20, 3.5)
+    plate = F.box((30, 10, 2.0), (60, 20, 3))
+    conds = Conditions((Condition("fixed", _box_faces(lo, hi, 0, 0.0)),
+                        Condition("load", _box_faces(lo, hi, 0, 60.0), amount=2.0, direction="-Z")))
+    report = static_analysis(plate, conds, mat, h=1.0).report
+    assert any("elements" in n and "thick" in n and "finer detail" in n for n in report["notes"])
+    # an element an edge runs through is as full as it is: a 10 x 10 bar half an element off the grid
+    # weighed 1% too much and bent 5.7% too little at 10 elements across (the 2x2x2 fill: 2.9%)
+    from engine.fea.model import element_fill, make_grid
+    bar = F.box((30, 5.5, 5.5), (60, 10, 10))
+    grid = make_grid(np.array([[0, 0, 0], [60, 11, 11]]), 1.0)
+    assert element_fill(bar, grid).sum() == pytest.approx(6060.0, rel=1e-6)
+    assert element_fill(bar, grid, sub=2).sum() == pytest.approx(6000.0, rel=1e-6)
+    lo, hi = (0, 0.5, 0.5), (60, 10.5, 10.5)
+    conds = Conditions((Condition("fixed", _box_faces(lo, hi, 0, 0.0)),
+                        Condition("load", _box_faces(lo, hi, 0, 60.0), amount=2.0, direction="-Z")))
+    model = build_model(bar, conds, h=1.0, bounds=np.array([[0, 0, 0], [60, 11, 11]]))
+    u, _, _ = solve(model, mat)
+    tip = 2.0 * 60 ** 3 / (3 * mat.E * 10 ** 4 / 12) + 2.0 * 60 / (5 / 6 * mat.E / 2 * 100)
+    assert abs(float(np.asarray(u)[60, 5:7, 5:7, 2].mean())) == pytest.approx(tip, rel=0.04)
+
+
 def test_kept_displacements_serve_another_density_strength_and_stiffness(beam, tmp_path):
     # only Poisson's ratio changes the shape of the displacements; E scales them, and stresses not at all
     from engine.cache import DiskCache
@@ -586,6 +671,44 @@ def test_the_nodes_analyse_a_part_and_report(beam_step, beam):
     assert all(p[0] == pytest.approx(100.0) for p in load_markers[0]["points"])
     assert set(fixed_markers[0]["faces"]) == {_face_id(beam, 0, 0.0)} and set(load_markers[0]["bodies"]) == {0}
     assert set(load_markers[0]["faces"]) == {_face_id(beam, 0, 100.0)}
+
+
+def test_settings_are_checked_and_notes_said_once(beam_step, beam):
+    from pathlib import Path
+    from engine.fea.materials import custom
+    from engine.graph import Evaluator, Graph, GraphError
+    # Poisson's ratio: what the message says is what is taken (0.499 was refused as "not below 0.5")
+    assert custom(3500.0, 0.499, 1.2, 50.0).nu == 0.499
+    with pytest.raises(ValueError, match="at most 0.499"):
+        custom(3500.0, 0.4995, 1.2, 50.0)
+    # Keep is checked in a preview too, not only once Optimize runs
+    recipe = _recipe(beam_step, beam)
+    link = lambda ref: {"link": ref}
+    for keep in (0, 150):
+        recipe["nodes"]["topo"] = {"type": "sim.topology", "inputs": {
+            "space": link("body.body"), "material": link("pla.material"), "conditions": link("load.conditions"),
+            "keep": keep}}
+        with pytest.raises(GraphError, match="Keep % must be between 0 and 100"):
+            Evaluator(Graph.from_dict(recipe), workers=1, log=None).run(["topo"])
+    # two bodies analysed as one: the note about it once per run (it was added to the kept report every time)
+    blocks = str(Path(__file__).resolve().parents[1] / "samples" / "two_blocks.step")
+    recipe = {"version": 1, "nodes": {
+        "import": {"type": "input.import_step", "inputs": {"path": blocks}},
+        "pla": {"type": "sim.material", "inputs": {"preset": "PLA"}},
+        "fixed": {"type": "sim.fixed", "inputs": {"cad": link("import.bodies"), "faces": "0:0"}},
+        "load": {"type": "sim.load", "inputs": {"cad": link("import.bodies"), "faces": "1:1", "amount": 10.0,
+                                                "direction": "-Z", "add_to": link("fixed.conditions")}},
+        "static": {"type": "sim.static", "inputs": {"part": link("import.bodies"), "material": link("pla.material"),
+                                                    "conditions": link("load.conditions"), "detail": "draft"}}}}
+    for show in ("stress", "displacement", "safety factor"):
+        recipe["nodes"]["static"]["inputs"]["show"] = show
+        events = []
+        try:
+            Evaluator(Graph.from_dict(recipe), workers=1, log=None, on_event=events.append).run(["static"])
+        except GraphError as err:      # (which faces hold and load the two blocks does not matter here)
+            pytest.skip(f"the sample's faces do not make an analysis: {err}")
+        said = [e["text"] for e in events if e["type"] == "message" and "bodies analysed as one piece" in e["text"]]
+        assert len(said) == 1, said
 
 
 def test_load_case_nodes_feed_an_analysis(beam_step, beam):

@@ -23,9 +23,19 @@ from .model import (MAX_COARSE, MAX_COARSE_STATIC, ConditionError, active_nodes,
                     element_size, estimate_volume, make_grid)
 from .solver import Hierarchy, Level, NotConverged, _slabs, gather
 
-FEA_VERSION = 2      # bump when the numerics change: results kept on the SSD are then ignored
+FEA_VERSION = 3      # bump when the numerics change: results kept on the SSD are then ignored
 SAFETY_CAP = 10.0    # safety factors above this are shown as this
 SUPPORT_PEAK = 1.2   # a peak at a support this much above the stress elsewhere is called artificial
+# The report's highest stress and deflection are read from elements at least this full, the stress
+# carried on to the surface from there (`_surface_stress`). Elements the surface only clips (from 2% full)
+# have their centre outside the part: a round bar in torsion read 14-22% too much stress at every detail
+# (17.6 MPa in truth), and its deflection 6-15% too much from their outer nodes. Elements at least half
+# full alone read it right in torsion but a plate's bending stress 1 / (elements across) too low: their
+# centres lie half an element under the face (2026-11-10).
+SOLID = 0.5
+FILL_SUB = 2         # samples per element side its fill is the mean of (`model.element_fill`)
+THIN_WALL = 8        # elements: walls thinner than this get a note (see `_wall_elements`)
+THIN_SHARE = 0.1     # ... when this share of the part is in them
 TOLERANCE = 1e-6     # relative residual a static analysis solves to
 # Nonzeros a static analysis' factorization of its coarsest multigrid level may keep (Hierarchy's direct_fill):
 # it takes as fine a level as this allows. On the CPU, where an iteration takes 1-3 s, DIRECT_FILL or
@@ -95,7 +105,7 @@ def plan_grid(part, detail="medium", volume=None, h=None, bounds=None, max_coars
 def build_model(part, conditions, detail="medium", xp=np, cache=None, volume=None, h=None, bounds=None, grid=None):
     """The FE model of an implicit body `part` with `conditions` (supports and loads)."""
     grid = grid or plan_grid(part, detail, volume, h, bounds, MAX_COARSE_STATIC)
-    phi = element_fill(part, grid, xp, cache)
+    phi = element_fill(part, grid, xp, cache, sub=FILL_SUB)
     if not (phi > 0).any():
         raise ConditionError("no material found in the part")
     fixed, forces, cases, notes = apply_cases(grid, phi, conditions)
@@ -157,6 +167,51 @@ def _near_supports(model, reach=2):
     for cx, cy, cz in CORNERS:
         touch |= fixed[cx:cx + nx, cy:cy + ny, cz:cz + nz]
     return ndimage.binary_dilation(touch, structure=np.ones((3, 3, 3), dtype=bool), iterations=reach)
+
+
+def _wall_elements(solid, share=THIN_SHARE):
+    """How many elements thick the part's thinner walls are: per element the shortest run of solid
+    elements through it along x, y or z, and of those the value `share` of the part lies under (a wall
+    at 45 degrees counts 1.4 x thicker than it is)."""
+    if not solid.any():
+        return 0.0
+    thinnest = None
+    for axis in range(3):
+        moved = np.moveaxis(solid, axis, -1)
+        rows = np.ascontiguousarray(moved).reshape(-1, moved.shape[-1])
+        starts = rows.copy()
+        starts[:, 1:] &= ~rows[:, :-1]
+        run = np.cumsum(starts.ravel()).reshape(rows.shape)     # every run's number (1, 2, ...)
+        full = np.zeros(rows.shape, dtype=np.int32)
+        full[rows] = np.bincount(run[rows])[run[rows]]
+        length = np.moveaxis(full.reshape(moved.shape), -1, axis)[solid]
+        thinnest = length if thinnest is None else np.minimum(thinnest, length)
+    return float(np.quantile(thinnest, share))
+
+
+def _surface_stress(vm, phi, solid):
+    """Element stresses with those of the elements at the surface carried on to the surface itself:
+    along x, y and z, where the next element out is not solid and the next one in is, the stress goes on
+    from the element's centre as it changes from that inner neighbour, as far as the surface lies (from
+    how full the element, or the one outside it, is: at most one element). Never less than the
+    element's own; 0 outside `solid`."""
+    out = np.where(solid, vm, 0.0)
+    best = out.copy()
+    for axis in range(3):
+        for step in (1, -1):
+            def shifted(a, by):          # a's neighbour `by` elements along the axis (0 / False past the grid)
+                moved = np.zeros_like(a)
+                src = [slice(None)] * 3
+                dst = [slice(None)] * 3
+                src[axis] = slice(by, None) if by > 0 else slice(None, by)
+                dst[axis] = slice(None, -by) if by > 0 else slice(-by, None)
+                moved[tuple(dst)] = a[tuple(src)]
+                return moved
+            edge = solid & ~shifted(solid, step) & shifted(solid, -step)
+            reach = np.where(phi < 1.0, phi - 0.5, 0.5 + shifted(phi, step))    # centre to surface, elements
+            carried = out + (out - shifted(out, -step)) * np.clip(reach, 0.0, 1.0)
+            np.maximum(best, np.where(edge, carried, 0.0), out=best)
+    return best
 
 
 def _neighbour_fill(values, valid, passes=2):
@@ -278,6 +333,10 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
 
     act = active_nodes(model.phi)
     near = _near_supports(model)
+    solid = model.phi >= SOLID                  # what the report's numbers are read from (see SOLID)
+    if not solid.any():
+        solid = model.phi > 0
+    solid_nodes = active_nodes(np.where(solid, model.phi, 0.0))
     level = Level(grid.shape, "fine", xp.asarray(material.E * grid.h * model.phi, dtype=dtype),
                   xp.asarray(stiffness(material.nu), dtype=dtype), xp)
     vm_e = size = None
@@ -294,12 +353,12 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
         imbalance = max(imbalance, float(np.linalg.norm(reaction + applied) / scale))
         del Ku
         size_k = np.linalg.norm(np.asarray(to_host(u), dtype=np.float64), axis=-1)
-        away_k = np.where(near, 0.0, stress_k)
+        away_k = np.where(near, 0.0, _surface_stress(stress_k, model.phi, solid))
         i_k = np.unravel_index(int(np.argmax(away_k)), away_k.shape)
         top = float(away_k[i_k])
         cases.append({"name": name, "max_away": top, "max_away_at": tuple(grid.origin + (np.asarray(i_k) + 0.5) * grid.h),
                       "min_safety": material.strength / max(top, 1e-9),
-                      "max_displacement": float(np.where(act, size_k, 0.0).max())})
+                      "max_displacement": float(np.where(solid_nodes, size_k, 0.0).max())})
         # with load cases: the worst of them everywhere (what the part must stand)
         vm_e = stress_k if vm_e is None else np.maximum(vm_e, stress_k)
         size = size_k if size is None else np.maximum(size, size_k)
@@ -310,20 +369,28 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
     stress = nodal_average(vm_e, model.phi)
     safety = np.minimum(material.strength / np.maximum(stress, 1e-9), SAFETY_CAP)
 
-    i_max = np.unravel_index(int(np.argmax(vm_e)), vm_e.shape)
-    max_stress = float(vm_e[i_max])
+    vm_s = _surface_stress(vm_e, model.phi, solid)
+    i_max = np.unravel_index(int(np.argmax(vm_s)), vm_s.shape)
+    max_stress = float(vm_s[i_max])
     # Faces held perfectly rigid make an artificial stress peak at their edge, which grows with finer
     # detail (bracket: 12.8, 14.0, 21.8 MPa at draft, medium, fine). Report the highest stress
     # away from the supports too, and use it for the safety factor and the colour scale.
-    away = np.where(near, 0.0, vm_e)
+    away = np.where(near, 0.0, vm_s)
     i_away = np.unravel_index(int(np.argmax(away)), away.shape)
-    max_away = float(away[i_away]) if (~near & (model.phi > 0)).any() else max_stress
-    n_disp = np.where(act, size, 0.0)
+    max_away = float(away[i_away]) if (~near & solid).any() else max_stress
+    n_disp = np.where(solid_nodes, size, 0.0)
     elements = int((model.phi > 0).sum())
-    partial = int(((model.phi > 0) & (model.phi < 0.99)).sum())
     notes = list(model.notes)
-    if elements and partial > 0.5 * elements:
-        notes.append(f"the part is thin compared with the {grid.h:g} mm elements: results are rough, use a finer detail")
+    # A wall whose faces fall inside elements is too stiff: its part-filled layers count as spread over
+    # whole elements. Measured, faces half an element off on both sides: 20 / 10 / 5 elements across read
+    # 1.5 / 5.7 / 19% too little deflection and stress; on the grids laid here plates 5.5-6.5 elements
+    # thick 3-5%, 10 and more under 0.5% (2026-11-10). (Before: a note only when over half of the
+    # elements were part-filled, which a plate 3 elements thick is not.)
+    walls = _wall_elements(solid)
+    if 0 < walls < THIN_WALL:
+        notes.append(f"the thinner walls are about {max(walls, 1):.0f} elements of {grid.h:g} mm thick: stiffness can "
+                     f"read up to ~{min(25, round(500 / max(walls, 1) ** 2)):.0f}% too high and stress as much too low "
+                     f"there; a finer detail gives them more elements")
     report = {
         "detail": detail, "grid": grid.describe(), "elements": elements, "h": grid.h,
         "device": "GPU" if xp is not np else "CPU", "iterations": iterations, "cached": not missing,
@@ -345,6 +412,9 @@ def static_analysis(part, conditions, material, detail="medium", xp=np, cache=No
                               extent),
         "displacement": nodal_field(disp, grid, key + "-u", "displacement", "mm", (0.0, float(n_disp.max())), extent),
     }
+    # the legend's top is the report's deflection (the colours are read off a coarser grid: 4.95 on the
+    # legend beside 4.99 mm in the note)
+    fields["displacement"].display_range = (0.0, float(n_disp.max()))
     if report["peak_at_support"]:  # a colour scale that the peak at a support does not wash out
         fields["stress"].display_range = (0.0, max_away)
     # the safety factor on a fixed scale, from 1 (or lower, where the part fails away from the supports)

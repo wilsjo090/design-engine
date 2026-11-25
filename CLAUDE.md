@@ -84,7 +84,7 @@ because Warp's float32 closest-point maths drifts on long thin triangles. Only g
 `GPU_MIN_VOXELS` (1M) use the GPU, and only as many workers as the card's free memory allows
 (read via NVML; CUDA's memGetInfo is wrong under Windows WDDM). Out-of-memory falls back to the
 CPU per body. Marching cubes of a CuPy grid runs on the GPU too (`meshing._marching_cubes_gpu`,
-Warp's `IsoSurfaceMarchingCubes`: same vertices and triangles as skimage); block meshing and
+Warp's `IsoSurfaceMarchingCubes`: same vertices and triangles as skimage; both turn their triangles out of a body that is negative inside, so no mesher checks the volume to orient a mesh: the tests do); block meshing and
 decimation stay on the CPU.
 
 **Big bodies in blocks** (`engine/tiles.py`): grids above `TILE_MIN_VOXELS` (32M) are meshed
@@ -172,7 +172,7 @@ selection's border edges (KD-tree). A wide fade is sampled on a coarser grid and
 (`facemask.sample_factor`: factors 6/3/2, chosen to keep block meshing exact). *Apply to: all
 other faces* (`invert`) uses the complement of the picked faces, so the picked ones stay plain. Input type `faces` is a text list: `15` = face 15 on every
 body (copies like the petals), `2:15` = face 15 of body 2 only (`mesh.metadata["cad_body"]`, set
-by Import STEP, kept by `scale_about`), or names of saved selections (recipe `selections`,
+by Import STEP, kept by `scale_about`), `10-15` = that range (anything else is refused, `facemask.face_entries`, and so is a body that is not there, `faces_on`), or names of saved selections (recipe `selections`,
 resolved in `Graph.from_dict`). The editor picks them on a CAD view (`/api/faces/{node}`: face and
 body per displayed triangle, whether the bodies are copies of one part (same faces, triangles and
 area share per face), tangent groups). Masks have no bounds but an `extent` (`fields.display_extent`),
@@ -190,9 +190,9 @@ smoothly share one frame instead, an unfolded sheet (`engine/unfold.py`: cut ope
 `FOLD`, LSCM start then as-rigid-as-possible steps, cached per process) laid onto the CAD frame of
 its largest face (`holes._unfolded`), so that face's pattern stays put; sheets that close around
 (border loops that turn ~0 on the surface: a split cylinder) or stretch over `MAX_STRETCH` keep a
-frame per face. Holes are dropped whole: outline closer than Edge margin
+frame per face. The lattice is centred on the face (`holes._start`: of the lattice through the middle and the ones half a cell off, the one with most shapes that fit, counted on a raster of the face; a joined sheet anchors on its largest face; Offset U / V move from there; faces that close around keep their whole number of cells). Holes are dropped whole: outline closer than Edge margin
 to the selection's border (edges to unchosen faces and sharp folds, outline tested against border
-points, not a circle), found twice (seams), or too close to another face's holes. Depth from Warp
+points, not a circle), found twice (seams), or too close to another face's holes (shapes back to back on a wall's two faces only when their prisms meet, `holes._crowded`; over `CROWD_PAIRS` overlapping pairs the node refuses: Spacing far under Size took 2.8 GB). Depth from Warp
 ray casts (`checks.ray_thickness` / `ray_first_hit`, centre plus 8 points around); Depth > 0 makes
 pockets, Height > 0 raised shapes (for a union: they sink into the wall by the face's drop under
 their outline + `JOIN`, at most 90% of the wall; a pocket as deep as the wall goes through, no
@@ -201,7 +201,7 @@ each centre (`holes.read_at`, a one-sample grid per hole: a coarse grid misread 
 whose band is thinner than its cells), and 0 there means no shape; Min Size (Hole Pattern 1 mm,
 Surface Pattern 0) leaves out shapes that a Size scale would shrink to pinholes. The cutter is
 one straight prism per hole along its axis, evaluated hole by hole on the grid samples around it
-(`FAR` elsewhere): a pure function of position, cheap (0.5 s for 211 holes on 46M voxels), the
+(`FAR` elsewhere; in float32, positions taken from each shape's centre in float64 first, the turn and the scale folded into the two directions across, `_Shapes.around`: 35% faster than float64 with a turn per sample): a pure function of position, cheap (0.5 s for 211 holes on 46M voxels), the
 same in blocks bit for bit. 2D shapes are exact distances (`Shape.sdf`; the cross is a union of two
 boxes, exact outside only); Size is always the inner width (the largest pin that fits). Voronoi
 cells give every shape its own convex outline (`Holes.cells`, `pattern2d.polygon_sdf`; every check
@@ -214,7 +214,7 @@ side. Stars and chevrons are simple polygons (`simple_polygon_sdf`); `delaunay` 
 layout's Delaunay triangles (holes on the triangles' centroids); Alternate turns every other cell
 (the triangle tiling needs odd polygons centred half way up, `Shape._lift`); Tilt leans hole axes
 (depths from where each sample's axis meets the face). Boolean Subtract/Union take Edge round /
-chamfer (`fields.subtract_edged`, `union_edged`); a cutter must be exact as far out as the radius,
+chamfer (`fields.subtract_edged`, `union_edged`: the union's size is scaled per sample by how the two surfaces meet, `fields._meeting`, the product of their gradients and their curl by central differences, so it declares one sample of halo, `neighbours`; faces the two bodies share stay flat but for a ridge under a voxel at the hidden edges, where the plain Mercury union swelled them 0.29 x the radius; the subtract is not weighted); a cutter must be exact as far out as the radius,
 so the Booleans call its `regrow` (`nodes._exact_to`; Smooth Union, Offset and Shell by a number do too). Picture and Text (`engine/picture.py`) project an image onto a
 face (flat, or around a cylinder's axis) as a 0..1 field. Standard patterns ship as presets in
 `presets/` (25).
@@ -224,7 +224,7 @@ picked CAD faces moved out or in as one piece, as a field. `Patch` is the chosen
 (corner normals angle-weighted per CAD face) and its border (edges of one chosen triangle); `geometry` (cached,
 (3, *grid.shape), 12 B per voxel) gives every sample within `band` of the faces `lat` (0 on walls standing on the
 border along the faces' normals; over the faces minus the distance from the closest point c to the border, beyond
-it the sideways rest of |p - c| signed by the border edge's outward direction), `hgt` (± |p - c| over the faces, so
+it the sideways rest of |p - c| signed by the border edge's outward direction, at a border corner by both edges meeting there, `Patch.mates`: on the plane continuing one edge its dot product is ±1e-16 and left slivers 2.5 mm long), `hgt` (± |p - c| over the faces, so
 outward folds between chosen faces join round as Offset Body; (p - c)·n on the border) and `s`; closest points
 from igl on the patch (`_near`, in chunks) or facemask's Warp kernel on the GPU. Sides straight: part ∪ slab
 {lat ≤ 0, -e ≤ hgt ≤ d} minus recess {lat ≤ 0, d ≤ hgt ≤ e}, one formula for a Distance field of either sign;
@@ -261,7 +261,7 @@ one back); a body's *Modify ▸ Cut out / Add shape ▸ Channel (pipe)… / Pipe
 and starts placing. Demo: `recipes/pipe_demo.json`.
 
 **Lattices** (`engine/lattice.py`): TPMS (value / |grad|, exact gradients in `TPMS_GRADIENT`, so
-thickness is in mm), periodic strut lattices (points folded into one octant of a cell,
+thickness is in mm; a sheet's level is looked up so that its mean wall is the typed thickness, `tpms(true_walls=True)`: area per volume x thickness = solid share, since value / |grad| alone made a 2 mm gyroid's walls 1.56 mm), periodic strut lattices (points folded into one octant of a cell,
 `|q - rint(q)|`; valid because every lattice there is mirror-symmetric about cell faces and
 mid-planes: a lattice without that symmetry, e.g. diamond struts, needs another method) and a
 Voronoi foam (struts cut into pieces ≤ cell/3; exact nearest-piece distance in
@@ -279,7 +279,7 @@ static stress analysis on a voxel grid. `model.py` lays the grid from the part's
 carries, not by area; `sample_triangles` puts loads' long thin triangles on stretched grids, while
 supports and topology's skin keep `stretch=False`, since which nodes lie near a face depends on how
 densely it is covered) into fixed DOFs and nodal forces; `Condition.traction(normals, points)`
-gives force, pressure, bearing (contact side, cosine weighted; a direction along the faces, a hole's axis, is refused
+gives force, pressure, bearing (contact side, cosine weighted; only the part of the typed force square to the hole's axis is applied, 200 N at 45° = 141 N with a note, `Condition.bearing`, `hole_axis` = the smallest eigenvector of the faces' area-weighted normals, `resultant()` and the arrow use the same force; a direction along the faces, a hole's axis, is refused
 by `_bearing_norm`, `MAX_BEARING_GROWTH`: scaling rounding noise up to the amount gave 1.2e18 N, and compliances of
 1e31 that left the real loads hanging in the air) and torque, and a torque or a
 force's Offset is a rigid-connection turn about the faces' centre (`_turning`: w = I^-1 M, adds
@@ -317,7 +317,7 @@ BVHs), then stops the run's idle workers (`core.stop_idle_workers`, they hold RA
 each), deciding again after each; an analysis left on the CPU says so in the log. `analysis.py`: element-centre von
 Mises stress, nodal fields (`Field.unit`, `display_range` without the artificial peak at supports),
 report lines, displacements kept on the SSD for E = 1 (`FEA_VERSION`; keyed without density,
-strength and E). Static analysis' coarsest multigrid level, factorized directly, is the finest one whose
+strength and E). The report's maxima are read from elements at least half full (`analysis.SOLID`: the almost-empty surface elements read a twisted bar 14-22% high at every detail), the surface elements' stress extrapolated to the surface (`_surface_stress`: half-full elements alone under-read bending), max deflection from those elements' nodes, and the displacement legend ends at it; `build_model` fills part-filled elements from 2 x 2 x 2 samples (`FILL_SUB`; topology's own grid keeps the centre sample, so its states stay valid) and notes walls under `THIN_WALL` (8) elements thick (`_wall_elements`), which read too stiff. Static analysis' coarsest multigrid level, factorized directly, is the finest one whose
 factorization is predicted to keep at most `direct_fill` nonzeros (`analysis.DIRECT_FILL`: on the CPU 25M or 5
 per box element, on the GPU, where every millisecond iteration solves it on the host, 1 per box element;
 `Hierarchy(direct_fill=)`,
@@ -351,7 +351,139 @@ members stop at what fits and sigma at half the longest side, and a Min thicknes
 "no limit" these asked for gigabytes of filter in seconds, or a grey blob reaching no load). Max section's linearization overshoots at a sharp projection, a load path going
 and coming back every other iteration, so with Max section a design variable that turned back gets a smaller move limit
 (`_track_moves`, `TURN_SHRINK`, as MMA's asymptotes; `moves` and `last_step` are in the state; never without Max section,
-so other results stay the same); `density_mesh` turns the
+so other results stay the same); the node's body is `fields.sampled_body` of `density_field`'s samples, with no mesh in
+between (the polished body, 2026-11-12, step 2 of docs/ORGANIC_PARTS_PLAN.md; FINDINGS "The polished body"): the
+smoothed samples (h / 2 apart) are the control values of a cubic B-spline, C2, so the facets of the h / 2 mesh the
+body used to be the distance to no longer show as stripes; the samples themselves as control values, not a spline
+through them, so a value never leaves the range of the 64 samples round it (no ringing, no loose bits the samples
+do not have); one axis at a time on the part of the samples a grid covers, positions and weights from the grid's
+float64 axes (blocks bit for bit, the GPU the same numbers as the CPU), the samples a `Shared` array; the samples are
+of the members alone, the state's `members` (`T.members_field`, `MEMBERS_FIELD` its version, `saved_members`: the
+filtered design variables on the free elements, solid in the same free elements as the densities but running
+smoothly across a member's surface, carried `CARRY` elements into the fixed regions from the nearest free element so
+members overlap them; dead ends cut are emptied in it too), and the node joins them with the exact bodies of what the
+optimizer kept solid (step 3, 2026-11-12, FINDINGS "Exact bosses and a fillet"): `T.skin_body`, everything within the
+skin's reach (`skin_reach`) of the faces the skin is kept around, per connected piece of faces, a cylinder piece
+measured as a cylinder (`frame.geometry._cylinder`: a hole's wall is a ring all round, also under a bearing load, whose
+contact side alone the optimizer keeps: with that side alone the hanger's shaft holes came out as open slots, 17% more
+stress; the bolted bracket's closed pin eyes are 10% of its mass), growing with the distance beyond its boxes, and the
+Keep body itself. Order in `nodes_fea._result.shape`: members, bosses and Keep joined first, then cropped by design
+space union Keep (cropped first the members had the design space's faces, which are Keep's too where Keep is part of it,
+and no corner between two bodies was left: half a fillet). Fillet (input `fillet`, mm, default 0, not in the topology
+key): `smooth_union(order=2)` of width `FILLET_SIZE` x the radius, as the frames' (the Booleans' `union_edged` reads each
+body's curl and pitted on the sampled field). `density_field(fixed=)`: those exact bodies count as material where thin
+members, tips and pieces are told (`thicken` / `cut_tips` `backing`), are not in the samples, and a design with no member
+is no error. States saved without `members` get it once (`topology.members_of` in the node: `T.prepare` on the saved
+level, `members_field` of the saved `x`, saved back); when that fails the densities with the fixed regions in them, as
+before, and no fillet. In the densities those regions are whole elements: bosses 0.3 mm off their cylinder, a Keep plate
+up to half an element thicker than the CAD one;
+the Smoothing's blur is narrower by the spline's own
+(`SPLINE_VARIANCE`), and the samples are made distances in mm again: divided by their slope (`_as_distances`,
+`SLOPE_MIN` / `SLOPE_MAX`: the blurred distance runs at 0.64 per mm across a strut 3 elements thick, and a Texture
+0.5 mm high stood 0.8 mm off it), never farther from 0 than the nearest sample of the other side (without that cap the
+division moved the surface itself at Smoothing 0), and from `FAR_SAMPLES` on blended over to that distance blurred by
+`FAR_BLUR` samples (`_far_distances`: a speck pushed "just outside" came back under an Offset Body of 1 mm; unblurred it
+is stepped by the samples, and a fillet's blend reads both bodies well away from their surfaces); values 1 mm from the
+surface read about 5% high. Even out (input `even`, x, default `T.EVEN` 1, 0 = off, not in the topology key; step 4,
+2026-11-12, FINDINGS "Even out"): `T.even_out`, in `_density_mesh` after `thicken` and before `cut_tips`, a level-set
+flow that moves the members' surface inwards by its smaller principal curvature (outwards where that is negative) for
+`EVEN_TIME` (2) x Even out elements^2: a straight strut and a plate keep their thickness (the mean curvature thins a
+strut at 1 / r), bulges and necks level out, joints and the corners of openings get round, loose ends pull back, and
+holes shrink (R^2 falls by 2 x the time: at 1 those under 2 elements' radius close). With Extrude along (`axis`) it is
+the curvature of the outline in the planes across the axis: a flat side's smaller curvature is 0 where it bulges, and
+only its necks filled. Explicit steps of `EVEN_STEP` samples^2 on the samples near the surface only (flat-index gathers,
+found again every `EVEN_BAND` steps, `EVEN_CHUNK` at a time, every sample from the values before the step): the same
+array code on numpy and CuPy, 0.7-1.6 s for 9-15M samples on the GPU, 46 s on the CPU. The two curvatures' soft minimum
+is their mean where they are closer than `EVEN_SOFT` per element (the prototype's formula was half of that too large
+on every strut). Nothing moves where the values turn back within a sample (`EVEN_GATE`: central over one-sided
+differences; half way between two members and along the middle of one the values have a ridge the samples cannot
+resolve, and a flow over it pulls flakes out of gaps; the prototype's gate on the slope froze 5-27% of the surface,
+thin members most), except that a hole down to a sample or two, which is all ridge, is filled by the second largest
+eigenvalue of the values' second derivatives (`_second_largest`, `EVEN_PINHOLE`: large along the middle of a hole, 0
+along the middle of a gap, which stays open), to half a sample over 0 (the level moves afterwards: holes came back as
+pits). Nothing moves in a fixed body or within `EVEN_HOLD` samples of one (at most `SKIN_BEYOND`: with the skin
+field's cap as "far" the shape depended on the fillet), nor where the extension past the design space ends (its
+cut-off ends pulled back into the part); the material in the design space outside the fixed bodies stays what it was
+(`_level_keeping`). Only of the members' field (a state without one gets none). It needs smoothed values: on a raw
+distance every sharp edge is a ridge and stays. Edges (input `edge`, mm, default 0, with `edge_shape` round / chamfer, neither in the topology key; called Round edges until the chamfer;
+2026-11-12, FINDINGS "Round edges, and a hanger like the reference"): the crop that ends `_result.shape` is
+`F.intersect_edged(within, out, edge, keep=keep_body)`: the edges the crop makes, where a member's side or a boss
+meets a face of the design space (the rims of the openings in an extruded web), are arcs of that radius (`_meeting`'s
+angle between the two surfaces, `_round_union` on the negated values; exact inside and to half a radius outside, the
+plain max from one radius out; one sample of halo, `_with_neighbours`, as `union_edged`). Faces the shape shares with
+the design space stay (their gradients agree), and so do the design space's own edges: round those in CAD. `keep`: an
+edge of Keep's that lies on a face of the design space (a plate's lower edge over an opening) reads as crossing
+surfaces on one side of it only and came out half rounded, with a step: no rounding where the shape is Keep
+(`KEPT_EDGE`), and nothing is taken off Keep. Not rounded well: a member lying along an edge of the design space (its
+surface meets two faces at once: a rough line there, as without). Measured at 2 mm on the hanger: mass -1.1%,
+deflection +0.3%; 1.5 mm on the brackets: -1.1% / -1.2% and +1.3% / +0.1%, one piece each. Edge shape chamfer
+(`intersect_edged(edge="chamfer")`): the Booleans' `_chamfer_union` on the negated values, a flat cut through the two
+lines where the arc would touch (legs of the size at 90 degrees, exact to 0.001 mm on a bar through a face), same
+fade, `keep` and halo. Walls (input `walls`, mm, default 0 = solid; FINDINGS "Walls and chamfers"): the design space
+hollow, `nodes_fea._hollow` = everything deeper than that inside the part (CAD bodies measured again with a band of
+walls + 1 mm: beyond their usual 2 mm band distances are interpolated) less Keep and the skin's bosses
+(`T.skin_body`), joined with a connected Avoid and from there an Avoid body like any other (in the topology key
+through its own key, cropped exactly, its rims broken by Edges too). `density_field(avoid=)`: Avoid's elements
+count as outside when the members are extended, so a member by an Avoid body runs straight on into it and the exact
+cut leaves it a flat face (before, the smoothing pulled the surface back from Avoid: in walls every member was flat
+outside and round inside; not the gap's elements, which nothing cuts). A hole's faces are faces like any other: a
+blind hole ending in the hollow has walls round its end, and a Skin round it is a ball in the hollow (hold a
+countersunk screw by its cone). Members are then strips of a wall, flat outside
+and inside, each wall with its own pattern; Min thickness must not be over the walls (6 over 5: not settled at 200
+iterations, cavities), Max thickness is measured across the wall and does nothing, and members get narrower only with
+Keep % (the hanger: 50% a truss, 45% three separate brackets). Members as bars (inputs `members_as` optimized /
+bars, `bar_form` follow / straight and `bar_size`, mm, 0 = auto; none in the topology key; `engine/fea/bars.py`, `nodes_fea._bars`; FINDINGS
+"Bars along the optimized members"): the optimization only says where material goes, and the members are drawn
+again as straight bars. `bars.trace`: the smoothed members and the fixed bodies (bosses, Keep) on the element grid
+are thinned to centre lines (skimage's 3D `skeletonize`: it keeps loops and connections, what hangs loose shrinks
+away, so the fixed bodies must be in the solid; a perfectly even-sided lone bar thins to nothing), the lines in the
+fixed bodies are dropped and the rest read as joints and chains (`_chains`: neighbours counted on the whole
+skeleton, so a line with a leg into a fixed body is a joint held by it; a link of one sample between a joint and a
+body is a chain of its own: taken for a ring it left the hanger's outer eyes hanging on their back struts). Then
+loose ends under `SPUR` x the width go, a joint with two bars is none, joints within `MERGE` x the width become one
+(a held one keeps its place), each member's line follows its joints as they move (`follow`), held joints come
+to rest in the middle of their body (`settle`: the node walks up the distance from the body's surface to its
+ridge, a boss's axis or a plate's middle, at most `INTO` x the width: every bar at a boss ends on its axis and the
+eye has one outline; straight on by a width they ended past it), and each line
+is cut into straight pieces within `STRAIGHT` x the width (Douglas-Peucker), whose corners are turned in arcs of
+`ROUND` x the width (`_rounded`: a true arc touching both pieces, at most 0.45 of each, as pieces turning `ARC`
+degrees each; a bar bent at a sharp corner had a crease inside the bend and across its chamfered faces). Bar form
+follow (the default; FINDINGS
+"Bars that follow their members"): a bar keeps its member's form instead. Its line is the member's own, smoothed
+(`_smooth_line`: continued past each end by its mirror image, so the ends stay and the middle does not move), bent
+to a moved joint only within `BEND` x the width of it (`follow_joints`; by shares a chord whose ends moved 13 mm
+into its eyes moved 13 mm all along). Its width is the member's there: every line sample's share of the material
+(the free samples nearest it) over the length of line it stands for (of the smoothed line: a zigzag of samples
+read 30% low) and over the member's thickness through that sample along the bar's normal (`normal=`, `SPAN`),
+smoothed, at most `WIDEST` x the member's median; line and width together are cut into pieces within `CURVE` x the
+width (Douglas-Peucker in x, y, z and width), each piece a taper. `bars.mirrored`: with Symmetry the low
+side's bars and their mirror images (the skeleton is not quite symmetric). `bars.body`: per piece a stadium outline, tapered
+from `width` to `width_b` (iq's uneven capsule in the bar's plane), in the plane square to its normal (the design
+space's gradient at its middle: its faces lie as the nearest face) times a slab along it; a member's pieces
+(`member=`) are joined plainly, they share their end circles (blended, every joint between two pieces bulged), the
+members' outlines are blended (G2 `bulge`, Fillet) on prisms `TALL` taller than the bars and the
+faces are the slabs' own, so fillets never pillow the flat faces; the blend is per member (`blend` (n,):
+`_bars` gives a bar fillets of max(Fillet, `BAR_FILLET` x its width, at most `BAR_FILLET_MOST`), members are
+laid widest first and each joins what is there by its own blend, so the narrower bar decides a fillet, as in the
+frames; the bosses and Keep are joined with the bars' middle radius, and the bosses' field is right that far out)
+and only within a `layer` (the members of one plane, a wall's: across two walls a blend was a web from wall to
+wall cut to the two slabs, a patch of skin and voids beside every eye; the layers are joined plainly, except round `knots`, joints where the ends of members of two or more layers lie together, a free 3D frame's: a ball there and a blend in space of the finished layers that fades out within twice `BAR_KNOT_REACH`, `nodes_fea._bars`; `BAR_BY_JOINTS`, off: an experiment that lays a free part's bars by their joints' planes, FINDINGS "Bars laid by their joints"; a free part's joints outside the bosses and Keep are lofts instead, `BAR_LOFT`, `bars.lofts`, FINDINGS "Lofted joints": every member is cut square `LOFT` x its larger side short of the joint, farther at sharp angles, and between every two members there is a loft along a cubic Bezier that leaves the one's line where it was cut, in its direction, and arrives on the other's so, its width, thickness and faces going evenly from the one's to the other's, never twisting over 45 degrees since a section turned a quarter with its sides swapped is the same; no ball, no fillet in a plane; a stub member with both ends in one joint is left out, and so is a loft tighter than half the bar's side, a hairpin between bars that leave side by side, where both its bars have other lofts; `body(curves=, flat_a=, flat_b=)` works a loft out as it is, per span on the samples' nearest points of the curve by 5 Newton steps from the span's middle, a sample being a span's only where the steps came to rest square to the curve, each loft a layer of its own joined plainly, also near knots, whose blend in space drew the cut ends out into stripes; as straight pieces a loft's faces showed every piece as a rib; where lofts of different planes come together they leave a three-sided dimple and creases where they cross: `BAR_FILL`, `bars.fills` reads the bars as drawn on samples `FILL_VOXEL` apart round each lofted joint, smooths them over a sample and lets their surface flow outwards (`bars.flow`: a level set flow as Even out's, numpy on the host, explicit steps on the samples near the surface) for `FILL_TIME` x the bars' side^2: by its larger principal curvature where that is hollow (a pit, hollow in every direction: it fills flat) and by what its smaller one is hollower than 1 / (`FILL_SHARP` x the side) (a groove sharper than that radius, a crease or the foot of a step: rounded to it)); `flow(ridge=)` can also round convex edges (`FILL_RIDGE`, a `cut` patch, gated by `body(seams=True)`, the second nearest loft's values): off, since a union of lofts makes only hollow creases and every sharp outside edge is some loft's own, the joints' rims and the step tops alike, and three lofts overlap all over a joint (FINDINGS "Sharp edges rounded too"); one plane per joint, `LOFT_PLANE`, and a mix of a joint's lofts (taken out again) left off too; a node per joint, `LOFT_NODE` (faces from the convex hull of the bars' cut ends, the outline from the lofts, FINDINGS "A node per joint"): no steps but faceted, built and off until the user chooses; patched joints, `nodes_fea.BAR_PATCH` / `bars.patches` (as Rhino's Patch: one loft's surfaces kept, the rest of the joint a thin plate through them, `_biharmonic`, a "replace" patch), the same, FINDINGS "Patched joints"; face by face, `LOFT_FACES` (each joint face its own patch: Shepard's mix of the bars' face planes, the lofts' outlines for the sides), the same, FINDINGS "Face by face"; a face, a bend between two bars (hollow one way, straight the other, rounder than that), a slot's walls and a round opening wider than twice that radius do not move, so it needs no rules about openings (the user's point: what is sharp, or hollow all round, tells a defect from what is meant to be hollow); what that adds is a patch of samples per joint (`fields.spline_values`, a sampled body's cubic B-spline) joined plainly in its box, `FILL_UNDER` under the flow's surface, so a face nothing was added to is the bars' own, and fading out past the joint's core; taken out again, FINDINGS "Filling them flat" and "A flow instead of balls": balls rolled over the joint (lumpy pads, lids over openings, and the rules against those took most of the fills away), caps from the convex hull of a joint's three lofts (ripples over every loft face), smoothing the solid (a film in every bend, rings on hollow faces); `FILL_SHARP` 0.6 and `FILL_TIME` from 0.35 closed openings 4-5 mm wide, and a strict `FILL_GATE` left a dot at the bottom of a filled pit; what no fill takes away is the steps where a joint's lofts cross at different depths; `_bars` 6 -> 33 s for the bolted bracket's 11 joints on the CPU; walls keep their fillets in the plane); a slab
+reaches a sixth of the blend past its bar's outline (the whole blend: a tab beside every eye); the rims between the two chamfered or rounded
+(Edges); member by member on the samples round each, as the pipes (blocks bit for bit, GPU = CPU). Width: Bar size,
+or the member's own (straight: its mean section over its mean thickness). `nodes_fea._bars`: a member's pieces get
+one normal and lie in one plane where most of its length looks one way (`BAR_FLAT`, `BAR_MOSTLY`: near an edge of
+the design space single pieces look the neighbouring face's way, and a joint inside a boss lies at the boss's
+depth; pieces a hair askew of each other were shards at every joint between them; a member that looks no one way, deep in a free 3D part, gets the plane its line bends in, `BAR_BENT`, and is laid in it when it leaves it by under `BAR_LIFT` x its width: FINDINGS "Bars deep in a part"). In walls every
+bar is a strip from `BAR_COVER` + Edges outside the design space's face (which cuts it and breaks that rim) to
+`BAR_PAST` past the hollow's, which cuts it, sharp (a hair short of it a slot was left under Keep; an edged cut
+between two faces a hair apart left streaks), its depth measured from its middle straight out along its normal. When the bars leave the part in
+more pieces than the members did (plates, which have no centre line: the wall bracket), the optimized shape is
+shown with a warning. The note says "drawn as N bars W mm wide" and its safety factor is the bars'. Measured:
+smoothing 1.6-2.1 -> 0.4-0.7 s
+(no marching cubes or mesh smoothing on the host), a view's 7-17M samples 0.03-0.11 -> 0.014-0.035 s on the GPU and
+1.4-2.5 -> 0.06-0.16 s per eighth on the CPU (no search tree per worker), hanger and brackets one piece, mass within
+0.9% and deflection within 1.7%. `density_mesh` (the same steps, then marching cubes and Taubin smoothing) stays for
+tests and comparison: it turns the
 densities into a smooth closed mesh (its array work on the GPU when `SMOOTH_GPU_BYTES` per sample fit beside the
 headroom, `_smoothing_module`; the node makes room first as for an analysis, `nodes_fea._room_for_smoothing`:
 this process's GPU caches, then idle workers, and logs a smoothing left on the CPU; else or on running out of
@@ -381,7 +513,7 @@ compliance x outline^Smoothness, the projected design's outline (`Optimizer.outl
 densities' outline rewarded thin grey members and never shrank the real surface); Symmetry lays the
 grid symmetrically about planes through the design space's middle and averages the sensitivities with
 their mirror images (`Problem.mirror`, `symmetric`), so free densities stay exact mirror images; both
-are in the key only when set. Start coarse (default yes, fine detail only, in the key then): `T.levels`
+are in the key only when set. Extrude along (`extrude`: none / x / y / z, `Problem.extrude`, in the key only when set; step 1 of docs/ORGANIC_PARTS_PLAN.md, measured in FINDINGS "Extrude along"): the free densities of each grid line along the axis are one design variable, so members run straight through the design space with flat sides: sensitivities averaged along the line (`Problem.along`, after Symmetry's), x set to the line's mean after every update and after a coarse level's handover, dead ends pruned as whole lines; the filter's cone is its middle layer only (in the plane; kept in a cubic array, which the convolutions and `gpu.Volume`'s taps expect), so a member's thickness is its width seen along the axis and the eroded design loses nothing at the two faces; Max thickness's neighbourhoods are in the plane too (`_gauss`), `_room` measures the design space seen along the axis, Members and Max section are off with a note (and out of the key). Keep % must leave room for walls Min thickness wide: a 30 x 10 mm outline at 30% with 3-element members fell apart. Sample: `recipes/topo_hanger_extruded.json` (a plate as Keep, a wedge-shaped web under it, held by its four outer screws, each of the three shafts loaded alone three ways: 9 load cases, which is what gives a web of triangles; Fillet 4, Round edges 2; `tools/make_hanger_sample.py` writes its STEP file, the rounded outer edges are CAD's). `recipes/topo_hanger.json` is the same part free in 3D with Walls 6 mm (no Extrude along, Symmetry x, Keep 50%, Min thickness 5.5, Fillet 5, Edges 1.5 chamfer, Members as bars, Bar form straight, 7 mm (the user's choice of the bar forms, 2026-11-14), held by the countersinks of its four outer screws, faces 29, 30, 33, 34, the loads 12 mm in front of the web by their Offset, so the shafts twist it): a truss of 11 square bars 7 mm wide running to the shaft eyes, their bends arcs and their joints 5 mm fillets, in the front wall and the back wall, which is what the user's reference is (not an extrusion, and its members are square bars with chamfers, not round struts: without Walls the free 3D result was a flat-faced truss with round struts behind it, which the user turned down). Start coarse (default yes, fine detail only, in the key then): `T.levels`
 gives the coarser details whose elements can hold the Max thickness, `_optimize` runs each until the
 projection sharpness reaches `HAND_OVER[level]` (`Optimizer.run(hand_over=)`), then `handover()` /
 `take_over()` move the design variables (trilinear, `_transfer`), sharpness, iteration count and history
@@ -483,7 +615,7 @@ compression by what a bar of that size carries over its own length, `sizing.forc
 a load goes over more bars; `MAX_SIZE_SHARES` are tried in turn while bars at Max size fail the beam check,
 `MaxSizeShort`, since the elastic frame does not share a load as the layout did; sizing, the beam check and
 the body check never go above it; in the node key only when set) and checks the frame with 12-dof beam elements (`beam.py`: clamped supports, von Mises at
-the bar ends, linear buckling factor), bumping sizes until it passes (`optimize._checked`, at least `MIN_GROWTH` a
+the bar ends, linear buckling factor, from two elements per compressed piece: one read a propped column 44% high), bumping sizes until it passes (`optimize._checked`, at least `MIN_GROWTH` a
 round; never thicker than fits the design space, `_room_size`: the section's thinner side against the thickest spot;
 bars that need more fail as `MaxSizeShort` with `room`, and `optimize_frame` lays the frame out again with that as Max
 size; the body check stops there too, the report's `room`); Light bars:
@@ -508,7 +640,7 @@ spaces only touch by a voxel distance; bodies are cropped by `geometry.seamless`
 (port type `frame`: a Frame output or a CAD body) adds held nodes on the other frame's nodes and
 bars or the body's surface (`ground._attach_nodes`, `Ground.attach`; the log gives the force put
 on it, which is not added to the other frame); Join Frames (`geometry.join_body`) draws all frames'
-bars in one kernel so joints between frames get the same fillets. A frame laid out and sized for these settings (its state's `shape` the
+bars in one kernel so joints between frames get the same fillets, and analyses the joined body with every frame's supports and loads (input Check, `nodes_frame._joined_check`; frames carry their material, `FrameRef.material`): safety factor and deflection on the card. A frame laid out and sized for these settings (its state's `shape` the
 same) reports `finished` (`core.report_finished`), as Topology Optimization does. Frame view: `node_done` carries
 `frames` (`nodes_frame.frame_view`), drawn by `FrameBars` / `FramePanel` in Viewport.tsx. While it optimizes,
 `optimize_frame(live=)` reports the frame after every step (the layout's LPs, mid-bar LPs, each joint move and
@@ -558,7 +690,7 @@ samples); `nodes._report_mesh` warns about both (not for a Domain or a lattice's
 `fills_box`).
 `core.report_message(text, level)` puts a line in the editor log from inside a node (levels
 info, warning, error); `core.report_progress(done, total, step)` drives the card's and status bar's
-progress (`parallel_map`'s `title` is its step); runs slowed down to stay within memory say so in the
+progress (`parallel_map`'s `title` is its step; a node's events go out at most every `core.PROGRESS_EVERY`, 80 ms, the last one and every new step always); runs slowed down to stay within memory say so in the
 log (`Evaluator._notice`). Warnings and errors are kept with the node's cached result and sent with
 every `node_done` (`messages`), so the card shows them on cached runs too (the hidden mesher's as
 `viewWarnings`; a group's inner nodes' on the group). In a worker process the lines go back with
@@ -594,7 +726,7 @@ to the workers (`time.time()` on Windows steps 1-15 ms). A traced map's tasks ca
 tuple element (none when off). A hook costs ~0.3 µs when off; a new heavy step should get a span.
 
 **Value ranges**: `Field.range` is propagated by interval arithmetic (`fields._interval`,
-`_unary_range`; constants, noise and 3D waves -1..1, masks and Smooth Step 0..1 set explicitly).
+`_unary_range`; constants, noise and 3D waves -1..1, masks and Smooth Step 0..1 set explicitly). Noise really spans it: `fields.noise` multiplies by `noise.gain(octaves, roughness)` (1 / the largest value on a fixed sample: 1.49 at 3 octaves, as it came it reached about ±0.68) and clips.
 `node_done` events carry it to the editor (range tag on the card); Remap's `auto` uses it. A new
 field type with a known range should pass `range=` to `Field`. Offsets use it for bounds: body -
 d (or + d) grows the bounds by d's reach, and `Field.grown` keeps (the box before, the reach), so
@@ -669,7 +801,7 @@ Math nodes are `numeric`: with plain numbers in they give a float64 number out (
 "spacing = 1.5 x size" can set number and int inputs. A scalar output may feed those when
 `Graph.gives_number` (the editor: `graphConvert.outputType`, used to check wires) finds every scalar input
 of the Math node, and of Math nodes before it, typed in or a number; otherwise `problems()` says the input
-needs a plain number.
+needs a plain number. `problems()` also checks typed values before a run (`core._literal_problem`: a choice that is one of the choices, a number that is a finite number), names inputs by their card labels, and asks a bypassed node only for the input it passes on.
 Texture (`implicit.texture`) is Offset Body for textures: pattern stretched from its `Field.range` to
 0..1 (`stretch` auto), times Height, times Fade (or 1 - Fade), so a texture is Pattern → Texture instead
 of Multiply, Multiply and Offset Body (`tests/test_fields.py` checks it equals that chain; the texture
@@ -786,7 +918,7 @@ always keeps `STATUS_ROOM`; content changes refit it through a MutationObserver,
 then the categories in build order (`ORDER`), groups and presets; each opens a panel of tiles (first
 sentence of the doc, input → output type chips without plain settings); a click adds at the canvas
 centre, a drag (`NODE_DRAG_TYPE`) where it is dropped (`NodeEditor` onDrop, `addFromLibrary`); "/"
-focuses its search; tabs drop counts, then names, as the pane narrows (`data-fit`). The viewport is three.js / react-three-fiber with Z up (section
+focuses its search; tabs drop counts, then names, as the pane narrows (`data-fit`). The viewport is three.js / react-three-fiber with Z up, drawn on demand (`frameloop="demand"`: an idle view draws nothing, it drew 120 times a second; code that changes a uniform, a geometry's index or the camera outside React's props must call `invalidate()`, as `viewCut.useBoxCutUniforms`, `useHideRanges`, CameraFit and CameraTurn do) (section
 plane via `clippingPlanes`, variants drawn to the left of the result, check panel). Ball, Bar, Box and Pipe
 nodes (`fields.ball/bar/box`, `pipe.pipe`, exact distances) are drawn by the viewport itself (`Guides.tsx`; the server
 runs them but adds no view, `server.DRAWN_BY_VIEWPORT`), translucent and faintly through the bodies:

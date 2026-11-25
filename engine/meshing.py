@@ -1,4 +1,5 @@
 """Turn an evaluated field back into a triangle mesh and export it."""
+import os
 import numpy as np
 import trimesh
 from skimage.measure import marching_cubes
@@ -156,12 +157,11 @@ def surface_mesh(verts, faces, scale, shift, voxel, nonfinite, clipped, normals=
     # Marching cubes output is already closed and shares vertices correctly. trimesh's
     # processing (merging near-coincident vertices, dropping zero-area triangles) can pinch or
     # open it where the surface passes through grid corners, so keep its topology untouched.
+    # Both marching cubes (skimage's and Warp's) turn their triangles out of a body that is negative inside:
+    # no volume integral to find that out (it was 13 of a Draft mesh's 64 ms, 60 ns per triangle, and never
+    # turned one; tests/test_tiles.py and test_gpu.py check the meshes face out).
     mesh = trimesh.Trimesh(verts, faces, process=False,
                            vertex_attributes=None if normals is None else {FIELD_NORMAL: normals})
-    # not mesh.volume: it leaves trimesh's per-triangle arrays (96 B per triangle, 2.7x the mesh) in
-    # the mesh's cache, kept with the node's result and pickled with it from the workers
-    if signed_volume(mesh.vertices, mesh.faces) < 0:
-        mesh.invert()
     mesh.metadata.update(nonfinite=nonfinite, clipped=clipped, voxel=voxel)
     return mesh
 
@@ -320,12 +320,26 @@ def signed_volume(V, F, chunk=1_000_000):
     return total / 6.0
 
 
+EXPORTS = (".stl", ".3mf", ".obj", ".ply", ".glb", ".off")   # what `export` writes
+
+
 def export(mesh, path):
-    """Write STL, 3MF, OBJ or PLY depending on the file extension."""
-    if str(path).lower().endswith(".stl"):
+    """Write STL, 3MF, OBJ or PLY (also GLB, OFF) depending on the file extension."""
+    kind = os.path.splitext(str(path))[1].lower()
+    if kind not in EXPORTS:    # (trimesh said "('%s exporter not available!', 'step')")
+        raise ValueError(f"cannot write a '{kind or 'file without an extension'}' mesh file: end the name in "
+                         f"{', '.join(EXPORTS[:4])}")
+    if kind == ".stl":
         _export_stl(mesh, path)
-    else:  # without a CAD body's per-triangle data (PLY would try to write the corner UVs)
-        trimesh.Trimesh(mesh.vertices, mesh.faces, process=False).export(str(path))
+        return
+    if kind == ".3mf":
+        try:
+            import lxml  # noqa: F401  (trimesh's 3MF writer needs it)
+        except ImportError:
+            raise ValueError("writing .3mf needs the lxml package, which is not installed: pip install lxml "
+                             "(or save as .stl)") from None
+    # without a CAD body's per-triangle data (PLY would try to write the corner UVs)
+    trimesh.Trimesh(mesh.vertices, mesh.faces, process=False).export(str(path))
 
 
 def _export_stl(mesh, path, chunk=1_000_000):

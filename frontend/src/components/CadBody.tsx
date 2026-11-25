@@ -14,7 +14,7 @@ import {
   CAD_COLORS, LOOK_MAX_TRIANGLES, edgesShown, requestLook, tintColors, useCadLook, type CadLookOptions, type EdgeSet,
   type LookResult,
 } from '../cadLook'
-import { CAP_COLOR, hideRanges, patchBoxCut, useBoxCut, useBoxCutUniforms, type CutBox } from './viewCut'
+import { CAP_COLOR, patchBoxCut, useBoxCut, useBoxCutUniforms, useHideRanges, type CutBox } from './viewCut'
 
 const EDGE_DARK = '#16181c'
 const EDGE_LIGHT = '#e6e9ee'
@@ -150,13 +150,12 @@ function EdgeLines({ set, color, opacity, cull, clip, box, hide, order }: {
     return g
   }, [set])
   useEffect(() => () => geometry.dispose(), [geometry])
-  useEffect(() => {
-    if (geometry.userData.source) hideRanges(geometry, geometry.userData.source, set.parts, 2, hide)
-  }, [geometry, set, hide])
+  useHideRanges(geometry, geometry.userData.source, set.parts, 2, hide)
   const boxUniforms = useBoxCutUniforms(box)
   const keep = box?.keep ?? 'outside'
   const uniforms = useMemo(() => ({ uCull: { value: 0 }, uPull: { value: EDGE_PULL } }), [])
-  useEffect(() => { uniforms.uCull.value = cull ? 1 : 0 }, [cull, uniforms])
+  const invalidate = useThree((s) => s.invalidate)
+  useEffect(() => { uniforms.uCull.value = cull ? 1 : 0; invalidate() }, [cull, uniforms, invalidate])
   const patch = useMemo(() => ({
     onBeforeCompile: (shader: THREE.WebGLProgramParametersWithUniforms) => {
       patchBoxCut(shader, boxUniforms, keep)
@@ -217,7 +216,7 @@ export function CadBody({ view, node, wireframe, ghost, clip, box, patch, hide }
   const options = useCadLook()
   const look = useLook(view, patch ? undefined : node)
   const geometry = useLookGeometry(view, look)
-  useEffect(() => hideRanges(geometry, geometry.userData.source, view.parts, 3, hide), [geometry, view, hide])
+  useHideRanges(geometry, geometry.userData.source, view.parts, 3, hide)
   // right-clicks and clicks raycast it: its search tree is built in a worker meanwhile (bvhBuild.ts), on the
   // look's geometry (the one drawn from then on; a body too big for a look keeps the plain one)
   const menuTarget = !patch && !!node && !ghost && (!!look || view.faces > LOOK_MAX_TRIANGLES)

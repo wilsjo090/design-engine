@@ -164,9 +164,144 @@ def test_catalog_is_complete():
         assert required in types
 
 
+def shipped_recipes():
+    """The recipes git tracks (work in progress beside them is not the repo's to check); every recipe file
+    where git is not there."""
+    import subprocess
+    try:
+        listed = subprocess.run(["git", "ls-files", "-z", "recipes"], cwd=ROOT, capture_output=True, timeout=30,
+                                check=True).stdout.decode("utf-8").split("\0")
+    except (OSError, subprocess.SubprocessError):
+        listed = []
+    found = [ROOT / name for name in listed if name.endswith(".json") and (ROOT / name).exists()]
+    return found or sorted((ROOT / "recipes").glob("*.json"))
+
+
+def test_skip_duplicates_keeps_a_different_body_with_the_same_box(tmp_path):
+    # a cylinder that fills a block's box is not the block again (the box alone decided: the cylinder went,
+    # and every later body's number moved); a real double still goes
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+    from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
+    from OCP.TopoDS import TopoDS_Compound
+    box = lambda: BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10, 10, 10).Shape()
+    cylinder = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(5, 5, 0), gp_Dir(0, 0, 1)), 5, 10).Shape()
+    compound, builder = TopoDS_Compound(), BRep_Builder()
+    builder.MakeCompound(compound)
+    for shape in (box(), cylinder, box()):
+        builder.Add(compound, shape)
+    writer = STEPControl_Writer()
+    writer.Transfer(compound, STEPControl_AsIs)
+    writer.Write(str(tmp_path / "twins.step"))
+    g = Graph()
+    g.add("import", "input.import_step", path=str(tmp_path / "twins.step"))
+    bodies = Evaluator(g, log=None).run()["import"]["bodies"]
+    assert [round(abs(b.volume), -1) for b in bodies] == [1000, 780]      # the block, the (faceted) cylinder
+    g.set("import", "skip_duplicates", 0)
+    assert len(Evaluator(g, log=None).run()["import"]["bodies"]) == 3
+    g.set("import", "path", "")
+    with pytest.raises(GraphError, match="choose a STEP file"):
+        Evaluator(g, log=None).run()
+
+
+def _box_graph():
+    g = Graph()
+    g.add("a", "implicit.box", centre="0, 0, 0", size="20, 20, 20")
+    g.add("b", "implicit.box", centre="60, 0, 0", size="20, 20, 20")
+    return g
+
+
+@pytest.mark.parametrize("node, kind, inputs, message", [
+    ("n", "field.noise", {"octaves": 0}, "Octaves must be between 1 and 12"),
+    ("n", "field.noise", {"roughness": -1.0}, "Roughness must be between 0 and 1"),
+    ("n", "field.noise", {"seed": -5}, "Seed must be 0 or more"),
+    ("c", "math.clamp", {"x": 0.5, "low": 2.0, "high": 1.0}, "Low (2) is above High (1)"),
+    ("s", "implicit.shell", {"body": link("a.out"), "thickness": 0.0}, "Thickness must be greater than 0"),
+    ("s", "implicit.smoothen", {"body": link("a.out"), "iterations": -1}, "Iterations must be at least 1"),
+    ("i", "implicit.intersect", {"a": link("a.out"), "b": link("b.out")}, "the bodies do not overlap"),
+    ("l", "lattice.struts", {"thickness": 0.0}, "Thickness must be greater than 0"),
+    ("m", "mesh.from_implicit", {"body": link("a.out"), "voxel": 1.0, "keep": 1.5}, "Keep triangles must be above 0"),
+    ("m", "mesh.from_implicit", {"body": link("a.out"), "voxel": 1.0, "tolerance": -1.0}, "must be 0 or more"),
+])
+def test_settings_that_cannot_work_say_what_is_wrong(node, kind, inputs, message):
+    # each of these was a raw Python error, a silent wrong result, or the same text as something else
+    g = _box_graph()
+    g.add(node, kind, **inputs)
+    with pytest.raises(GraphError) as err:
+        Evaluator(g, log=None, workers=1).run([node])
+    assert message in str(err.value), str(err.value)
+
+
+def test_typed_values_are_checked_before_a_run():
+    g = _box_graph()
+    g.add("x", "field.coordinate", axis="w")
+    g.add("u", "implicit.union", a=link("a.out"), b=link("b.out"), edge="zzz")
+    g.add("ball", "implicit.ball", radius="abc")
+    g.add("n", "field.noise", octaves=3.7)
+    g.add("scale", "cad.scale", scale=float("nan"))
+    g.add("out", "output.export", mesh=link("a.out"), path="part.step")
+    said = dict(g.problems())
+    assert said["x"] == "Axis: 'w' is not one of x, y, z"
+    assert said["u"].startswith("Edge: 'zzz' is not one of sharp")
+    assert said["ball"] == "Radius needs a number, not 'abc'"
+    assert said["n"] == "Octaves needs a whole number, not 3.7"
+    assert "needs a number" in dict((n, m) for n, m in g.problems() if "Scale" in m)["scale"]
+    assert any(n == "out" and "must end in .stl" in m for n, m in g.problems())
+    # a bypassed node only needs the input it passes on
+    g = _box_graph()
+    g.add("cut", "implicit.subtract", a=link("a.out"))
+    assert [m for n, m in g.problems() if n == "cut"] == ["B is not connected (a required input)"]
+    g.nodes["cut"]["bypass"] = True
+    assert not [m for n, m in g.problems() if n == "cut"]
+
+
+def test_face_lists_take_ranges_and_refuse_what_they_cannot_read():
+    from engine.facemask import FaceListError, faces_for_body, faces_on, parse_faces
+    assert faces_for_body("10-13, 2", 0) == [2, 10, 11, 12, 13] and faces_for_body("1:3-5; 7", 1) == [3, 4, 5, 7]
+    assert faces_for_body("1 : 3 - 5", 0) == [] and parse_faces("4, 2:9-10") == [4, 9, 10]
+    for text in ("-1", "5.5", "3,,x!", "1:2:3"):
+        with pytest.raises(FaceListError):
+            parse_faces(text)
+    with pytest.raises(FaceListError, match="no face selection named 'wall'"):
+        parse_faces("wall, 3")
+    body = Evaluator(Graph.from_dict({"version": 1, "nodes": {
+        "import": {"type": "input.import_step", "inputs": {"path": str(TEST_STEP)}}}}), log=None).run()["import"]["bodies"][0]
+    assert body.metadata["cad_bodies"] == 1 and faces_on("0:3, 4", body) == [3, 4]
+    with pytest.raises(FaceListError, match="body 5 does not exist"):
+        faces_on("5:10", body)
+    # in a list the node was given, the bodies that are there count (they may come from several files)
+    import copy
+    other = copy.deepcopy(body)
+    other.metadata["cad_body"] = 1
+    assert faces_on("1:6", body, among=[body, other]) == [] and faces_on("1:6", other, among=[body, other]) == [6]
+    with pytest.raises(FaceListError, match="body 2 does not exist"):
+        faces_on("2:6", body, among=[body, other])
+
+
+def test_a_domain_cuts_the_mesh_at_its_own_box_and_exports_name_their_formats(tmp_path):
+    g = Graph()
+    g.add("import", "input.import_step", path=str(TEST_STEP))
+    g.add("ball", "implicit.ball", centre="30, 20, 7", radius=100.0)
+    g.add("m", "mesh.from_implicit", body=link("ball.out"), voxel=0.5, domain=link("import.bodies"), padding=0.0)
+    out = Evaluator(g, log=None, workers=1).run(["m", "import"])
+    mesh, room = out["m"]["mesh"][0], out["import"]["bodies"][0].bounds
+    assert np.abs(mesh.bounds - room).max() < 0.05          # (it went 2 voxels on, 1 mm past the box)
+    from engine.meshing import export
+    with pytest.raises(ValueError, match="cannot write a '.step' mesh file"):
+        export(mesh, tmp_path / "part.step")
+    with pytest.raises(ValueError, match="without an extension"):
+        export(mesh, tmp_path / "part")
+    export(mesh, tmp_path / "part.obj")
+    assert (tmp_path / "part.obj").stat().st_size > 1000
+
+
 def test_recipes_are_valid():
-    for recipe in (ROOT / "recipes").glob("*.json"):
-        Graph.load(recipe).validate()
+    for recipe in shipped_recipes():
+        try:
+            Graph.load(recipe).validate()
+        except GraphError as err:
+            raise AssertionError(f"{recipe.name}: {err}") from err
 
 
 def test_events_report_progress_and_cache(tmp_path):
@@ -258,7 +393,7 @@ def test_math_on_numbers_gives_a_number_that_sets_number_inputs():
     g.add("noise", "field.noise", scale=link("sum.out"))             # a number input
     g.add("count", "cad.pattern", count=link("spacing.out"))         # an int input
     assert g.problems(["noise"]) == []
-    assert [m for _, m in g.problems(["count"])] == ["required input 'body' is not set"]
+    assert [m for _, m in g.problems(["count"])] == ["Bodies is not connected (a required input)"]
     out = Evaluator(g, log=None).run(["noise"])
     assert type(out["sum"]["out"]) is float and out["sum"]["out"] == 0.1 * 3 * 2    # float64, not float32
     g.add("x", "field.coordinate", axis="x")

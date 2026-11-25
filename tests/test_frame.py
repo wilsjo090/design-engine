@@ -324,6 +324,20 @@ def test_euler_buckling_of_a_column():
     assert res.buckling == pytest.approx(math.pi ** 2 * PLA.E * sec.Iy / (2 * L) ** 2, rel=0.01)
 
 
+def test_a_piece_held_at_both_ends_buckles_between_them():
+    # a column as ONE piece (as the frame check has every bar between two joints), clamped at the foot,
+    # its top propped sideways by two thin ties: P_cr = 20.19 E I / L^2. One cubic element cannot bow
+    # between ends that do not turn: it gave 44% too much, and the check's "buckling factor" with it
+    L, d = 100.0, 6.0
+    col, tie = Profile("round").section(d), Profile("round").section(2.0)
+    nodes = [(0, 0, 0), (0, 0, L), (200, 0, L), (0, 200, L)]
+    loads = np.zeros((4, 3))
+    loads[1, 2] = -1.0
+    res = beam.check(nodes, [(0, 1), (1, 2), (1, 3)], [col, tie, tie], PLA, [0, 2, 3], loads, ["round"] * 3, shear=False)
+    assert res.axial[0] == pytest.approx(-1.0, rel=0.01)
+    assert res.buckling == pytest.approx(20.19 * PLA.E * col.Iy / L ** 2, rel=0.03)
+
+
 def test_reactions_balance_the_loads():
     nodes = np.array([(0, 0, 0), (0, 40, 0), (30, 20, 10), (30, 20, 40), (60, 10, 20)], dtype=float)
     els = [(0, 2), (1, 2), (2, 3), (2, 4), (3, 4), (0, 3), (1, 3)]
@@ -1406,3 +1420,12 @@ def test_a_frame_connected_to_another_passes_its_load_into_it_and_joins(two_bloc
     mesh = field_to_mesh(F.Context(grid).eval_full(body).astype(np.float32), grid)
     solids = [p for p in mesh.split(only_watertight=False) if p.volume > 1.0]
     assert len(solids) == 1                                          # one part across both blocks
+    # Join Frames analyses the joined part under both frames' loads at once: frame A was sized for its own
+    # 100 N, without the 120 N frame B hangs on it
+    from engine.graph import nodes_frame as NF
+    assert "no material" in NF._joined_check(body, [ref_a, ref_b])
+    ref_a.material = ref_b.material = PLA
+    joined = NF.join_frames(ref_a, ref_b)
+    assert joined.note.startswith("joined part, all loads at once: safety factor") and "max deflection" in joined.note
+    assert NF.join_frames(ref_a, ref_b, check="no").key == joined.key and not getattr(
+        NF.join_frames(ref_a, ref_b, check="no"), "note", None)

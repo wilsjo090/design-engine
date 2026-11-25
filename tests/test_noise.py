@@ -59,3 +59,17 @@ def test_fields_cache_keys_depend_on_parameters():
     assert F.wave3d("gyroid", 5, 1, 8, 0).key != F.wave3d("gyroid", 5, 2, 8, 0).key
     with pytest.raises(ValueError):
         F.wave3d("nope")
+
+
+@pytest.mark.parametrize("octaves, roughness", [(1, 0.5), (3, 0.5), (3, 0.45), (5, 0.6)])
+def test_the_noise_field_spans_minus_one_to_one(octaves, roughness):
+    # as it comes, fractal noise only reaches about +-0.68 (3 octaves): "-1..1" was not true, a Remap of
+    # -1..1 never reached its ends and a texture two thirds of its Height
+    from engine.noise import gain
+    grid = Grid((0, 0, 0), (300, 300, 150), 2.0)
+    for seed in (0, 5):
+        values = F.Context(grid).eval_full(F.noise(12.0, octaves, roughness, seed))
+        assert 0.9 < values.max() <= 1.0 and -1.0 <= values.min() < -0.9
+        assert (np.abs(values) == 1.0).mean() < 2e-3                  # hardly anything is cut off at the ends
+    assert F.noise(12.0, octaves, roughness, 0).range == (-1.0, 1.0)
+    assert gain(octaves, roughness) == gain(octaves, roughness) > 1.0

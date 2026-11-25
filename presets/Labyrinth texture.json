@@ -22,7 +22,7 @@
       "id": "density",
       "type": "math.multiply",
       "inputs": {
-        "b": 60.0
+        "b": 44.5
       },
       "links": {
         "a": "noise.out"

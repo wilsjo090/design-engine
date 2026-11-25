@@ -135,7 +135,11 @@ export function NumberInput({ value, integer, unit, zero, slider, axis, onCommit
     return true
   }
   const finish = () => {
-    if (live || text === show(value)) return
+    if (text === show(value)) return
+    if (live) {  // (typed values are taken as they come; what is no number, "abc" or "1/2", stayed in the field)
+      if (read(text) === undefined) setText(show(value))
+      return
+    }
     if (!commit(text)) setText(show(value))  // not a number: back to what it was
   }
   const key = (e: KeyboardEvent<HTMLInputElement>) => {

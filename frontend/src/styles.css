@@ -105,6 +105,8 @@ button.on { background: #3a4a33; border-color: var(--accent); color: #d6f5c3; }
 .help-panel { position: absolute; top: 10px; right: 10px; width: 300px; max-height: calc(100% - 200px); z-index: 5;
   display: flex; flex-direction: column; background: rgba(33, 35, 39, 0.96); border: 1px solid var(--border);
   border-top: 3px solid var(--cat); border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); }
+/* the selected card lies under the panel's usual place: on the left instead (below the graph's buttons) */
+.help-panel.left { right: auto; left: 10px; top: 44px; max-height: calc(100% - 234px); }
 .help-head { display: flex; align-items: baseline; gap: 8px; padding: 8px 10px 6px; border-bottom: 1px solid var(--border); }
 .help-title { font-weight: 600; }
 .help-close { margin-left: auto; padding: 0 6px; background: none; border: none; color: var(--muted); }
@@ -587,6 +589,7 @@ body.scrubbing, body.scrubbing * { cursor: ew-resize !important; user-select: no
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
 }
 .vp-quick:has(.vec3) { width: 300px; }   /* (three X / Y / Z fields: room for "120.5" in each) */
+.vp-quick:has(.seg) { width: 310px; }    /* (buttons side by side, "sharp round chamfer", were cut off) */
 .vp-quick-head { padding: 0 12px 6px; color: #eef0f2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vp-quick-title { font-size: 11px; color: var(--muted); }
 .vp-quick-row { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 2px 12px; color: #eef0f2; }

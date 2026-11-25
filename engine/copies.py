@@ -186,7 +186,9 @@ def place(mesh, chosen, part, up="auto", base="bottom centre", layout="staggered
             check()
         found = H._face_holes(holes, face, V, Fc[tri], corner_uv, period, layout, sx, sy, axis, angle, offset,
                               randomness, seed, None, check, alternate, None, name=name, flat=flat, girth=girth,
-                              footprint=reach * most, margin=margin, height=height)
+                              footprint=reach * most, margin=margin, height=height,
+                              clear=float(np.max(margin + reach * most)),
+                              anchor=H._largest_face(V, Fc, ids, tri) if flat else None)
         if found is not None:
             parts.append(found)
     if not parts:
@@ -263,7 +265,9 @@ def place(mesh, chosen, part, up="auto", base="bottom centre", layout="staggered
         holes.cells = np.repeat(hull[None], len(holes), axis=0)
 
     border = H._border_points(V, Fc, ids, np.isin(ids, chosen), width)
-    at_edges = _shrink_to_edges(holes, border, margin, edges == "shrink")
+    # (the border is points up to 0.25 mm apart: a footprint's corner could reach half of that between two)
+    at_edges = _shrink_to_edges(holes, border, margin, edges == "shrink",
+                                slack=0.5 * float(np.clip(width / 8, 0.02, 0.25)))
     near_border = H._near_border(holes, border, margin)
     holes.take(~near_border)
     crowding, shrunk = np.zeros(len(holes), dtype=bool), 0
@@ -351,10 +355,11 @@ def _in_frames(holes, points, k, factor):
     return holes.unit_sdf((a * c + b * s) / size, (b * c - a * s) / size, k) * size
 
 
-def _shrink_to_edges(holes, border, margin, any_size):
+def _shrink_to_edges(holes, border, margin, any_size, slack=0.0):
     """Shrinks the copies whose footprint comes closer than `margin` to the border points, to the
     largest size that keeps it: all of them (any_size), else only those that need less than
-    EDGE_TRIM. Returns how many shrank."""
+    EDGE_TRIM. Returns how many shrank. `slack`: how far a corner can reach between two border points
+    (a spiral's copy stuck 0.095 mm out over the edge, "shrunk to fit inside")."""
     near = np.flatnonzero(H._near_border(holes, border, margin))
     if not len(near):
         return 0
@@ -365,7 +370,7 @@ def _shrink_to_edges(holes, border, margin, any_size):
     def fits(factor):
         closest = np.full(len(near), np.inf)
         np.minimum.at(closest, owner, _in_frames(holes, points, near[owner], factor[owner]))
-        return closest >= margin - 1e-9
+        return closest >= margin + slack - 1e-9
     factor = _largest(fits, len(near))
     take = (factor > 0) & (any_size | (factor >= EDGE_TRIM))
     holes.scale[near[take]] *= factor[take]

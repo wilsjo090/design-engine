@@ -34,8 +34,9 @@ PRESETS = {m.name: m for m in (
 def custom(E, nu, density, strength):
     if E <= 0:
         raise ValueError("stiffness E must be greater than 0")
-    if not -0.99 < nu < 0.499:
-        raise ValueError("Poisson's ratio must be below 0.5 (rubber-like) and above -1")
+    if not -0.99 < nu <= 0.499:
+        raise ValueError("Poisson's ratio must be at most 0.499 (rubber-like; 0.5 cannot be squeezed at all) and "
+                         "above -1")
     if density <= 0 or strength <= 0:
         raise ValueError("density and strength must be greater than 0")
     return Material("custom", float(E), float(nu), float(density), float(strength))

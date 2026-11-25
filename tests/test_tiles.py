@@ -11,7 +11,7 @@ from engine.cad_import import load_step, tessellate
 from engine.dualcontour import dual_contour
 from engine.graph import Evaluator, Graph, link
 from engine.grid import Grid
-from engine.meshing import FIELD_NORMAL, NORMAL_SCALE, field_to_mesh
+from engine.meshing import FIELD_NORMAL, NORMAL_SCALE, field_to_mesh, signed_volume
 
 TEST_STEP = Path(__file__).resolve().parents[1] / "samples" / "test_part.step"
 VOXEL = 0.25
@@ -78,7 +78,20 @@ def test_tiled_mesh_matches_the_whole_grid(part, small_blocks, tmp_path):
     assert computed > 1
     assert len(mesh.faces) == len(whole.faces)
     assert mesh.volume == pytest.approx(whole.volume, rel=1e-6)
+    assert whole.volume > 0 and mesh.volume > 0     # facing out, with no volume check in the meshers
     assert reload(mesh, tmp_path).is_watertight
+
+
+def test_meshes_face_out_without_a_volume_check(small_blocks):
+    """Marching cubes turns the triangles out of a body that is negative inside, also round a cavity (whose
+    surface faces into it) and where the body is cut by the box: whole grid and blocks."""
+    shell = F.shell(F.ball((0, 0, 0), 8.0), 2.0)
+    for field, volume in ((F.ball((0, 0, 0), 8.0), 4 / 3 * np.pi * 8 ** 3),
+                          (shell, 4 / 3 * np.pi * (9 ** 3 - 7 ** 3))):    # (a shell lies half on each side)
+        whole = whole_grid_mesh(field)
+        blocks, _, _ = tiles.mesh_tiled(field, field.bounds, VOXEL, 1.5, 1.0, sequential)
+        assert signed_volume(whole.vertices, whole.faces) == pytest.approx(volume, rel=0.01)
+        assert signed_volume(blocks.vertices, blocks.faces) == pytest.approx(volume, rel=0.01)
 
 
 def unit_normals(mesh):

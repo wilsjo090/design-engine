@@ -25,7 +25,7 @@ def chosen_faces(cad, faces, apply):
     if apply not in facemask.APPLY:
         raise GraphError(f"Apply to must be one of: {', '.join(facemask.APPLY)}")
     body = facemask.cad_body(cad)
-    picked = facemask.faces_for_body(faces, body)
+    picked = facemask.faces_on(faces, cad)
     count = int(ids.max()) + 1 if len(ids) else 0
     wrong = [f for f in picked if f >= count]
     if wrong:
@@ -277,6 +277,7 @@ def surface_pattern(cad, faces, apply, shape, sides, size, length, corner_radius
     for text, level in found.lines:
         report_message(text, level)
     out = H.relief(found, softness, band)
+    out.surface_band = float(band)
     if invert == "yes":  # the web: 1 on the chosen faces (fading in at their edge) except on the shapes
         ids = facemask.cad_faces(cad)
         on_faces = facemask.face_mask(cad, ids, chosen, softness, "inside", band, "surface")
@@ -394,6 +395,8 @@ def pattern_on_faces(body, cad, faces, apply, join, layout, spacing, girth, cell
     surfaces = list(cad) if isinstance(cad, list) else [cad]
     if not facemask.parse_faces(faces) and apply == "chosen faces":
         raise GraphError("pick the faces the copies go on (Faces: Pick)")
+    if not isinstance(size_scale, F.Field) and float(size_scale) <= 0:
+        raise GraphError("Size scale must be greater than 0")
     copies, sizes = [], []
     for surface in surfaces:
         chosen = chosen_faces(surface, faces, apply)
@@ -479,7 +482,9 @@ def picture(cad, faces, apply, path, width, mapping, offset_u, offset_v, angle, 
         darkness = PIC.load_image(path)
     except PIC.PictureError as err:
         raise GraphError(str(err)) from err
-    out = PIC.picture_field(place, darkness, width, (offset_u, offset_v), invert == "yes", band, key=str(path))
+    out = PIC.picture_field(place, darkness, width, (offset_u, offset_v), invert == "yes", band, key=str(path),
+                            depth=0.5 * place.wall(cad))
+    out.surface_band = float(band)
     out.note = f"{darkness.shape[1]} x {darkness.shape[0]} px, {width:g} x {width * darkness.shape[0] / darkness.shape[1]:.1f} mm, {place.mapping}"
     return out
 
@@ -512,6 +517,7 @@ def text(cad, faces, apply, text, font, height, mapping, offset_u, offset_v, ang
         raise GraphError(str(err)) from err
     width = darkness.shape[1] * height / pixels
     out = PIC.picture_field(place, darkness, width, (offset_u, offset_v), invert == "yes", band,
-                            key=f"text:{text}:{font}")
+                            key=f"text:{text}:{font}", depth=0.5 * place.wall(cad))
+    out.surface_band = float(band)
     out.note = f"{width:.1f} x {darkness.shape[0] * height / pixels:.1f} mm, {place.mapping}"
     return out

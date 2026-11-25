@@ -9,6 +9,7 @@ import {
   type CheckReport, type MemberSection,
 } from '../api'
 import { casesKey, parseCases, type LoadCase } from '../loadCases'
+import { useShallow } from 'zustand/react/shallow'
 import { useStore, type Variant } from '../store'
 import type { Axis, ColorMap, FaceData, FaceRef, FaceSelection, FrameView, GroundView, Marker, MenuEntry, Paint, ViewMesh } from '../types'
 import { QUALITY_LABEL, isLink, parseFaceKeys, resolveFaces } from '../types'
@@ -30,7 +31,7 @@ import { GUIDE_TYPES, Guides, PIPE, offsetStep, parseVec, vectorText } from './G
 import { parsePoints, pointsText } from './pipeShape'
 import { BodyHint } from './BodyHint'
 import { CAD_ENV, CadBody, CadEdges, CadLookPanel, toggleCadEdges, useCadEnvironment, useLook, useLookGeometry } from './CadBody'
-import { CAP_COLOR, hideRanges, useBoxCut, type CutBox } from './viewCut'
+import { CAP_COLOR, useBoxCut, useHideRanges, type CutBox } from './viewCut'
 import { edgesShown, useCadLook } from '../cadLook'
 import { cancelBoundsTree, scheduleBoundsTree } from '../bvhBuild'
 import { ViewTimingOverlay, setFieldNormals, setViewTiming, useFieldNormals, useViewTiming, viewGeometry, viewNormals,
@@ -140,7 +141,7 @@ function ViewObject({ view, wireframe, ghost, clip, paint, cmap, range, onHover,
     return g
   }, [view, fieldNormals])
   useEffect(() => () => { cancelBoundsTree(geometry); geometry.disposeBoundsTree(); geometry.dispose() }, [geometry])
-  useEffect(() => hideRanges(geometry, view.indices, view.parts, 3, hide), [geometry, view, hide])
+  useHideRanges(geometry, view.indices, view.parts, 3, hide)
   // right-clicks and clicks raycast it: its search tree is built in a worker meanwhile (bvhBuild.ts)
   const menuTarget = !patch && ((!!node && !ghost) || variant !== undefined)
   useEffect(() => { if (menuTarget) scheduleBoundsTree(geometry, view.indices) }, [geometry, view, menuTarget])
@@ -439,6 +440,7 @@ function CameraFit({ views, extra, onBounds }: {
 }) {
   const camera = useThree((s) => s.camera) as THREE.PerspectiveCamera
   const controls = useThree((s) => s.controls) as unknown as OrbitControlsImpl | null
+  const invalidate = useThree((s) => s.invalidate)
   const fitRequest = useStore((s) => s.fitRequest)
   const lastFit = useRef(-1)
   const hadContent = useRef(false)
@@ -464,7 +466,8 @@ function CameraFit({ views, extra, onBounds }: {
     camera.updateProjectionMatrix()
     controls.target.copy(center)
     controls.update()
-  }, [views, extra, fitRequest, camera, controls, onBounds])
+    invalidate()   // (the canvas draws on demand: the camera was moved by hand)
+  }, [views, extra, fitRequest, camera, controls, onBounds, invalidate])
   return null
 }
 
@@ -474,6 +477,7 @@ function CameraFit({ views, extra, onBounds }: {
 function CameraTurn() {
   const camera = useThree((s) => s.camera)
   const controls = useThree((s) => s.controls) as unknown as OrbitControlsImpl | null
+  const invalidate = useThree((s) => s.invalidate)
   const request = useStore((s) => s.camera)
   useEffect(() => {
     if (!request || !controls) return
@@ -484,7 +488,8 @@ function CameraTurn() {
     camera.position.copy(target).addScaledVector(dir, distance)
     controls.target.copy(target)
     controls.update()
-  }, [request, camera, controls])
+    invalidate()
+  }, [request, camera, controls, invalidate])
   return null
 }
 
@@ -1549,10 +1554,12 @@ function FramePanel({ frames, hover, history, replay, onReplay }: {
   history: Record<string, { steps: FrameView[] }>; replay: { node: string; at: number } | null
   onReplay: (node: string, at: number | null) => void
 }) {
-  const status = useStore((s) => s.status)
+  // (the running step of the frames' own nodes only, not the whole status map: see Viewport)
+  const steps = useStore(useShallow((s) => Object.fromEntries(frames.map(([id]) =>
+    [id, s.status[id]?.state === 'running' ? s.status[id]?.step ?? null : null]))))
   /** what the node's LP is doing now (its progress step "layout (LP 8, interior point iteration 28)") */
   const ticking = (id: string, stage?: string) => {
-    const step = status[id]?.state === 'running' ? status[id]?.step : null
+    const step = steps[id]
     return step && stage && step.startsWith(`${stage} (`) && step.endsWith(')')
       ? `solving ${step.slice(stage.length + 2, -1)}` : null
   }
@@ -1754,7 +1761,9 @@ function ResultPanel({ node, paint, hover }: { node: string; paint: Paint; hover
 export function Viewport() {
   const viewsMap = useStore((s) => s.views)
   const visible = useStore((s) => s.visible)
-  const status = useStore((s) => s.status)
+  // only what the legend shows of the nodes' status: with the whole map, every progress event of any node
+  // rendered the 3D view (and everything in it) again
+  const states = useStore(useShallow((s) => Object.fromEntries(s.visible.map((id) => [id, s.status[id]?.state]))))
   const requestFit = useStore((s) => s.requestFit)
   const slices = useStore((s) => s.slices)
   const cmap = useStore((s) => s.slice.cmap)
@@ -2369,8 +2378,11 @@ export function Viewport() {
         rightDown.current = null
         if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) <= 5) openMenu(e.clientX, e.clientY)
       }}>
+      {/* frameloop demand: a frame only when something changed (a prop, the camera, an invalidate() where
+          three objects are changed by hand). Drawing every frame, an idle view of a few million triangles
+          kept the graphics card busy 120 times a second, the card the engine computes on. */}
       <Canvas camera={{ position: [150, -180, 130], fov: 35, near: 0.1, far: 20000 }} dpr={[1, 2]}
-        gl={{ antialias: true }}>
+        gl={{ antialias: true }} frameloop="demand">
         <ClippingOn />
         <color attach="background" args={['#24262b']} />
         <hemisphereLight args={['#f4f6fa', '#3a3d44', 1.2]} />
@@ -2454,14 +2466,14 @@ export function Viewport() {
                 : viewsMap[id]?.kind === 'cad' ? cadLook.color : KIND_STYLE[viewsMap[id]?.kind ?? 'mesh']?.color }} />
             <span className="legend-name">{id}</span>
             <span className="legend-info" title={voxelNote(viewsMap[id])}>
-              {status[id]?.state === 'running' ? 'updating…'
+              {states[id] === 'running' ? 'updating…'
                 : viewsMap[id] ? (viewsMap[id].level && !viewsMap[id].exact ? `${QUALITY_LABEL[viewsMap[id].level!]} · ` : '') +
                   (viewsMap[id].voxel && !viewsMap[id].exact ? `voxel ${fmtVoxel(viewsMap[id].voxel!)} · ` : '') +
                   `${(viewsMap[id].faces / 1000).toFixed(viewsMap[id].faces < 10000 ? 1 : 0)}k tris` +
                   (shownDetails[id] ? ` · on screen ${fmtVoxel(shownDetails[id].voxel)}` : '') +
                   (paints[id] ? ` · coloured by ${paints[id].label}${paints[id].unit ? ` (${paints[id].unit})` : ''}` : '')
                 : slices[id] ? `field slice, ${slices[id].axis} = ${slices[id].position.toFixed(1)}`
-                : status[id]?.state === 'error' ? 'error'
+                : states[id] === 'error' ? 'error'
                 : guideIds.split(' ').includes(id) ? 'shape (select its node to drag it)' : '…'}
             </span>
           </div>

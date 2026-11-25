@@ -1,0 +1,418 @@
+{
+  "version": 1,
+  "nodes": {
+    "import": {
+      "type": "input.import_step",
+      "inputs": {
+        "path": "samples/hanger_web.step"
+      },
+      "pos": [
+        0,
+        1200
+      ]
+    },
+    "space": {
+      "type": "input.pick_body",
+      "inputs": {
+        "index": 0,
+        "bodies": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        360,
+        900
+      ]
+    },
+    "plate": {
+      "type": "input.pick_body",
+      "inputs": {
+        "index": 1,
+        "bodies": {
+          "link": "import.bodies"
+        }
+      },
+      "pos": [
+        360,
+        3300
+      ]
+    },
+    "keep_plate": {
+      "type": "implicit.from_cad",
+      "inputs": {
+        "cad": {
+          "link": "plate.body"
+        },
+        "band": 2
+      },
+      "pos": [
+        1440,
+        3300
+      ]
+    },
+    "petg": {
+      "type": "sim.material",
+      "inputs": {
+        "preset": "PETG"
+      },
+      "pos": [
+        1440,
+        3060
+      ]
+    },
+    "screws": {
+      "type": "sim.fixed",
+      "inputs": {
+        "faces": "29, 30, 33, 34",
+        "cad": {
+          "link": "space.body"
+        }
+      },
+      "pos": [
+        720,
+        -340
+      ]
+    },
+    "left_down": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "23",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "0, 0, -1",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        0
+      ]
+    },
+    "case_left_down": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "left_down.conditions"
+        },
+        "name": "Left shaft, down",
+        "add_to": {
+          "link": "screws.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        0
+      ]
+    },
+    "left_right": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "23",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "1, 0, -0.5",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        340
+      ]
+    },
+    "case_left_right": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "left_right.conditions"
+        },
+        "name": "Left shaft, right",
+        "add_to": {
+          "link": "case_left_down.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        340
+      ]
+    },
+    "left_left": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "23",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "-1, 0, -0.5",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        680
+      ]
+    },
+    "case_left_left": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "left_left.conditions"
+        },
+        "name": "Left shaft, left",
+        "add_to": {
+          "link": "case_left_right.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        680
+      ]
+    },
+    "middle_down": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "22",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "0, 0, -1",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        1020
+      ]
+    },
+    "case_middle_down": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "middle_down.conditions"
+        },
+        "name": "Middle shaft, down",
+        "add_to": {
+          "link": "case_left_left.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        1020
+      ]
+    },
+    "middle_right": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "22",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "1, 0, -0.5",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        1360
+      ]
+    },
+    "case_middle_right": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "middle_right.conditions"
+        },
+        "name": "Middle shaft, right",
+        "add_to": {
+          "link": "case_middle_down.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        1360
+      ]
+    },
+    "middle_left": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "22",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "-1, 0, -0.5",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        1700
+      ]
+    },
+    "case_middle_left": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "middle_left.conditions"
+        },
+        "name": "Middle shaft, left",
+        "add_to": {
+          "link": "case_middle_right.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        1700
+      ]
+    },
+    "right_down": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "24",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "0, 0, -1",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        2040
+      ]
+    },
+    "case_right_down": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "right_down.conditions"
+        },
+        "name": "Right shaft, down",
+        "add_to": {
+          "link": "case_middle_left.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        2040
+      ]
+    },
+    "right_right": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "24",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "1, 0, -0.5",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        2380
+      ]
+    },
+    "case_right_right": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "right_right.conditions"
+        },
+        "name": "Right shaft, right",
+        "add_to": {
+          "link": "case_right_down.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        2380
+      ]
+    },
+    "right_left": {
+      "type": "sim.load",
+      "inputs": {
+        "faces": "24",
+        "kind": "bearing",
+        "amount": 60,
+        "direction": "custom",
+        "vector": "-1, 0, -0.5",
+        "cad": {
+          "link": "space.body"
+        },
+        "offset": "0, -12, 0"
+      },
+      "pos": [
+        1080,
+        2720
+      ]
+    },
+    "case_right_left": {
+      "type": "sim.load_case",
+      "inputs": {
+        "loads": {
+          "link": "right_left.conditions"
+        },
+        "name": "Right shaft, left",
+        "add_to": {
+          "link": "case_right_right.conditions"
+        }
+      },
+      "pos": [
+        1440,
+        2720
+      ]
+    },
+    "topology": {
+      "type": "sim.topology",
+      "inputs": {
+        "skin": 4,
+        "detail": "medium",
+        "fillet": 5,
+        "edge": 1.5,
+        "space": {
+          "link": "space.body"
+        },
+        "material": {
+          "link": "petg.material"
+        },
+        "conditions": {
+          "link": "case_right_left.conditions"
+        },
+        "keep_body": {
+          "link": "keep_plate.out"
+        },
+        "keep": 50,
+        "min_thickness": 5.5,
+        "symmetry": "x",
+        "max_iterations": 200,
+        "walls": 6,
+        "edge_shape": "chamfer",
+        "members_as": "bars",
+        "bar_size": 7,
+        "bar_form": "straight"
+      },
+      "pos": [
+        1800,
+        1700
+      ],
+      "visible": true
+    }
+  }
+}

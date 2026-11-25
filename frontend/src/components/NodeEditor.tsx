@@ -242,26 +242,42 @@ function portType(nodeId: string, handle: string | null | undefined, side: 'sour
 function groupSelection() {
   const s = useStore.getState()
   if (!s.nodes.some((n) => n.selected && n.type === 'engine')) return
-  const name = prompt('Name for the new group (e.g. noise_wave). Its Number nodes become its settings.')?.trim()
-  if (!name) return
-  const error = s.createGroup(name)
-  if (error) alert(error)
-  else s.addLog(`Grouped into "${name}": Edit opens it, Ungroup puts the nodes back`, 'success')
+  // (the editor's own name box, as for frames and renaming: the browser's prompt() looked like another program)
+  s.setPrompt({
+    x: window.innerWidth / 2 - 130, y: 110, label: 'Name of the new group',
+    value: 'group',
+    done: (name) => {
+      const now = useStore.getState()
+      const error = now.createGroup(name)
+      if (error) now.addLog(error, 'error')
+      else now.addLog(`Grouped into "${name}": Edit opens it, Ungroup puts the nodes back`, 'success')
+    },
+  })
 }
 
 async function saveSelectionAsPreset() {
   const s = useStore.getState()
   const clip = s.copySelection()
   if (!clip) return
-  const name = prompt('Name for the preset (it appears under Presets when you add a node, in every recipe):')?.trim()
-  if (!name) return
-  const doc = prompt('A short description (optional):')?.trim()
-  try {
-    await api.savePreset(name, { ...clip, ...(doc ? { doc } : {}) })
-    s.addLog(`Saved preset "${name}" (${clip.nodes.length} node${clip.nodes.length === 1 ? '' : 's'})`, 'success')
-  } catch (err) {
-    s.addLog(`Could not save the preset: ${(err as Error).message}`, 'error')
+  const save = async (name: string, doc?: string) => {
+    const now = useStore.getState()
+    try {
+      await api.savePreset(name, { ...clip, ...(doc ? { doc } : {}) })
+      now.addLog(`Saved preset "${name}" (${clip.nodes.length} node${clip.nodes.length === 1 ? '' : 's'})`, 'success')
+    } catch (err) {
+      now.addLog(`Could not save the preset: ${(err as Error).message}`, 'error')
+    }
   }
+  const at = { x: window.innerWidth / 2 - 130, y: 110 }
+  s.setPrompt({
+    ...at, label: 'Name of the preset', value: 'preset',
+    done: (name) => {
+      void save(name).then(() => useStore.getState().setPrompt({
+        ...at, label: 'A short description (Esc: none)', value: '',
+        done: (doc) => { void save(name, doc) },
+      }))
+    },
+  })
 }
 
 function SelectionBar({ onFrame }: { onFrame: () => void }) {

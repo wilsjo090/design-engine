@@ -37,6 +37,7 @@ import collections
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -75,6 +76,7 @@ LAST_RESORT_SECONDS = 30       # after a stop: end the process if commit stays u
 
 
 _current = threading.local()  # (evaluator, node id) of the node running on this thread
+PROGRESS_EVERY = 0.08         # s between a node's progress events (see Evaluator._progress_due)
 
 
 def report_progress(done, total, step=None):
@@ -224,6 +226,7 @@ class Port:
     # dice button in the editor without it.)
     pick: str = None
     switch: bool = False   # an int that is 1 or 0: shown as an on/off switch
+    extensions: tuple = None   # a path input: the file endings it takes (checked before a run)
 
     def __post_init__(self):
         self.label = self.label or self.name.replace("_", " ").title()
@@ -523,16 +526,21 @@ class Graph:
                 except GraphError as err:
                     problems.append((node_id, str(err)))
                     continue
+                if not _is_link(value):
+                    wrong = _literal_problem(port, value)
+                    if wrong:
+                        problems.append((node_id, wrong))
+                    continue
                 if _is_link(value):
                     src_id, src_port = _split(value["link"])
                     src = self.nodes.get(src_id)
                     if src is None or src.get("type") not in REGISTRY:
-                        problems.append((node_id, f"{name}: links to missing node '{src_id}'"))
+                        problems.append((node_id, f"{port.label}: links to missing node '{src_id}'"))
                         continue
                     try:
                         out = REGISTRY[src["type"]].output(src_port)
                     except GraphError as err:
-                        problems.append((node_id, f"{name}: {err}"))
+                        problems.append((node_id, f"{port.label}: {err}"))
                         continue
                     if out.type not in _COMPATIBLE.get(port.type, {port.type}):
                         if out.type == "scalar" and "number" in _COMPATIBLE.get(port.type, ()) \
@@ -541,11 +549,13 @@ class Graph:
                                 problems.append((node_id, f"{port.label} needs a plain number, but '{src_id}' "
                                                           f"gives a field (one of its inputs varies with position)"))
                             continue
-                        problems.append((node_id, f"{name}: cannot connect {out.type} output "
+                        problems.append((node_id, f"{port.label}: cannot connect {out.type} output "
                                                   f"'{value['link']}' to {port.type} input"))
+            # (a bypassed node only passes one input on: it does not need the rest)
+            passing = bypass_input(spec) if spec.get("bypass") else None
             for port in ntype.inputs:
-                if port.name not in inputs and port.default is REQUIRED and not port.optional:
-                    problems.append((node_id, f"required input '{port.name}' is not set"))
+                if port.name not in inputs and port.default is REQUIRED and not port.optional and not passing:
+                    problems.append((node_id, f"{port.label} is not connected (a required input)"))
         try:
             self.order(list(self.nodes) if node_ids is None else node_ids)
         except GraphError as err:
@@ -613,11 +623,37 @@ def _output_extras(outputs):
     items = value if isinstance(value, list) else [value]
     found = [m for v in items if (m := getattr(v, "markers", None))]
     notes = [n for v in ([value] if isinstance(value, list) else []) + items if (n := getattr(v, "note", None))]
+    if isinstance(value, list) and not getattr(value, "note", None) and len(dict.fromkeys(notes)) > 1:
+        # a list whose bodies came out differently: not only the first one's line ("6 holes" for two plates
+        # with 12, "none placed" when the second body got them)
+        notes = [f"{notes[0]} · and {len(notes) - 1} more bodies with other results (see the log)"]
     frames = [f for v in items if (f := getattr(v, "frame_view", None))]
     grounds = [g for v in items if (g := getattr(v, "ground_view", None))]
     finished = [f for v in items if (f := getattr(v, "finished", None))]
     return {"markers": found or None, "note": notes[0] if notes else None, "frames": frames or None,
             "ground": grounds[0] if grounds else None, "finished": finished[0] if finished else None}
+
+
+def _literal_problem(port, value):
+    """What is wrong with a value typed into an input, or None: a choice that is not one of the port's (an
+    old recipe's, or a typo in a file: it used to fail inside the node, or be taken as something else), text
+    where a number goes, a number that is not finite, a fraction where a whole number goes."""
+    if value is None:
+        return None
+    if port.choices and isinstance(value, str) and value not in port.choices:
+        return f"{port.label}: '{value}' is not one of {', '.join(str(c) for c in port.choices)}"
+    if port.extensions and isinstance(value, str) and value.strip() \
+            and os.path.splitext(value)[1].lower() not in port.extensions:
+        return (f"{port.label}: the file name must end in {', '.join(port.extensions[:4])} "
+                f"(it ends in '{os.path.splitext(value)[1] or 'nothing'}')")
+    if port.type in ("number", "int", "scalar"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"{port.label} needs a number, not '{value}'"
+        if not math.isfinite(value):
+            return f"{port.label} needs a number (it is {value})"
+        if port.type == "int" and float(value) != int(value):
+            return f"{port.label} needs a whole number, not {value:g}"
+    return None
 
 
 def _literal_signature(port, value):
@@ -656,6 +692,7 @@ class Evaluator:
         self.failed = []    # run(keep_going=True): a GraphError per node that failed or has a problem
         self.memory_peak = 0
         self._notices = set()  # lines already sent this run (_notice)
+        self._progress = {}    # node id -> (time, step) of its last progress event sent (_progress_due)
         self.split = None  # two-stage maps: None = as SPLIT says (on the GPU), True = always, False = never
 
     def cancel(self):
@@ -701,7 +738,21 @@ class Evaluator:
 
     def _emit(self, **event):
         if self.on_event:
+            if event.get("type") == "progress" and not self._progress_due(event):
+                return
             self.on_event(event)
+
+    def _progress_due(self, event):
+        """Whether a progress event goes out: a node's last one (done = total), a new step, else at most
+        one every PROGRESS_EVERY s per node. A list of 144 bodies through 10 quick nodes sent 1,440 of them
+        in under 0.1 s, each its own WebSocket frame and its own redraw of the editor (2026-11-10)."""
+        node, step, now = event.get("node"), event.get("step"), time.perf_counter()
+        last = self._progress.get(node)
+        total = event.get("total")
+        if last is None or last[1] != step or (total and event.get("done", 0) >= total)                 or now - last[0] >= PROGRESS_EVERY:
+            self._progress[node] = (now, step)
+            return True
+        return False
 
     def _result(self, node_id, outputs):
         if self.on_result:
@@ -840,6 +891,7 @@ class Evaluator:
         picked on the previous STEP file must not keep the new part from being shown)."""
         self.memory_peak = 0
         self._notices = set()
+        self._progress = {}
         refresh_memory_limit(self.memory_in_use())  # from the RAM free now, fixed for this run
         self._reset_cache_budgets()
         stop = threading.Event()

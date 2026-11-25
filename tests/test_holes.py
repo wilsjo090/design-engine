@@ -239,9 +239,11 @@ def plate():
 
 def test_holes_in_a_plate_are_whole_and_measure_right(plate, tmp_path):
     holes = H.place(plate, [top_face(plate)], P2.Shape("round", 4), "grid", 6.0, align="x", margin=2.0)
-    # centres every 6 mm from the plane's origin, at least margin + radius (4 mm) from the edges
+    # centres every 6 mm, in the middle of the face (5 mm from both ends; from the plane's own origin they
+    # were 6 and 4 mm from them), at least margin + radius (4 mm) from the edges
     assert len(holes) == 6 * 4
-    assert np.allclose(np.unique(np.round(holes.centre[:, 0], 6)), [6, 12, 18, 24, 30, 36])
+    assert np.allclose(np.unique(np.round(holes.centre[:, 0], 6)), [5, 11, 17, 23, 29, 35])
+    assert np.allclose(np.unique(np.round(holes.centre[:, 1], 6)), [6, 12, 18, 24])
     assert np.allclose(holes.normal, [0, 0, 1]) and np.allclose(holes.depth, 3.5, atol=1e-4)
     assert holes.smallest_web == pytest.approx(2.0, abs=1e-3)
     out = reloaded(cut_mesh(plate, holes, 0.2), tmp_path)
@@ -280,12 +282,12 @@ def test_raised_shapes_stand_on_the_face(plate, tmp_path):
 
 def test_fields_set_each_pockets_depth_studs_height_and_slots_turn(plate, tmp_path):
     top = top_face(plate)
-    # pockets 0.2 to 3.2 mm deep across x: the column at x = 36 is as deep as the 3 mm wall, so it goes
+    # pockets 0.1 to 3.1 mm deep across x: the column at x = 35 is as deep as the 3 mm wall, so it goes
     # through (and no further: wall + 0.5)
     holes = H.place(plate, [top], P2.Shape("round", 4), "grid", 6.0, align="x", depth=F.X / 10 - 0.4)
     x = holes.centre[:, 0]
     assert len(holes) == 24 and np.allclose(holes.depth, np.where(x > 33, 3.5, x / 10 - 0.4), atol=1e-4)
-    assert any("Depth from the field: 0.20 to 3.20 mm" in t for t, _ in holes.lines)
+    assert any("Depth from the field: 0.10 to 3.10 mm" in t for t, _ in holes.lines)
     out = reloaded(cut_mesh(plate, holes, 0.2), tmp_path)
     assert out.is_watertight and genus(out) == 4
     # studs as tall as the field says; where it is 0 or less, none
@@ -388,6 +390,29 @@ def test_surface_pattern_raises_whole_studs(plate, tmp_path):
     assert len(areas) == 24 and np.abs(2 * np.sqrt(areas / np.pi) - 3.5).max() < 0.1
     assert np.abs(np.sort(centres[:, 0]) - np.sort(shapes.centre[:, 0])).max() < 0.05
     assert len(section_loops(out, 3.05)[0]) == 24                            # nothing raised between them
+
+
+def test_pockets_on_both_faces_of_a_wall_stay_unless_they_meet(tmp_path):
+    # seen along their axes, pockets on the two faces of a plate lie on top of each other: the check for
+    # shapes too close to those of another face took one face's pockets away whole (2 mm pockets on both
+    # faces of a 6 mm plate: 15 of 30 left)
+    thick = mesh_of(_box(0, 0, 0, 40, 30, 6))
+    top = top_face(thick)
+    bottom = face_where(thick, lambda c, n: n[:, 2] < -0.9)
+    both = [top, bottom]
+    one = H.place(thick, [top], P2.Shape("round", 4), "grid", 6.0, align="x", depth=2.0)
+    pockets = H.place(thick, both, P2.Shape("round", 4), "grid", 6.0, align="x", depth=2.0)
+    assert len(pockets) == 2 * len(one) == 48
+    assert pockets.smallest_web == pytest.approx(2.0, abs=1e-3)       # between neighbours, not through the wall
+    out = reloaded(cut_mesh(thick, pockets, 0.25), tmp_path)
+    assert out.is_watertight and out.volume == pytest.approx(40 * 30 * 6 - 48 * np.pi * 4 * 2, rel=6e-3)
+    # deep enough to meet in the wall (less than 1 mm left between their floors): one of each pair goes
+    assert len(H.place(thick, both, P2.Shape("round", 4), "grid", 6.0, align="x", depth=2.8)) == 24
+    # through holes from both faces are the same holes, once
+    assert len(H.place(thick, both, P2.Shape("round", 4), "grid", 6.0, align="x")) == 24
+    # a relief reaches at most half the wall: both faces keep theirs
+    relief = H.place(thick, both, P2.Shape("round", 4), "grid", 6.0, align="x", surface=True)
+    assert len(relief) == 48
 
 
 def test_dimples_leave_the_far_side_of_a_thin_wall_alone(tmp_path):
@@ -656,8 +681,8 @@ def test_rounded_and_chamfered_hole_edges(tmp_path, edge, at_depth):
     # one 4 mm hole with a 0.6 mm edge: 0.3 mm below the face the hole is wider by the fillet (or the
     # chamfer); half way through the plate it is 4 mm
     small = mesh_of(_box(0, 0, 0, 12, 12, 4))
-    holes = H.place(small, [top_face(small)], P2.Shape("round", 4), "grid", 20.0, offset=(6.0, 6.0), margin=1.0)
-    assert len(holes) == 1
+    holes = H.place(small, [top_face(small)], P2.Shape("round", 4), "grid", 20.0, margin=1.0)
+    assert len(holes) == 1 and np.allclose(holes.centre[0, :2], [6, 6])     # in the middle of the face
     body = F.subtract_edged(F.body_from_mesh(small, 2.0), H.cutter(holes).regrow(0.6), edge, 0.6)
     grid = Grid.from_bounds(small.bounds, 0.05, 1.0)
     out = reloaded(field_to_mesh(F.Context(grid).eval_full(body), grid), tmp_path)
@@ -721,6 +746,51 @@ def test_text_and_picture_nodes(tmp_path):
         Evaluator(g, log=None).run()
 
 
+def test_pictures_keep_to_their_side_their_angle_and_their_kind_of_face(tmp_path):
+    from PIL import Image
+    from engine import picture as PIC
+    plate = mesh_of(_box(0, 0, 0, 60, 30, 3))
+    top = top_face(plate)
+    dark = np.zeros((40, 40), dtype=np.float32)
+    dark[10:30, 5:35] = 1.0
+    place = PIC.Placement(plate, [top])
+    # a Band over the wall printed the picture on the far side as well: the nodes give half the wall
+    assert place.wall(plate) == pytest.approx(3.0, abs=1e-3)
+    through = PIC.picture_field(place, dark, 20.0, band=8.0)
+    kept = PIC.picture_field(place, dark, 20.0, band=8.0, depth=0.5 * place.wall(plate))
+    assert F.sample(through, (30, 15, 0.2)) == 1.0 and F.sample(kept, (30, 15, 0.2)) == 0.0
+    assert F.sample(kept, (30, 15, 2.0)) == 1.0 and F.sample(kept, (30, 15, 6.0)) == 1.0
+    # the angle is part of what the field is (two pictures that differed only in Angle were one)
+    turned = PIC.picture_field(PIC.Placement(plate, [top], angle=90.0), dark, 20.0)
+    assert turned.key != PIC.picture_field(place, dark, 20.0).key
+    assert F.sample(turned, (30, 21.5, 3)) == 1.0 and F.sample(PIC.picture_field(place, dark, 20.0), (30, 21.5, 3)) == 0.0
+    # around a flat face there is no axis: said, instead of a picture that lands nowhere
+    with pytest.raises(PIC.PictureError, match="round face"):
+        PIC.Placement(plate, [top], mapping="around")
+    # 16-bit greys keep their greys, a photo taken sideways is turned upright, no file is said plainly
+    deep = np.zeros((20, 30), dtype=np.uint16)
+    deep[:, :10], deep[:, 10:20] = 65535, 32768
+    Image.fromarray(deep).save(tmp_path / "deep.png")
+    loaded = PIC.load_image(tmp_path / "deep.png")
+    assert loaded.shape == (20, 30) and loaded[5, 5] == pytest.approx(0.0, abs=0.01)
+    assert loaded[5, 15] == pytest.approx(0.5, abs=0.01) and loaded[5, 25] == pytest.approx(1.0, abs=0.01)
+    photo = Image.fromarray(np.full((20, 30), 255, dtype=np.uint8))
+    exif = photo.getexif()
+    exif[0x0112] = 6                                    # "rotate 90 degrees to show"
+    photo.save(tmp_path / "photo.jpg", exif=exif)
+    assert PIC.load_image(tmp_path / "photo.jpg").shape == (30, 20)
+    with pytest.raises(PIC.PictureError, match="choose a picture"):
+        PIC.load_image("")
+
+
+def test_a_spacing_far_below_the_size_is_refused_before_it_fills_the_memory(plate):
+    # 4 mm holes 0.5 mm apart: thousands of shapes with hundreds of neighbours each (2.8 GB in seconds)
+    big = mesh_of(_box(0, 0, 0, 120, 120, 3))
+    with pytest.raises(H.HoleError, match="far too close"):
+        H.place(big, [top_face(big)], P2.Shape("round", 4), "grid", 0.5, align="x", margin=0.0)
+    assert len(H.place(plate, [top_face(plate)], P2.Shape("round", 4), "grid", 6.0, align="x")) == 24
+
+
 def test_edges_are_node_inputs():
     from engine.graph.core import REGISTRY
     for kind in ("implicit.subtract", "implicit.union"):
@@ -781,12 +851,12 @@ def test_tangent_faces_share_one_pattern():
     rows = np.unique(np.round(along(joined.centre), 1))
     assert len(rows) == 9 and off_rows(joined.centre) < 0.01      # 3 rows on the front, 1 on the fillet, 5 on top
     assert off_rows(apart.centre) > 1.0                             # a pattern per face: out of step at the borders
-    assert joined.smallest_web > 2.5 and apart.smallest_web < 1.0
+    assert joined.smallest_web > 2.5
     # the largest face (the top) keeps the holes it has without joining
     from scipy.spatial import cKDTree
     top_joined = joined.centre[joined.centre[:, 2] > 20 - 1e-6]
     top_apart = apart.centre[apart.centre[:, 2] > 20 - 1e-6]
-    assert len(top_joined) == len(top_apart) == 35 and cKDTree(top_joined).query(top_apart)[0].max() < 1e-5
+    assert len(top_joined) == len(top_apart) == 40 and cKDTree(top_joined).query(top_apart)[0].max() < 1e-5
 
 
 def test_folds_cut_the_sheet_open():

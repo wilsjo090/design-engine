@@ -63,8 +63,12 @@ def number(value):
 def import_step(path, tolerance, skip_duplicates, angle):
     """Read all solid bodies from a STEP file. The triangulated bodies are kept on the SSD, so
     opening the same file (unchanged, same settings) again takes about a second."""
-    if not path or not Path(path).exists():
+    if not path:
+        raise GraphError("choose a STEP file (Path)")
+    if not Path(path).exists():
         raise GraphError(f"STEP file not found: {path}")
+    if tolerance <= 0 or angle <= 0:
+        raise GraphError("Tolerance and Max angle must be greater than 0")
     found = load_step_meshes(path, tolerance, angle)
     if found is None:
         # imported here: OpenCascade is large, and worker processes never need it
@@ -83,7 +87,10 @@ def import_step(path, tolerance, skip_duplicates, angle):
             report_message(f"Import STEP: body {i + 1} has {len(mesh.faces) / 1e6:.1f} million triangles "
                            f"(tolerance {tolerance:g} mm, angle {angle:g}). Everything after it gets slow and "
                            f"heavy; a larger angle (e.g. 0.5-1.0) or tolerance gives far fewer.", "error")
-        key = tuple(np.round(mesh.bounds.ravel(), 2))
+        # a double: the same box, triangles and volume (the box alone also dropped a cylinder that fills a
+        # block's box, and every later body's number moved)
+        key = (tuple(np.round(mesh.bounds.ravel(), 2)), len(mesh.faces),
+               round(abs(float(meshing.signed_volume(mesh.vertices, mesh.faces))), 2))
         if skip_duplicates and key in seen:
             continue
         seen.add(key)
@@ -92,6 +99,8 @@ def import_step(path, tolerance, skip_duplicates, angle):
         if names is not None and i < len(names):
             mesh.metadata["cad_name"] = names[i]
         meshes.append(mesh)
+    for mesh in meshes:
+        mesh.metadata["cad_bodies"] = len(meshes)   # (so "5:10" on a file of 3 bodies can be called wrong)
     return meshes
 
 
@@ -231,7 +240,7 @@ def mirror_bodies(cad, plane, position, faces, keep):
 
         def chosen(b):
             ids = facemask.cad_faces(b)
-            wanted = facemask.faces_for_body(faces, facemask.cad_body(b))
+            wanted = facemask.faces_on(faces, b, among=bodies)
             return None if ids is None or not wanted else np.isin(ids, wanted)
         try:
             point, normal = face_plane(bodies, chosen)
@@ -279,6 +288,8 @@ def pattern_bodies(body, kind, count, spacing, rows, row_spacing, axis, vector, 
     if kind == "linear":
         step = np.asarray(_point(spacing, "spacing"))
         row_step = np.asarray(_point(row_spacing, "row spacing")) if rows > 1 else np.zeros(3)
+        if (count > 1 and not np.any(step)) or (rows > 1 and not np.any(row_step)):
+            raise GraphError("Spacing is 0, 0, 0: the copies would lie on top of each other")
         moves = [trimesh.transformations.translation_matrix(i * step + j * row_step)
                  for j in range(rows) for i in range(count)]
     else:
@@ -318,12 +329,18 @@ def cylindrical(axis, component):
        Port("octaves", "int", 3, doc="Layers of finer detail added on top. 1-2 = smooth, 4+ = wrinkly."),
        Port("roughness", "number", 0.5, slider=(0, 1), doc="How strong each finer layer is, 0..1. Higher = rougher."),
        Port("seed", "int", 0, doc="Any whole number. Change it for a different pattern with the same character.")],
-      [Port("out", S, doc="Smooth random values, roughly -1..1. Connect it to a Texture for bumps, Remap it to "
+      [Port("out", S, doc="Smooth random values spanning -1..1. Connect it to a Texture for bumps, Remap it to "
                           "the range you need, or multiply it by a density and wave it for contour lines.")])
 def noise(scale, octaves, roughness, seed):
-    """Smooth random variation in 3D, roughly -1..1. Same seed = same pattern."""
+    """Smooth random variation in 3D, spanning -1..1. Same seed = same pattern."""
     if scale <= 0:
         raise GraphError("scale must be greater than 0")
+    if not 1 <= octaves <= 12:      # (0 gave a constant 0, 40 a cast warning)
+        raise GraphError("Octaves must be between 1 and 12")
+    if not 0 <= roughness <= 1:     # (negative ones left the -1..1 range)
+        raise GraphError("Roughness must be between 0 and 1")
+    if seed < 0:
+        raise GraphError("Seed must be 0 or more")
     return F.noise(scale, octaves, roughness, seed)
 
 
@@ -366,15 +383,20 @@ def face_mask(cad, faces, fade, position, band, reach, apply="chosen faces"):
     if unknown:
         raise GraphError(f"no face selection named '{unknown[0]}' in this recipe")
     body = facemask.cad_body(cad)
-    chosen = facemask.faces_for_body(faces, body)
+    chosen = facemask.faces_on(faces, cad)
     wrong = [f for f in chosen if f > ids.max()]
     if wrong:
         raise GraphError(f"face {wrong[0]} does not exist (body {body} has faces 0-{ids.max()})")
     if fade < 0:
         raise GraphError("fade must be 0 or more")
+    if reach == "surface" and band <= 0:
+        raise GraphError("Band must be greater than 0")
     if apply not in facemask.APPLY:
         raise GraphError(f"Apply to must be one of: {', '.join(facemask.APPLY)}")
-    return facemask.face_mask(cad, ids, chosen, fade, position, band, reach, invert=apply == "all other faces")
+    out = facemask.face_mask(cad, ids, chosen, fade, position, band, reach, invert=apply == "all other faces")
+    if reach == "surface":
+        out.surface_band = float(band)   # (a Texture or Offset Body taller than it says so: `_warn_band`)
+    return out
 
 
 @node("field.wave3d", "3D Wave", "Fields",
@@ -501,6 +523,8 @@ _unary("math.sqrt", "Sqrt", F.sqrt, lambda x: np.sqrt(max(x, 0.0)), "Square root
       [Port("out", S, doc="X limited to Low..High.")], numeric=True)
 def clamp(x, low, high):
     """Limit x to the range low..high."""
+    if _plain(low, high) and float(low) > float(high):   # (it gave High everywhere, silently)
+        raise GraphError(f"Low ({float(low):g}) is above High ({float(high):g})")
     if _plain(x, low, high):
         return _number(min(max(float(x), float(low)), float(high)), "Clamp")
     return F.clamp(_field(x), low, high)
@@ -542,7 +566,21 @@ def from_cad(cad, band):
 def offset(body, distance):
     """Grow (positive) or shrink (negative) a body. Drive the distance with a field for textures
     (the Texture node does the height, the range and the fade of a texture in one)."""
+    _warn_band("Offset Body", distance)
     return F.offset(_exact_to(body, distance), distance)
+
+
+def _warn_band(what, distance):
+    """Warn when an offset reaches farther from the surface than a Face Mask or pattern in it is computed
+    (its Band): beyond the Band they are 0, so the texture was cut off flat there without a word (a 3 mm
+    texture behind a mask with the default Band of 2 mm ended at 16.94 instead of 18 mm)."""
+    if not isinstance(distance, F.Field) or distance.range is None:
+        return
+    band, reach = F.surface_band(distance), max(abs(distance.range[0]), abs(distance.range[1]))
+    if band is not None and reach > band + 1e-6:
+        report_message(f"{what}: it reaches {reach:.3g} mm from the surface, but a Face Mask or pattern in it is "
+                       f"only computed {band:g} mm from the surface (its Band), so the rest is cut off flat: set "
+                       f"that Band to at least {reach:.3g} mm", "warning")
 
 
 TEXTURE_RANGES = ("auto", "as is")
@@ -586,6 +624,7 @@ def texture(body, pattern, height, fade, invert_fade="no", stretch="auto"):
     distance = p * height
     if isinstance(fade, F.Field) or fade != 1.0:
         distance = distance * fade
+    _warn_band("Texture", distance)
     return F.offset(body, distance)
 
 
@@ -654,7 +693,7 @@ def offset_faces(body, cad, faces, distance, sides, width, edge, edge_size, foot
     if unknown:
         raise GraphError(f"no face selection named '{unknown[0]}' in this recipe")
     number = facemask.cad_body(cad)
-    chosen = facemask.faces_for_body(faces, number)
+    chosen = facemask.faces_on(faces, cad)
     wrong = [f for f in chosen if f > ids.max()]
     if wrong:
         raise GraphError(f"face {wrong[0]} does not exist (body {number} has faces 0-{ids.max()})")
@@ -723,7 +762,12 @@ def _offset_note(patch, low, high, sides, edge, edge_size, foot, foot_size):
       [Port("out", "implicit", doc="A wall of that thickness, centred on the original surface.")])
 def shell(body, thickness):
     """Hollow wall of the given thickness, centred on the surface."""
-    return F.shell(_exact_to(body, thickness if isinstance(thickness, F.Field) else 0.5 * float(thickness)), thickness)
+    if not isinstance(thickness, F.Field) and float(thickness) <= 0:
+        raise GraphError("Thickness must be greater than 0")
+    out = F.shell(_exact_to(body, thickness if isinstance(thickness, F.Field) else 0.5 * float(thickness)), thickness)
+    if not isinstance(thickness, F.Field):
+        out.thinnest = float(thickness)     # (a mesher whose voxel cannot show it says so)
+    return out
 
 
 _EDGE_PORTS = [
@@ -754,10 +798,22 @@ def _exact_to(body, distance):
       [Port("out", "implicit", doc="Both bodies together.")])
 def union(a, b, edge="sharp", radius=0.5):
     """Both bodies combined. Edge round or chamfer fills the inner edges where they meet (e.g. a
-    fillet at the foot of raised shapes from a Hole Pattern)."""
+    fillet at the foot of raised shapes from a Hole Pattern): as a ball of that radius rolling over
+    both would (a chamfer: straight across where it touches), at any angle from 90° to flat, so faces
+    the two bodies share stay where they are."""
     if edge not in F.EDGES:
         raise GraphError(f"Edge must be one of: {', '.join(F.EDGES)}")
+    _sized(a, b)
     return F.union_edged(_regrown(a, edge, radius), _regrown(b, edge, radius), edge, radius)
+
+
+def _sized(*bodies):
+    """A lattice without a Domain goes on for ever: joined to a body it filled that body's box with lattice
+    without a word."""
+    for body in bodies:
+        if isinstance(body, F.Field) and body.bounds is None and getattr(body, "fills_box", False):
+            raise GraphError("the lattice has no size of its own: connect its Domain, or use Fill Body with "
+                             "Lattice to put it inside a body")
 
 
 @node("implicit.subtract", "Boolean Subtract", "Implicit",
@@ -777,7 +833,10 @@ def subtract(a, b, edge="sharp", radius=0.5):
       [Port("out", "implicit", doc="Only the volume that is inside both.")])
 def intersect(a, b):
     """Only where both bodies overlap."""
-    return F.intersect(a, b)
+    out = F.intersect(a, b)
+    if out.bounds is not None and np.any(out.bounds[0] >= out.bounds[1]):
+        raise GraphError("the bodies do not overlap: nothing is inside both")
+    return out
 
 
 @node("implicit.smooth_union", "Smooth Union", "Implicit",
@@ -787,6 +846,7 @@ def intersect(a, b):
       [Port("out", "implicit", doc="Both bodies joined, with a fillet-like blend between them.")])
 def smooth_union(a, b, radius):
     """Union with a fillet-like blend of about `radius` mm."""
+    _sized(a, b)
     return F.smooth_union(_exact_to(a, radius), _exact_to(b, radius), radius)
 
 
@@ -798,6 +858,8 @@ def smooth_union(a, b, radius):
       [Port("out", "implicit", doc="The smoothed body.")])
 def smoothen(body, iterations, grid_size):
     """Round off creases. Looks the same at any preview quality."""
+    if iterations < 1 or grid_size <= 0:   # (a negative count was "math domain error", a size of 0 did nothing)
+        raise GraphError("Iterations must be at least 1 and Grid size greater than 0")
     return F.smoothen(body, int(iterations), float(grid_size))
 
 
@@ -941,6 +1003,8 @@ def tpms_lattice(pattern, cell, mode, thickness, offset, domain, units):
     sharp nodes, good for printing."""
     if cell <= 0:
         raise GraphError("cell size must be greater than 0")
+    if mode == "sheet" and not isinstance(thickness, F.Field) and float(thickness) <= 0:
+        raise GraphError("Thickness must be greater than 0")
     return _fills_box(LAT.tpms(pattern, cell, thickness, mode, offset, domain.bounds if domain is not None else None,
                                units))
 
@@ -961,6 +1025,8 @@ def strut_lattice(pattern, cell, thickness, blend, domain, units):
     """A beam lattice repeating in every direction."""
     if cell <= 0:
         raise GraphError("cell size must be greater than 0")
+    if not isinstance(thickness, F.Field) and float(thickness) <= 0:
+        raise GraphError("Thickness must be greater than 0")
     return _fills_box(LAT.struts(pattern, cell, thickness, blend, domain.bounds if domain is not None else None, units))
 
 
@@ -979,6 +1045,8 @@ def voronoi_lattice(domain, cell, thickness, randomness, seed, units):
     """An organic foam of struts along the edges of random (Voronoi) cells."""
     if cell <= 0:
         raise GraphError("cell size must be greater than 0")
+    if not isinstance(thickness, F.Field) and float(thickness) <= 0:
+        raise GraphError("Thickness must be greater than 0")
     try:
         return _fills_box(LAT.voronoi(domain.bounds, cell, thickness, randomness, seed, units))
     except ValueError as err:
@@ -1032,6 +1100,12 @@ def _mesh(body, bounds, voxel, padding, keep, tolerance=0.0, cut_hint=None, meth
         raise GraphError("voxel size must be greater than 0")
     if method not in MESHERS:
         raise GraphError(f"Method must be one of: {', '.join(MESHERS)}")
+    thin = F.thinnest(body)
+    if thin is not None and voxel > 0.5 * thin:
+        # (a gyroid of 15% looked 3% solid at voxel 0.4, and a 0.6 mm shell a quarter of its volume at Draft)
+        report_message(f"walls or struts {thin:.2g} mm thick are under 2 voxels of {voxel:.2g} mm here: they come "
+                       f"out thinner than they are, or with holes. A finer quality (or voxel) shows them right",
+                       "warning")
     grid = Grid.from_bounds(bounds, voxel, padding)
     hint = _cut_hint(body, cut_hint)
     if grid.size > tiles.TILE_MIN_VOXELS:  # big body: in blocks, only where its surface is
@@ -1140,8 +1214,16 @@ def mesh_from_implicit(body, voxel, method, padding, domain, keep, tolerance, co
     """Turn an implicit body into a watertight triangle mesh (marching cubes, or dual contouring
     for sharp CAD edges)."""
     body, voxel = _field(body), float(voxel) * float(coarser)
+    if not 0 < keep <= 1:           # (1.5 was taken as 1, -1 as "as few as possible")
+        raise GraphError("Keep triangles must be above 0 and at most 1")
+    if tolerance < 0 or padding < 0:
+        raise GraphError("Tolerance and Padding must be 0 or more")
     if domain is not None:  # meshed inside the domain's box: cutting the body there is the point
-        return _mesh(body, domain.bounds, voxel, padding, keep, tolerance, method=method)
+        # ... exactly at its faces (the grid goes two voxels on, and the body went with it)
+        lo, hi = (np.asarray(v, dtype=float) for v in domain.bounds)
+        cut = F.intersect(body, F.box((lo + hi) / 2, hi - lo))
+        cut.bounds = np.array([lo, hi])
+        return _mesh(cut, domain.bounds, voxel, padding, keep, tolerance, method=method)
     if body.bounds is None:
         raise GraphError("cannot tell where this body is; connect a Domain")
     bounds, room = F.mesh_box(body, padding, voxel)
@@ -1330,7 +1412,8 @@ def merge_meshes(a, b, fuse):
 
 @node("output.export", "Export Mesh", "Output",
       [Port("mesh", "mesh", many=True, doc="The mesh to save. A list goes into one file."),
-       Port("path", "path", "out.stl", doc="Where to save: .stl, .3mf, .obj or .ply. Missing folders are created.")],
+       Port("path", "path", "out.stl", extensions=meshing.EXPORTS,
+            doc="Where to save: .stl, .3mf, .obj or .ply. Missing folders are created.")],
       [Port("path", "path", doc="The file that was written.")], side_effect=True)
 def export_mesh(mesh, path):
     """Write the mesh (a list is merged into one file)."""
@@ -1341,7 +1424,7 @@ def export_mesh(mesh, path):
 
 @node("output.preview", "Preview Image", "Output",
       [Port("mesh", "mesh", many=True, doc="The mesh to render. A list is shown together."),
-       Port("path", "path", "preview.png", doc="The PNG file to write.")],
+       Port("path", "path", "preview.png", extensions=(".png",), doc="The PNG file to write.")],
       [Port("path", "path", doc="The file that was written.")], side_effect=True)
 def preview_image(mesh, path):
     """Render a PNG of the mesh."""

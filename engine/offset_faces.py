@@ -102,6 +102,23 @@ def _corner_normals(V, F, ids):
     return sums[inverse].reshape(len(F), 3, 3)
 
 
+def _mates(edges):
+    """Per border edge, (n, 2): another border edge at its first and at its second vertex (the next one
+    round that vertex; -1 where the edge ends alone)."""
+    count = len(edges)
+    flat, owner = edges.ravel(), np.repeat(np.arange(count), 2)
+    order = np.argsort(flat, kind="stable")
+    vertex, edge = flat[order], owner[order]
+    first = np.r_[True, vertex[1:] != vertex[:-1]]
+    start = np.flatnonzero(first)
+    group = np.cumsum(first) - 1
+    size = np.diff(np.r_[start, len(vertex)])[group]
+    nxt = start[group] + (np.arange(len(vertex)) - start[group] + 1) % size
+    out = np.empty(2 * count, dtype=np.int64)
+    out[order] = np.where(size > 1, edge[nxt], -1)
+    return out.reshape(count, 2)
+
+
 def _quantile(values, weights, q):
     """The weighted q-quantile of values (inf counts as larger than everything; inf if none)."""
     values = np.where(np.isnan(values), np.inf, values)
@@ -135,6 +152,7 @@ class Patch:
         self.ids = ids[rows]
         self.normals = _corner_normals(self.V, self.F, self.ids) if len(rows) else np.zeros((0, 3, 3))
         self.edges = np.zeros((0, 2), dtype=np.int64)
+        self.mates = np.zeros((0, 2), dtype=np.int64)   # per border edge: another one at each of its ends (-1: none)
         self.s = np.zeros(0)
         self.ends = np.zeros((0, 2))
         self.unmatched = 0
@@ -177,6 +195,7 @@ class Patch:
         hit = np.abs(values) >= biggest[flat] - 1e-12
         at_vertex[flat[hit]] = values[hit]
         self.edges, self.s, self.ends, self.out = edges, s, at_vertex[edges], m
+        self.mates = _mates(edges)
 
     def _neighbour_normals(self, V, F, ids, selected, pairs):
         """The neighbouring (not chosen) face's own normal along each border edge (full-mesh vertex
@@ -267,7 +286,7 @@ def _fall(x):
     return 1.0 - t * t * (3.0 - 2.0 * t)
 
 
-def _local(points, tri, closest, V, F, N, edges, s_edge, ends, away, key):
+def _local(points, tri, closest, V, F, N, edges, s_edge, ends, away, mates, key):
     """(lat, hgt, s) for points whose closest point on the patch is `closest`, on triangle `tri`."""
     corners = V[F[tri]]
     e1, e2, w = corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0], closest - corners[:, 0]
@@ -291,14 +310,26 @@ def _local(points, tri, closest, V, F, N, edges, s_edge, ends, away, key):
     db = points - at
     hb = np.einsum("ij,ij->i", db, n)
     side = np.sqrt(np.maximum((db * db).sum(1) - hb * hb, 0.0))
-    # sideways from the border point: + away from the faces (a closest point a hair inside the border,
-    # within ON_BORDER, gives a hair less than 0, as it would have from `inside`)
-    side = np.where(np.einsum("ij,ij->i", db - hb[:, None] * n, away[k]) < 0, -side, side)
-    lat = np.where(on, side, -inside)
-    hgt = np.where(on, hb, height)
     a, b = V[edges[k, 0]], V[edges[k, 1]]
     length = np.linalg.norm(b - a, axis=1)
     along = np.minimum(np.linalg.norm(at - a, axis=1), length)
+    # sideways from the border point: + away from the faces (a closest point a hair inside the border,
+    # within ON_BORDER, gives a hair less than 0, as it would have from `inside`). At a corner of the
+    # border the point is outside if it is outside either edge that meets there: past the corner, on the
+    # plane that continues one edge, sideways is square to that edge's own outward direction, the sign of
+    # their product was rounding noise, and a sheet of "over the faces" ran out to the band's end (a
+    # plate's side wall moved out 1 mm: slivers 2.5 mm past the plate and a loose speck, 2026-11-10)
+    out = np.einsum("ij,ij->i", db - hb[:, None] * n, away[k])
+    for end, near in ((0, along <= ON_BORDER), (1, length - along <= ON_BORDER)):
+        rows = np.flatnonzero(near & (mates[k, end] >= 0))
+        if len(rows):  # (measured from the corner itself: a point a hair inside both edges stays inside)
+            dv = points[rows] - V[edges[k[rows], end]]
+            dv -= np.einsum("ij,ij->i", dv, n[rows])[:, None] * n[rows]
+            out[rows] = np.maximum(np.einsum("ij,ij->i", dv, away[k[rows]]),
+                                   np.einsum("ij,ij->i", dv, away[mates[k[rows], end]]))
+    side = np.where(out < -1e-9 * side, -side, side)
+    lat = np.where(on, side, -inside)
+    hgt = np.where(on, hb, height)
     ramp = np.maximum(np.minimum(length / 2, RUNOUT), 1e-9)
     s = s_edge[k] + (ends[k, 0] - s_edge[k]) * _fall(along / ramp) + (ends[k, 1] - s_edge[k]) * _fall((length - along) / ramp)
     return lat, hgt, s
@@ -335,7 +366,7 @@ def geometry(patch, band):
     """Field of (lat, hgt, s) at every sample, shape (3, *grid.shape): exact within `band` mm of the
     chosen faces, (FAR, FAR, 0) farther away (see the module doc)."""
     V, F, N = Shared(patch.V), Shared(patch.F), Shared(patch.normals)
-    edges, s_edge, ends, away = (Shared(a) for a in (patch.edges, patch.s, patch.ends, patch.out))
+    edges, s_edge, ends, away, mates = (Shared(a) for a in (patch.edges, patch.s, patch.ends, patch.out, patch.mates))
     key, band = patch.key, float(band)
 
     def fn(ctx):
@@ -344,7 +375,7 @@ def geometry(patch, band):
         out[0], out[1], out[2] = FAR, FAR, 0.0
         flat = [out[c].reshape(-1) for c in range(3)]
         start = np.asarray(grid.start)
-        arrays = (V.get(), F.get(), N.get(), edges.get(), s_edge.get(), ends.get(), away.get())
+        arrays = (V.get(), F.get(), N.get(), edges.get(), s_edge.get(), ends.get(), away.get(), mates.get())
         for near, tri, closest in _near(V, F, grid, band, key, ctx.xp is not np):
             if not len(near):
                 continue
@@ -354,7 +385,7 @@ def geometry(patch, band):
             for c in range(3):
                 flat[c][near] = values[c]
         return ctx.xp.asarray(out)
-    field = Field(fn, _digest("offset-faces-geometry", key, band), f"offset_faces_geometry({len(patch.F)})",
+    field = Field(fn, _digest("offset-faces-geometry", 2, key, band), f"offset_faces_geometry({len(patch.F)})",
                   cache=True)
     field.mesh = (key, len(patch.F))  # every process evaluating it builds a search tree for the faces
     return field

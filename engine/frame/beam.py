@@ -151,9 +151,28 @@ def check(nodes, elements, sections, material, supports, loads, kinds=None, up=U
 
     factor = np.inf
     if buckling and (axial < 0).any():
-        Gs = [Ts[i].T @ element_geometric(lengths[i], axial[i], sections[i]) @ Ts[i] for i in range(len(elements))]
-        KG = _assemble(n, elements, Gs)[free][:, free].tocsc()
-        factor = _buckling_factor(Kff, KG, lu)
+        # Every compressed element as two, with a node in its middle: one cubic element cannot bow between
+        # ends that are held from turning (a column fixed at the foot and propped at the top buckled at
+        # 164.7 N for 114.2, +44%; clamped at both ends not at all), two are within 0.02% (2026-11-10).
+        # Its axial force is the one just found.
+        pressed = np.flatnonzero(axial < 0)
+        middle = {int(i): n + k for k, i in enumerate(pressed)}
+        parts, stiff, geometric = [], [], []
+        for i, (a, b) in enumerate(elements):
+            half = int(i) in middle
+            L = lengths[i] / 2 if half else lengths[i]
+            k = Ks[i] if not half else Ts[i].T @ element_stiffness(
+                L, E, G, sections[i], SHEAR_K.get(kinds[i] if kinds else "", 5 / 6), shear) @ Ts[i]
+            g = Ts[i].T @ element_geometric(L, axial[i], sections[i]) @ Ts[i]
+            for pair in (((a, middle[int(i)]), (middle[int(i)], b)) if half else ((a, b),)):
+                parts.append(pair)
+                stiff.append(k)
+                geometric.append(g)
+        count = n + len(pressed)
+        loose = np.flatnonzero(~np.concatenate([fixed, np.zeros(6 * len(pressed), dtype=bool)]))
+        K2 = _assemble(count, parts, stiff)[loose][:, loose].tocsc()
+        KG = _assemble(count, parts, geometric)[loose][:, loose].tocsc()
+        factor = _buckling_factor(K2, KG, splinalg.splu(K2))
     return Check(u.reshape(n, 6), end, axial, stress, reactions, factor)
 
 

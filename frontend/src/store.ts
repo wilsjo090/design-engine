@@ -9,7 +9,7 @@ import type {
   LogEntry, Marker, NodeSpec, NodeStatus, Paint, Pieces, PromptState, Quality, QueueState, QuickEditState, Recipe, RunState,
   RunTag, SliceSettings, SliceView, Toast, ToastAction, ViewMesh, Warning,
 } from './types'
-import { DISPLAYABLE, GROUP_IN, GROUP_PREFIX, QUALITIES, QUALITY_LABEL, SETTING_TYPE, bypassInput, isLink } from './types'
+import { DISPLAYABLE, GROUP_IN, GROUP_PREFIX, QUALITIES, QUALITY_LABEL, SETTING_TYPE, bypassInput, isLink, unitOf } from './types'
 import { LOAD_CASE, caseName, nextCaseName } from './loadCases'
 import {
   FRAME_COLORS, contents, frameAround, hiddenBy, inFrame, nextFrameId, tidyFrames, type Frames,
@@ -344,7 +344,7 @@ const LIVE_STEPS = 600        // live frames kept per node for Replay (the wall 
 export const CLIENT = Math.random().toString(36).slice(2, 10)
 /** Runs that make no views (a detail adds to one; exports write files, optimizations save their result) */
 const VIEWLESS = ['detail', 'export', 'optimize']
-const COLUMN = 320            // one column of the graph (the recipes' layout)
+const COLUMN = 360            // one column of the graph (cards are up to 340 wide: at 320 they touched or overlapped)
 const NEW_W = 260, NEW_H = 240  // a new node's size before React Flow has measured it
 const GAP = 24
 
@@ -365,6 +365,38 @@ function freeSpot(anchor: EngineNode | undefined, place: 'right' | 'after', boxe
     x = anchor.position.x
     y += nodeBox(anchor).h + GAP
   }
+  for (let i = 0; i < 400 && hits(x, y); i++) y += 20
+  return { x, y }
+}
+
+/** Nodes that read a file, and the input that names it. */
+const FILE_INPUTS: Record<string, string> = { 'input.import_step': 'path', 'pattern.picture': 'path' }
+
+/** Whether everything shown waits for a file that has not been chosen yet (a new graph's Import STEP): a
+ *  preview would only fail then, so none is started (the card's "choose a file…" says what to do). */
+export function waitsForFile(s: Pick<State, 'nodes' | 'edges' | 'visible' | 'editing'>) {
+  if (s.editing || !s.visible.length) return false
+  const empty = new Set(s.nodes.filter((n) => {
+    const port = FILE_INPUTS[n.data?.typeId ?? '']
+    return port !== undefined && !isLink(n.data.inputs[port]) && !String(n.data.inputs[port] ?? '').trim()
+  }).map((n) => n.id))
+  if (!empty.size) return false
+  const needs = (id: string, seen: Set<string>): boolean => {
+    if (empty.has(id)) return true
+    if (seen.has(id)) return false
+    seen.add(id)
+    return s.edges.some((e) => e.target === id && needs(e.source, seen))
+  }
+  return s.visible.every((id) => needs(id, new Set()))
+}
+
+/** `at` moved down until a new node there overlaps none of `nodes` (a node added from the library, a new
+ *  group's node: they landed on top of the cards already there). */
+export function clearSpot(at: { x: number; y: number }, nodes: EngineNode[]) {
+  const boxes = nodes.map(nodeBox)
+  const hits = (x: number, y: number) => boxes.some((b) =>
+    x < b.x + b.w + GAP && x + NEW_W + GAP > b.x && y < b.y + b.h + GAP && y + NEW_H + GAP > b.y)
+  let { x, y } = at
   for (let i = 0; i < 400 && hits(x, y); i++) y += 20
   return { x, y }
 }
@@ -613,7 +645,21 @@ export const useStore = create<State>((set, get) => ({
       return { ...remember(s, 'connect'), edges, dirty: true, graphVersion: s.graphVersion + 1 }
     }),
 
-  setInput: (id, port, value) =>
+  setInput: (id, port, value) => {
+    // An input whose unit follows this one (a Load's Amount follows its Kind): the number stays and now
+    // means something else (100 N became 100 MPa without a word). Say so, and flash the node.
+    const before = get()
+    const node = before.nodes.find((n) => n.id === id)
+    const spec = node ? before.specs[node.data.typeId] : undefined
+    const read = (inputs: Record<string, unknown>) => (name: string) =>
+      (isLink(inputs[name]) ? undefined : inputs[name] ?? spec?.inputs.find((p) => p.name === name)?.default)
+    const changed: string[] = []
+    for (const p of spec?.inputs ?? []) {
+      if (!node || !p.unit || typeof p.unit === 'string' || Object.keys(p.unit)[0] !== port) continue
+      const was = unitOf(p, read(node.data.inputs)), now = unitOf(p, read({ ...node.data.inputs, [port]: value }))
+      const amount = read(node.data.inputs)(p.name)
+      if (was !== now && now && typeof amount === 'number') changed.push(`${p.label ?? p.name} is now ${amount} ${now} (it was ${was ?? 'without a unit'})`)
+    }
     set((s) => ({
       ...remember(s, `input:${id}.${port}`),
       nodes: s.nodes.map((n) =>
@@ -621,7 +667,12 @@ export const useStore = create<State>((set, get) => ({
       ),
       dirty: true,
       graphVersion: s.graphVersion + 1,
-    })),
+    }))
+    if (changed.length) {
+      get().flashNodes([id])
+      get().showToast(changed[0], changed.slice(1))
+    }
+  },
 
   addNode: (typeId, position) => {
     const s = get()
@@ -801,8 +852,14 @@ export const useStore = create<State>((set, get) => ({
         }
         case 'node_error':
           return { status: { ...s.status, [e.node]: { state: 'error', message: e.inner ? `${e.inner}: ${e.message}` : e.message } } }
-        case 'message':
-          return { log: [...s.log.slice(-199), { time: Date.now(), text: e.text, level: e.level ?? 'info' }] }
+        case 'message': {
+          // a warning or error said a moment ago is not said again: after an optimization the preview that
+          // follows computes the node once more, and every warning stood in the log twice
+          const level = e.level ?? 'info'
+          const now = Date.now()
+          if (level !== 'info' && s.log.slice(-20).some((l) => l.text === e.text && l.level === level && now - l.time < 15000)) return {}
+          return { log: [...s.log.slice(-199), { time: now, text: e.text, level }] }
+        }
         case 'run_done': {
           const run: RunState | null = s.run
             ? { ...s.run, running: false, phase: undefined, stopping: undefined, endedAt: Date.now() } : null
@@ -824,14 +881,20 @@ export const useStore = create<State>((set, get) => ({
             const files = Object.values(e.files ?? {}) as string[]
             if (files.length) files.forEach((f) => add(`Exported ${f}`, 'success'))
             else if (s.run?.mode === 'export') add('Nothing to export: add an Export Mesh node', 'error')
-            if (e.time > 1) add(`${what} finished in ${secs}`, 'info')
+            // (also after a quick one when the log's last line is an error or a warning: the bar at the bottom
+            // shows that last line, and kept saying something was wrong after the next run went well)
+            const last = log[log.length - 1]
+            if (e.time > 1 || (last && (last.level === 'error' || last.level === 'warning') && s.run?.mode !== 'detail')) {
+              add(`${what} finished in ${secs}`, 'info')
+            }
           }
           if (run && !e.cancelled && !VIEWLESS.includes(run.mode)) run.shown = e.shown ?? null
           if (run && run.mode === 'detail' && e.voxel) run.voxel = e.voxel
           // refining: the next quality, if this preview showed what works (also around a failing node),
           // a finer one would show more and nothing has changed since it was asked for. Views kept from
-          // a finer run count as what they are (no run that would change nothing)
-          if (run && run.mode === 'preview' && s.refine && !e.cancelled && (e.ok || e.left_out) && e.sharper &&
+          // a finer run count as what they are (no run that would change nothing). Not when the failing node
+          // left nothing to show: the same error was then run and logged at every quality
+          if (run && run.mode === 'preview' && s.refine && !e.cancelled && (e.ok || (e.left_out && e.shown)) && e.sharper &&
               run.tag?.version === s.graphVersion && run.quality) {
             const at = Math.max(QUALITIES.indexOf(run.quality), QUALITIES.indexOf(e.shown ?? run.quality))
             if (at < QUALITIES.indexOf(s.quality)) run.next = QUALITIES[at + 1]
@@ -1110,7 +1173,8 @@ export const useStore = create<State>((set, get) => ({
     const xs = picked.map((n) => n.position.x), ys = picked.map((n) => n.position.y)
     const instance: EngineNode = {
       id: instanceId, type: 'engine', selected: true,
-      position: { x: xs.reduce((a, b) => a + b, 0) / xs.length, y: ys.reduce((a, b) => a + b, 0) / ys.length },
+      position: clearSpot({ x: xs.reduce((a, b) => a + b, 0) / xs.length, y: ys.reduce((a, b) => a + b, 0) / ys.length },
+        s.nodes.filter((n) => !ids.has(n.id))),
       data: {
         typeId: GROUP_PREFIX + name,
         inputs: Object.fromEntries(picked.filter((n) => n.data.typeId === SETTING_TYPE)

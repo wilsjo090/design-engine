@@ -23,7 +23,7 @@ from .blockmesh import dual_block_values as _dual_block_values, mesh_block_value
 from .dualcontour import BLOCK_HALO, join_blocks
 from .fields import Context, halo as field_halo, mesh_triangles, release_mesh_caches
 from .grid import Grid
-from .meshing import FIELD_NORMAL, decimate, reduce, signed_volume, snap_float32
+from .meshing import FIELD_NORMAL, decimate, reduce, snap_float32
 
 BLOCK = 96             # voxels per block side; a multiple of ALIGN
 ALIGN = 12             # coarse sampling factors (noise 2-4, distance fields 2 and 4) all divide this
@@ -246,8 +246,8 @@ def _stitch(results, plan, tolerance, close):
         seam = on_seam[F].any(axis=1)
         if seam.any():
             V, F = reduce(V, F, tolerance / 2 / plan.voxel, frozen=~seam, snap=False)
-    if close and signed_volume(V, F) < 0:
-        F = F[:, ::-1]  # same as meshing.field_to_mesh: outward-facing triangles (the normals point out already)
+    # (marching cubes faces the triangles outward, as in meshing.surface_mesh: no volume integral, which took
+    # 60 ns per triangle here in the main process, 0.7 s for a 12M-triangle part)
     mesh = trimesh.Trimesh(plan.base + V * plan.voxel, F, process=False,
                            vertex_attributes=None if N is None else {FIELD_NORMAL: N})
     del V, F, N

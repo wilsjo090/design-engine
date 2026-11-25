@@ -194,9 +194,23 @@ def nearest_on_grid_gpu(V, F, grid, max_dist, key=None):
               inputs=[mesh.mesh.id, wp.vec3(*[float(c) for c in grid.base]), *grid.start, float(grid.voxel),
                       grid.shape[1], grid.shape[2], float(max_dist), face, closest])
     wp.synchronize_device()
-    face = face.numpy()
-    near = np.nonzero(face >= 0)[0]
-    return near, mesh.parent[face[near]].astype(np.int64), closest.numpy()[near].astype(np.float64)
+    # Only the samples near the mesh come back: picked out on the card (the whole grid's answers are 16 B per
+    # sample, 0.8 GB downloaded and held for a 50M grid of which a few % are near). Without room for that on
+    # the card, on the host as before.
+    try:
+        cp = backend.cupy()
+        found = cp.asarray(face)
+        near = cp.flatnonzero(found >= 0)
+        faces, points = cp.asnumpy(found[near]), cp.asnumpy(cp.asarray(closest)[near])
+        near = cp.asnumpy(near)
+        del found
+    except Exception as err:
+        if not backend.is_out_of_memory(err):
+            raise
+        faces = face.numpy()
+        near = np.nonzero(faces >= 0)[0]
+        faces, points = faces[near], closest.numpy()[near]
+    return near, mesh.parent[faces].astype(np.int64), points.astype(np.float64)
 
 
 def mesh_to_sdf_gpu(V, F, grid, band, key=None, coarse_factor=None):

@@ -23,7 +23,9 @@ from . import trace
 from .cache import default_cache_dir, psutil, read_npy
 
 FOLDER = "shared"
-INLINE_BYTES = 1 << 20      # smaller arrays travel inside the task as before
+INLINE_BYTES = 1 << 20      # smaller arrays travel inside the task as before (64 KB measured 2026-11-10 on the
+                            # lamp's 147 petals: sending is the closures' cloudpickle, 2.9 ms a task either way,
+                            # and the first run wrote 300 files in 5.3 s)
 KEEP_BYTES = 256 * 2**20    # arrays each process keeps after reading them (oldest dropped first)
 MAX_BYTES = 4 * 2**30       # files kept on the SSD; older files are deleted ...
 MIN_AGE = 3600.0            # ... unless written or read in the last hour (a run may be using them)
@@ -48,7 +50,8 @@ class Shared:
         array = np.ascontiguousarray(array)
         if key is None:
             h = hashlib.sha1(repr((array.dtype.str, array.shape)).encode())
-            h.update(memoryview(array).cast("B"))
+            if array.size:  # (a memoryview of an empty array cannot be cast: a patch without a border)
+                h.update(memoryview(array).cast("B"))
             key = h.hexdigest()[:32]
         self.key = f"{key}-{array.dtype.str.strip('<>|=')}-{'x'.join(map(str, array.shape))}"
         self._array = array
@@ -134,6 +137,19 @@ def forget():
 
 
 # --- arrays worked out once for all processes ---------------------------------------------------
+def _release(lock):
+    """Delete a lock file. Windows refuses while another process (or thread) has it open, as one that is
+    just looking whether it is stale does: the builder then failed with PermissionError although its arrays
+    were written (seen in a test run under load, 2026-11-10). Tried again for a moment; a lock left behind is
+    taken over as stale."""
+    for _ in range(50):
+        try:
+            lock.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            time.sleep(0.01)
+
+
 def prepared(kind, key, build):
     """`build()`'s dict of arrays (and plain numbers) for `key`, worked out once for all processes: the first
     process that needs them builds them and writes them to the shared folder, every process maps them from
@@ -162,7 +178,7 @@ def prepared(kind, key, build):
                     if found is None:
                         return built
             finally:
-                lock.unlink(missing_ok=True)
+                _release(lock)
             _trim(folder)
             return found
         with trace.span("prepare wait", kind=kind):
@@ -174,7 +190,7 @@ def prepared(kind, key, build):
         if time.time() >= deadline:
             return build()  # the other one takes too long: build without writing
         if _stale(lock):
-            lock.unlink(missing_ok=True)
+            _release(lock)
 
 
 def _take(lock):

@@ -10,7 +10,7 @@ import math
 import numpy as np
 from scipy.spatial import Voronoi
 
-from .fields import Context, Field, _digest, _lift
+from .fields import Context, Field, _digest, _lift, clamp
 from .shared import Shared
 
 # --- density: the share of solid material instead of a thickness ----------------------------
@@ -50,11 +50,12 @@ def _lookup(field, ys, label):
     return Field(fn, _digest("density", field.key, ys32.tobytes()), label, field.bounds, children=(field,), range=rng)
 
 
-def _cell_samples(field, cell, n=48):
-    """Values of a periodic lattice field over one cell (n³ points)."""
+def _cell_samples(field, cell, n=48, shift=(0.0, 0.0, 0.0)):
+    """Values of a periodic lattice field over one cell (n³ points), the points moved by `shift` cells."""
     from .grid import Grid
     step = float(cell) / n
-    return Context(Grid((0.0, 0.0, 0.0), (cell - step,) * 3, step)).eval_full(field)
+    lo = np.asarray(shift, dtype=float) * float(cell)
+    return Context(Grid(lo, lo + (cell - step), step)).eval_full(field)
 
 
 def _check_units(units):
@@ -116,22 +117,41 @@ TPMS_GRADIENT = {"gyroid": _gyroid_gradient, "schwarz_p": _schwarz_p_gradient, "
                  "neovius": _neovius_gradient, "lidinoid": _lidinoid_gradient}
 
 
-def tpms(kind, cell, thickness, mode="sheet", offset=0.0, bounds=None, units="mm"):
+def tpms(kind, cell, thickness, mode="sheet", offset=0.0, bounds=None, units="mm", true_walls=True):
     """A triply periodic minimal surface lattice with `cell` mm repeats. sheet: a wall `thickness`
-    mm thick centred on the surface; solid: the material on one side of the surface, moved by
-    `offset` mm (0 = about half the volume). `thickness`/`offset` may be fields. units="density":
-    `thickness` (sheet) or `offset` (solid modes) is the share of solid material, 0..1."""
+    mm thick centred on the surface (the wall's mean thickness: see below); solid: the material on one
+    side of the surface, moved by `offset` mm (0 = about half the volume). `thickness`/`offset` may be
+    fields. units="density": `thickness` (sheet) or `offset` (solid modes) is the share of solid
+    material, 0..1.
+
+    The field is value / |gradient|, a distance only right at the surface: taken as it is (true_walls
+    False), a 1.5 mm gyroid wall on 5 mm cells came out 1.17 mm, and thicker ones fell further behind.
+    So a sheet's thickness in mm is looked up like a density: the level whose solid share is the
+    surface's area per volume x the thickness, which makes the walls that thick on average (they still
+    vary across a cell, most for neovius and lidinoid)."""
     if kind not in TPMS:
         raise ValueError(f"type must be one of {', '.join(TPMS)}")
     if mode not in TPMS_MODES:
         raise ValueError(f"mode must be one of {', '.join(TPMS_MODES)}")
     _check_units(units)
     if units == "density":
-        base = _cell_samples(tpms(kind, cell, 0.0, mode, 0.0), cell)  # |distance| (sheet) or distance
+        base = _cell_samples(tpms(kind, cell, 0.0, mode, 0.0, true_walls=False), cell)  # |distance| or distance
         if mode == "sheet":
             thickness = _lookup(thickness, _density_curve(base, 2.0), "thickness from density")
         else:
             offset = _lookup(offset, _density_curve(base, 1.0), "offset from density")
+    elif mode == "sheet" and true_walls:
+        # (sampled a little off the cell's own lattice: on it the thin layer round the surface is counted
+        # up to 8% wrong, the surface passing through or between whole rows of points)
+        base = np.asarray(_cell_samples(tpms(kind, cell, 0.0, mode, 0.0, true_walls=False), cell, 64,
+                                        shift=(0.0026, 0.0054, 0.0082)), dtype=np.float64)
+        near = 0.015 * float(cell)                      # right at the surface the field is a distance
+        area = float((base < near).mean()) / (2 * near)  # the surface's area per volume, 1 / mm
+        curve = _density_curve(base, 2.0)
+        if isinstance(thickness, Field):
+            thickness = _lookup(clamp(thickness * area, 0.0, 1.0), curve, "sheet thickness")
+        else:
+            thickness = float(np.interp(min(max(float(thickness) * area, 0.0), 1.0), DENSITY_LEVELS, curve))
     f, gradient = TPMS[kind], TPMS_GRADIENT[kind]
     k = 2 * math.pi / float(cell)
     amount = _lift(thickness if mode == "sheet" else offset)
@@ -149,8 +169,11 @@ def tpms(kind, cell, thickness, mode="sheet", offset=0.0, bounds=None, units="mm
         if mode == "sheet":
             return (xp.abs(dist) - a * 0.5).astype(xp.float32)
         return ((dist if mode == "solid" else -dist) - a).astype(xp.float32)
-    return Field(fn, _digest("tpms", "exact gradient", kind, float(cell), mode, amount.key),
-                 f"tpms({kind}, {cell:g} mm)", bounds, children=(amount,))
+    out = Field(fn, _digest("tpms", "exact gradient", kind, float(cell), mode, amount.key),
+                f"tpms({kind}, {cell:g} mm)", bounds, children=(amount,))
+    if mode == "sheet" and amount.range is not None:
+        out.thinnest = float(amount.range[0])
+    return out
 
 
 # --- strut lattices -------------------------------------------------------------------------
@@ -266,19 +289,27 @@ def struts(kind, cell, thickness, blend=0.0, bounds=None, units="mm"):
             s = _segment_distance(*u, a, b, xp) * cell
             d = s if d is None else _smooth_min(d, s, blend, xp)
         return (d - ctx.eval(thickness) * 0.5).astype(xp.float32)
-    return Field(fn, _digest("struts", kind, cell, blend, thickness.key), f"struts({kind}, {cell:g} mm)", bounds,
-                 children=(thickness,))
+    out = Field(fn, _digest("struts", kind, cell, blend, thickness.key), f"struts({kind}, {cell:g} mm)", bounds,
+                children=(thickness,))
+    if thickness.range is not None:
+        out.thinnest = float(thickness.range[0])
+    return out
 
 
 # --- Voronoi foam ---------------------------------------------------------------------------
+VORONOI_CELLS = 400_000   # the most cells a foam is built with (2M once extrapolated to ~14 GB and ~160 s)
+
+
 def voronoi_struts(bounds, cell, randomness=1.0, seed=0):
     """Edges of the Voronoi cells of jittered grid points filling `bounds` (+ a margin), as
     (n, 2, 3) segments. randomness 0 = a regular grid of cells, 1 = fully random positions."""
     lo, hi = np.asarray(bounds, float)
     lo, hi = lo - 1.5 * cell, hi + 1.5 * cell
     counts = np.maximum(np.ceil((hi - lo) / cell).astype(int), 1)
-    if np.prod(counts) > 2_000_000:
-        raise ValueError(f"{np.prod(counts):,} Voronoi cells: use a larger cell size")
+    if np.prod(counts) > VORONOI_CELLS:   # (the foam is built in one go, in the main process)
+        fits = cell * (float(np.prod(counts)) / VORONOI_CELLS) ** (1 / 3)
+        raise ValueError(f"{np.prod(counts):,} Voronoi cells would take several GB and minutes to build: use a "
+                         f"cell size of at least {math.ceil(fits * 10) / 10:g} mm here (or a smaller domain)")
     idx = np.stack(np.meshgrid(*[np.arange(n) for n in counts], indexing="ij"), axis=-1).reshape(-1, 3)
     rng = np.random.default_rng(int(seed))
     jitter = rng.uniform(-0.5, 0.5, idx.shape) * max(float(randomness), 0.02)  # a little keeps Qhull happy
@@ -331,7 +362,10 @@ def voronoi(bounds, cell, thickness, randomness=1.0, seed=0, units="mm"):
         t = ctx.eval(thickness)
         dist = segment_distance(pieces, ctx.grid, float(cell) / 4, key=key, gpu=ctx.xp is not np)
         return dist - ctx.xp.asarray(t, dtype=ctx.xp.float32) * 0.5
-    return Field(fn, key, f"voronoi({cell:g} mm)", np.asarray(bounds, float), children=(thickness,), cache=True)
+    out = Field(fn, key, f"voronoi({cell:g} mm)", np.asarray(bounds, float), children=(thickness,), cache=True)
+    if thickness.range is not None:
+        out.thinnest = float(thickness.range[0])
+    return out
 
 
 def _foam_samples(field, bounds, cell, most=400_000):
