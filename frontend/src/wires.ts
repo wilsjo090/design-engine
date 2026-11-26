@@ -32,7 +32,7 @@ const HOVER_WAIT = 120
 /** below this zoom the cards' text is too small to read: with `simple`, they show their name instead */
 export const FAR_ZOOM = 0.45
 
-const DEFAULTS: WireOptions = { simple: true, focus: true, shared: true, long: true }
+const DEFAULTS: WireOptions = { simple: true, focus: true, shared: false, long: false }
 const KEY = 'wires'
 
 function loadOptions(): WireOptions {

@@ -1004,9 +1004,12 @@ zoomed out below `FAR_ZOOM`, simple cards (NodeEditor sets `data-far` and `--zoo
 store subscription, so zooming re-renders nothing; CSS covers each card with its `FarFace`, name sized by `--zoom` and
 cq units, the card keeping its size so nothing moves; only `.wired` rows keep their dots; frame labels grow above
 their box). Wires: the selected nodes' wires stand out and the rest fade (lightly while only hovering, after
-`HOVER_WAIT`); wires of an output with `SHARED_WIRES` or more and those longer than `LONG_WIRE` are drawn only
+`HOVER_WAIT`); with View ▸ Shared outputs / Long wires as labels (both off by default, so every wire is drawn), wires of an output with `SHARED_WIRES` or more and those longer than `LONG_WIRE` are drawn only
 while an end is selected or hovered (dashed), else as labels on the inputs they feed (`wireLabels`, memoized on
-the nodes and edges arrays; a click goes to the source). React Flow draws `drawnEdges` (copies: the store's edges stay as
+the nodes and edges arrays; a click goes to the source). While a wire or its label is hovered, each end
+less than 60% in view is shown as a copy of its card (`WirePeek.tsx`: the card's DOM cloned, React Flow's
+handle ids stripped, the wired port ringed, `pointer-events: none` so the wire keeps the hover) at the
+graph's side towards it, portalled to `document.body` (under `.editor[data-far]` it would get the far face). React Flow draws `drawnEdges` (copies: the store's edges stay as
 they are). A wire's input end moves: edges are `reconnectable: 'target'` (`makeEdge`); pressing a wired input's dot
 starts React Flow's reconnect from the wire's end anchor (`wires.pickUpWire`: a mousedown dispatched on
 `.react-flow__edgeupdater-target`, the dot's own pointerdown stopped; a labelled wire is drawn first), so it can

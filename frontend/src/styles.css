@@ -137,6 +137,20 @@ button.on { background: #3a4a33; border-color: var(--accent); color: #d6f5c3; }
 .wire-label::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 5px; vertical-align: middle;
   border-radius: 50%; background: var(--wire); }
 .wire-label:hover { color: #fff; text-decoration: underline dotted; }
+/* a hovered wire's off-screen end, shown as a copy of its card at the graph's side (WirePeek.tsx) */
+.wire-peek { position: fixed; z-index: 40; pointer-events: none; animation: wire-peek-in 0.12s ease-out; }
+@keyframes wire-peek-in { from { opacity: 0; transform: translateY(4px); } }
+.wire-peek-caption { display: flex; align-items: center; gap: 6px; height: 20px; margin-bottom: 4px; padding: 0 8px;
+  width: max-content; max-width: 100%; border-radius: 10px; background: rgba(20, 21, 24, 0.92); border: 1px solid #3a3d44;
+  font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+.wire-peek-caption b { color: #f1f2f4; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.wire-peek-arrow { color: var(--accent); font-size: 13px; }
+.wire-peek-away { color: #6f747c; }
+.wire-peek-frame { position: relative; }
+.wire-peek-card { transform-origin: 0 0; filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.6)); }
+.wire-peek-card > .enode { outline: 1px dashed #8a9099; outline-offset: 3px; }
+.wire-peek .peek-row { background: rgba(127, 207, 79, 0.14); }
+.wire-peek .peek-port { box-shadow: 0 0 0 3px var(--accent) !important; }
 .wire-count { font-size: 10px; color: var(--muted); padding: 0 4px; border: 1px solid #3a3d44; border-radius: 8px; }
 .handle.labelled { box-shadow: 0 0 0 1.5px #9aa0a8; }
 /* a wired input's dot picks up its wire (wires.pickUpWire) */

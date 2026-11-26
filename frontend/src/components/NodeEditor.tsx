@@ -17,6 +17,7 @@ import { NODE_DRAG_TYPE, addFromLibrary } from './NodeLibrary'
 import { NodePalette, compatibleInput, compatibleOutput, type PaletteFilter } from './NodePalette'
 import { NamePrompt } from './QuickEdit'
 import { ViewportMenu } from './ViewportMenu'
+import { WirePeek } from './WirePeek'
 import type { EngineNode, MenuEntry, MenuItem, PromptState } from '../types'
 import { CATEGORY_COLORS, DISPLAYABLE, GROUP_PREFIX, bypassInput } from '../types'
 import { FAR_ZOOM, LONG_WIRE, SHARED_WIRES, drawnEdges, hoverWires, useWires } from '../wires'
@@ -684,6 +685,7 @@ export function NodeEditor({ paletteSignal }: { paletteSignal: number }) {
           if (n.type === 'graphFrame') return `${s.graphFrames[n.id]?.color ?? '#8a8f98'}40`
           return CATEGORY_COLORS[s.specs[(n.data as { typeId: string }).typeId]?.category] ?? CATEGORY_COLORS.Groups
         }} maskColor="rgba(20,21,24,0.7)" style={{ background: '#1f2125' }} />
+        <WirePeek />
       </ReactFlow>
       {nodes.length === 0 && (
         <div className="editor-empty">Right-click or press Tab to add a node</div>
